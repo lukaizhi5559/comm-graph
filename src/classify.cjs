@@ -1,0 +1,147 @@
+'use strict';
+
+/**
+ * classify.cjs — Force-prompt intent classification for comms-graph
+ *
+ * Uses the same proven technique as stategraph-module's decomposePromptV2:
+ * "Return ONLY a single number" with maxTokens:5, temperature:0.1.
+ *
+ * Intent taxonomy:
+ *   0 - handoff              → needs tools/MCPs/automation → enqueue to main stategraph
+ *   1 - general_quick        → chitchat, opinions, known facts → direct LLM respond
+ *   2 - memory_quick         → quick profile/fact recall (name, favorite color) → user-memory lookup
+ *   3 - status_check         → "how is my task going?" → read task journal
+ *   4 - control_signal       → cancel/pause/resume → write to journal
+ *
+ * Falls back to embedding-based classification (classifier-fallback.cjs) if LLM
+ * returns an unparseable response.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const logger = require('./logger.cjs');
+
+// ── Intent definitions ─────────────────────────────────────────────────────────
+const INTENTS = {
+  0: { name: 'handoff',           description: 'Anything needing tools, web search, browser automation, computer actions, memory store, deep memory retrieval, scheduling, file operations, or multi-step tasks' },
+  1: { name: 'general_quick',    description: 'Chitchat, greetings, opinions, simple knowledge questions the LLM can answer directly without tools' },
+  2: { name: 'memory_quick',      description: 'Quick personal fact recall — name, favorite color, email, job, age. NOT deep temporal history or complex queries' },
+  3: { name: 'status_check',      description: 'Asking about the status/progress of a running or recently completed task' },
+  4: { name: 'control_signal',    description: 'Cancel, pause, resume, or stop a running task' },
+};
+
+// ── Load classification prompt ─────────────────────────────────────────────────
+function _loadClassifyPrompt() {
+  try {
+    return fs.readFileSync(path.join(__dirname, '../prompts/classify.md'), 'utf8').trim();
+  } catch (_) {
+    return null;
+  }
+}
+const CLASSIFY_PROMPT_TEMPLATE = _loadClassifyPrompt();
+
+/**
+ * Build the force-classification prompt for a given English user message.
+ */
+function _buildClassifyMessages(englishText, conversationContext) {
+  const intentList = Object.entries(INTENTS)
+    .map(([num, info]) => `${num} - ${info.name}: ${info.description}`)
+    .join('\n');
+
+  const systemPrompt = CLASSIFY_PROMPT_TEMPLATE
+    ? CLASSIFY_PROMPT_TEMPLATE.replace('{{INTENT_LIST}}', intentList)
+    : `You are an intent classifier for ThinkDrop AI. Classify the user's message into exactly one of these intents:
+
+${intentList}
+
+Return ONLY a single number (0, 1, 2, 3, or 4). No words, no explanation, no punctuation — just the number.`;
+
+  const userContent = conversationContext
+    ? `Conversation context (last 3 turns):\n${conversationContext}\n\nCurrent message: ${englishText}`
+    : `Message: ${englishText}`;
+
+  return [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: userContent },
+  ];
+}
+
+// ── Regex guard for parsing ────────────────────────────────────────────────────
+const NUMBER_RE = /^\s*([0-4])\s*$/;
+
+/**
+ * Classify an English user message into an intent (0-4).
+ *
+ * @param {string} englishText       - English translation of user input
+ * @param {string[]} [conversationContext] - Recent conversation turns for context
+ * @returns {Promise<{ intent: number, intentName: string, confidence: number, source: string }>}
+ */
+async function classify(englishText, conversationContext) {
+  if (!englishText || !englishText.trim()) {
+    return { intent: 1, intentName: 'general_quick', confidence: 0.5, source: 'empty_input' };
+  }
+
+  // ── Try force-prompt classification (primary) ────────────────────────────────
+  try {
+    const { ask } = require('./llm-providers.cjs');
+    const messages = _buildClassifyMessages(englishText, conversationContext);
+    const { text, provider } = await ask(messages, {
+      maxTokens: 5,
+      temperature: 0.1,
+      timeoutMs: 5000,
+    });
+
+    if (text) {
+      const trimmed = text.trim();
+      const match = trimmed.match(NUMBER_RE);
+      if (match) {
+        const intent = parseInt(match[1], 10);
+        const info = INTENTS[intent];
+        logger.info('[Classify] Force-prompt result', {
+          intent, intentName: info.name, provider, text: trimmed,
+          inputPreview: englishText.substring(0, 60),
+        });
+        return { intent, intentName: info.name, confidence: 0.92, source: 'force_prompt' };
+      }
+      // LLM returned something but not a clean number — try to extract
+      const numMatch = trimmed.match(/([0-4])/);
+      if (numMatch) {
+        const intent = parseInt(numMatch[1], 10);
+        const info = INTENTS[intent];
+        logger.info('[Classify] Force-prompt (extracted)', {
+          intent, intentName: info.name, provider, raw: trimmed,
+        });
+        return { intent, intentName: info.name, confidence: 0.75, source: 'force_prompt_extracted' };
+      }
+      logger.warn('[Classify] Force-prompt returned unparseable response', { raw: trimmed, provider });
+    }
+  } catch (err) {
+    logger.warn('[Classify] Force-prompt error', { error: err.message });
+  }
+
+  // ── Fallback: embedding-based classification ─────────────────────────────────
+  try {
+    const fallback = require('./classifier-fallback.cjs');
+    const result = await fallback.classify(englishText);
+    if (result && result.intent !== undefined) {
+      logger.info('[Classify] Fallback result', {
+        intent: result.intent, intentName: INTENTS[result.intent]?.name,
+        source: 'embedding_fallback',
+      });
+      return {
+        intent: result.intent,
+        intentName: INTENTS[result.intent]?.name || 'general_quick',
+        confidence: result.confidence || 0.5,
+        source: 'embedding_fallback',
+      };
+    }
+  } catch (err) {
+    logger.warn('[Classify] Fallback error', { error: err.message });
+  }
+
+  // ── Ultimate fallback: default to handoff (safe — let main stategraph handle) ──
+  logger.info('[Classify] All classification failed — defaulting to handoff');
+  return { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'default_handoff' };
+}
+
+module.exports = { classify, INTENTS };

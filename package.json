@@ -1,0 +1,29 @@
+{
+  "name": "@thinkdrop/comms-graph",
+  "version": "1.0.0",
+  "description": "ThinkDrop communication state graph — fast dialogue router for voice and text, with deterministic translation, force-classified intents, and async handoffs to the main stategraph",
+  "main": "src/server.cjs",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.cjs",
+    "dev": "node src/server.cjs"
+  },
+  "keywords": [
+    "comms",
+    "communication",
+    "stategraph",
+    "intent",
+    "translation",
+    "voice",
+    "thinkdrop"
+  ],
+  "author": "ThinkDrop AI",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
