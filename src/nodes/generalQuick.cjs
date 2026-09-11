@@ -6,10 +6,15 @@
  * Handles chitchat, greetings, opinions, and simple knowledge questions
  * that the LLM can answer directly without any tools.
  * Uses askEarly() for fast first-sentence resolution (~300-500ms).
+ *
+ * If the LLM fails (backend down, all providers exhausted), sets
+ * metadata.shouldHandoff = true so the server dispatches to the main
+ * state graph. Returns a random handoff phrase as immediate acknowledgment.
  */
 
 const logger = require('../logger.cjs');
 const { askEarly, buildMessages } = require('../llm-providers.cjs');
+const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
 
 /**
  * @param {string} englishText  - English user message
@@ -24,7 +29,31 @@ async function execute(englishText, systemPrompt) {
       temperature: 0.7,
     });
 
-    const response = firstSentence || fullText || "I'm here, though I'm not sure what to say to that.";
+    const response = firstSentence || fullText;
+
+    // If the LLM returned an empty response, hand off to main state graph
+    if (!response || !response.trim()) {
+      const phrase = getRandomHandoffPhrase();
+      logger.info('[GeneralQuick] LLM empty — handing off', { phrase, provider });
+      return {
+        text: phrase,
+        fullText: phrase,
+        metadata: { source: 'handoff', provider, intent: 1, shouldHandoff: true },
+      };
+    }
+
+    // Guard: if the LLM admits it can't answer (no real-time access, no capability),
+    // hand off to the main state graph which has tools and device context.
+    const _unhelpful = /^(?:i don'?t have access to|i don'?t have a|i cannot|i can'?t|i am unable to|i have no access)/i.test(response.trim());
+    if (_unhelpful) {
+      const phrase = getRandomHandoffPhrase();
+      logger.info('[GeneralQuick] Unhelpful response — handing off', { phrase, provider, responsePreview: response.substring(0, 60) });
+      return {
+        text: phrase,
+        fullText: phrase,
+        metadata: { source: 'handoff', provider, intent: 1, shouldHandoff: true },
+      };
+    }
 
     logger.info('[GeneralQuick] Response', {
       provider,
@@ -38,11 +67,13 @@ async function execute(englishText, systemPrompt) {
       metadata: { source: 'general_quick', provider, intent: 1 },
     };
   } catch (err) {
-    logger.error('[GeneralQuick] Error', { error: err.message });
+    // LLM call threw — hand off to main state graph
+    const phrase = getRandomHandoffPhrase();
+    logger.error('[GeneralQuick] Error — handing off', { error: err.message, phrase });
     return {
-      text: 'Forgive me — something went amiss just now.',
-      fullText: 'Forgive me — something went amiss just now.',
-      metadata: { source: 'error', intent: 1 },
+      text: phrase,
+      fullText: phrase,
+      metadata: { source: 'handoff', provider: 'none', intent: 1, shouldHandoff: true },
     };
   }
 }

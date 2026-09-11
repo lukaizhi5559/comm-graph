@@ -12,6 +12,7 @@
  *   POST /comms.status    — get task status summary
  *   POST /comms.complete  — main.js notifies task completion (releases agent lock)
  *   POST /comms.progress  — main.js sends task progress updates
+ *   POST /comms.remove    — main.js removes a task from the journal
  *   POST /comms.signal    — main.js acknowledges a control signal
  *   GET  /health          — health check
  *   GET  /tasks           — get all tasks (for UI)
@@ -41,6 +42,7 @@ const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
 const { execute: statusCheck } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const { execute: handoff, complete: handoffComplete } = require('./handoff.cjs');
+const { getRandomHandoffPhrase } = require('./handoffPhrases.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
 
@@ -178,8 +180,8 @@ async function processMessage(args) {
       });
 
       result = {
-        text: firstSentence || 'Passing that along to ThinkDrop now.',
-        fullText: firstSentence || 'Passing that along to ThinkDrop now.',
+        text: firstSentence || getRandomHandoffPhrase(),
+        fullText: firstSentence || getRandomHandoffPhrase(),
         metadata: {
           source: 'handoff',
           intent: 0,
@@ -194,6 +196,26 @@ async function processMessage(args) {
 
     case 1: { // general_quick
       result = await generalQuick(englishText, systemPrompt);
+      // If generalQuick couldn't answer (LLM failed), handoff to main state graph
+      if (result.metadata.shouldHandoff) {
+        const handoffResult = await handoff({
+          englishPrompt: englishText,
+          source,
+          originalPrompt: originalText,
+        });
+        result = {
+          text: result.text,
+          fullText: result.fullText,
+          metadata: {
+            ...result.metadata,
+            source: 'general_quick_handoff',
+            intent: 0,
+            taskId: handoffResult.taskId,
+            agentId: handoffResult.agentId,
+            parked: handoffResult.parked,
+          },
+        };
+      }
       break;
     }
 
@@ -356,6 +378,16 @@ const server = http.createServer(async (req, res) => {
     const body = await _readBody(req);
     logger.info('[Server] Signal ack', { signalType: body.signalType, taskId: body.taskId });
     return _send(res, 200, { ok: true });
+  }
+
+  // ── Task removal (from main.js) ────────────────────────────────────────────────
+  if (req.url === '/comms.remove' && req.method === 'POST') {
+    const body = await _readBody(req);
+    if (!body.taskId) {
+      return _send(res, 400, { error: 'taskId is required' });
+    }
+    const ok = handoff.remove(body.taskId);
+    return _send(res, ok ? 200 : 404, { ok });
   }
 
   // ── 404 ────────────────────────────────────────────────────────────────────────

@@ -1,297 +1,282 @@
 'use strict';
 
 /**
- * llm-providers.cjs — Shared LLM provider chain for comms-graph
+ * llm-providers.cjs — Backend-routed LLM provider for comms-graph
  *
- * Moved from voice-service. Tries providers in order until one succeeds.
- * Provider order: openai → claude → gemini → grok → mistral → deepseek
+ * All LLM calls are routed through thinkdrop-backend's HTTP API:
+ *   POST /api/llm         — non-streaming (returns full text)
+ *   POST /api/llm/stream  — streaming SSE (returns chunks + done event)
  *
- * API:
+ * The backend handles provider selection, circuit breakers, model fallback,
+ * catalog discovery, and free-premium/paid chain escalation. comms-graph
+ * no longer makes direct provider API calls.
+ *
+ * API (unchanged from previous version — callers don't need changes):
  *   ask(messages, opts)      → Promise<{ text: string, provider: string }>
  *   askEarly(messages, opts) → Promise<{ firstSentence: string, fullText: string, provider: string }>
  *   buildMessages(userText, systemPrompt) → messages[]
  */
 
-const https = require('https');
+const http = require('http');
 const logger = require('./logger.cjs');
 
 const DEFAULT_MAX_TOKENS  = 150;
 const DEFAULT_TEMPERATURE = 0.7;
 const DEFAULT_TIMEOUT_MS  = 12000;
 
-// ── Shared HTTPS helper ────────────────────────────────────────────────────────
-function _post(hostname, path, headers, body, timeoutMs) {
+// ── Backend URL ────────────────────────────────────────────────────────────────
+const BACKEND_BASE = (process.env.BACKEND_LLM_URL || 'http://localhost:4000/api/llm').replace(/\/$/, '');
+const BACKEND_HOST = BACKEND_BASE.replace(/^https?:\/\//, '').split(':')[0] || 'localhost';
+const BACKEND_PORT_MATCH = BACKEND_BASE.match(/:(\d+)\//);
+const BACKEND_PORT = BACKEND_PORT_MATCH ? parseInt(BACKEND_PORT_MATCH[1], 10) : 4000;
+const BACKEND_PATH = BACKEND_BASE.replace(/^https?:\/\/[^/]+/, '') || '/api/llm';
+const BACKEND_API_KEY = process.env.STATEGRAPH_API_KEY || '';
+
+// ── Messages → { systemPrompt, prompt } ────────────────────────────────────────
+function _extractFromMessages(messages) {
+  const systemMsg = messages.find(m => m.role === 'system');
+  const userMsgs  = messages.filter(m => m.role !== 'system');
+  const systemPrompt = systemMsg ? systemMsg.content : '';
+  const prompt = userMsgs.map(m => m.content).join('\n\n');
+  return { systemPrompt, prompt };
+}
+
+// ── Non-streaming request ──────────────────────────────────────────────────────
+function _postLLM(body, timeoutMs) {
   return new Promise((resolve) => {
-    const req = https.request({
-      hostname,
-      path,
+    const jsonBody = JSON.stringify(body);
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(jsonBody),
+    };
+    if (BACKEND_API_KEY) headers['Authorization'] = 'Bearer ' + BACKEND_API_KEY;
+
+    const req = http.request({
+      hostname: BACKEND_HOST,
+      port: BACKEND_PORT,
+      path: BACKEND_PATH,
       method: 'POST',
-      headers: {
-        'Content-Type':   'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        ...headers,
-      },
+      headers,
       timeout: timeoutMs,
     }, (res) => {
       let raw = '';
       res.on('data', c => { raw += c; });
-      res.on('end', () => resolve({ status: res.statusCode, body: raw }));
+      res.on('end', () => {
+        if (res.statusCode >= 400) {
+          logger.warn('[LLM] Backend HTTP error', { status: res.statusCode, preview: raw.substring(0, 200) });
+          resolve(null);
+          return;
+        }
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed.ok && parsed.data) {
+            resolve({ text: parsed.data.text || '', provider: parsed.data.provider || 'backend', time: parsed.data.processingTime });
+          } else {
+            logger.warn('[LLM] Backend returned ok=false', { error: parsed.error });
+            resolve(null);
+          }
+        } catch (err) {
+          logger.warn('[LLM] Backend response parse failed', { error: err.message });
+          resolve(null);
+        }
+      });
       res.on('error', () => resolve(null));
     });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.write(body);
+    req.on('error', (err) => {
+      logger.warn('[LLM] Backend request error', { error: err.message });
+      resolve(null);
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      logger.warn('[LLM] Backend request timeout', { timeoutMs });
+      resolve(null);
+    });
+    req.write(jsonBody);
     req.end();
   });
 }
 
-function _parseText(raw) {
-  try { return JSON.parse(raw); } catch (_) { return null; }
-}
-
-// ── Provider implementations ───────────────────────────────────────────────────
-
-async function _tryOpenAI(messages, opts) {
-  const apiKey = process.env.OPENAI_API_KEY || '';
-  if (!apiKey) return null;
-  const body = JSON.stringify({
-    model: 'gpt-4o-mini',
-    messages,
-    max_tokens: opts.maxTokens,
-    temperature: opts.temperature,
-  });
-  const res = await _post('api.openai.com', '/v1/chat/completions',
-    { Authorization: 'Bearer ' + apiKey }, body, opts.timeoutMs);
-  if (!res || res.status >= 400) return null;
-  const parsed = _parseText(res.body);
-  const text = parsed && parsed.choices && parsed.choices[0] &&
-    parsed.choices[0].message && parsed.choices[0].message.content;
-  return text ? text.trim() : null;
-}
-
-async function _tryClaude(messages, opts) {
-  const apiKey = process.env.ANTHROPIC_API_KEY || '';
-  if (!apiKey) return null;
-  const systemMsg = messages.find(m => m.role === 'system');
-  const chatMsgs  = messages.filter(m => m.role !== 'system');
-  const body = JSON.stringify({
-    model: 'claude-3-haiku-20240307',
-    max_tokens: opts.maxTokens,
-    temperature: opts.temperature,
-    ...(systemMsg ? { system: systemMsg.content } : {}),
-    messages: chatMsgs,
-  });
-  const res = await _post('api.anthropic.com', '/v1/messages', {
-    'x-api-key': apiKey,
-    'anthropic-version': '2023-06-01',
-  }, body, opts.timeoutMs);
-  if (!res || res.status >= 400) return null;
-  const parsed = _parseText(res.body);
-  const text = parsed && parsed.content && parsed.content[0] && parsed.content[0].text;
-  return text ? text.trim() : null;
-}
-
-async function _tryGemini(messages, opts) {
-  const apiKey = process.env.GEMINI_API_KEY || '';
-  if (!apiKey) return null;
-  const systemMsg = messages.find(m => m.role === 'system');
-  const chatMsgs  = messages.filter(m => m.role !== 'system').map(m => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
-  }));
-  const body = JSON.stringify({
-    contents: chatMsgs,
-    generationConfig: { maxOutputTokens: opts.maxTokens, temperature: opts.temperature },
-    ...(systemMsg ? { systemInstruction: { parts: [{ text: systemMsg.content }] } } : {}),
-  });
-  const path = '/v1beta/models/gemini-2.0-flash:generateContent?key=' + apiKey;
-  const res = await _post('generativelanguage.googleapis.com', path, {}, body, opts.timeoutMs);
-  if (!res || res.status >= 400) return null;
-  const parsed = _parseText(res.body);
-  const text = parsed && parsed.candidates && parsed.candidates[0] &&
-    parsed.candidates[0].content && parsed.candidates[0].content.parts &&
-    parsed.candidates[0].content.parts[0] && parsed.candidates[0].content.parts[0].text;
-  return text ? text.trim() : null;
-}
-
-async function _tryGrok(messages, opts) {
-  const apiKey = process.env.GROK_API_KEY || '';
-  if (!apiKey) return null;
-  const body = JSON.stringify({
-    model: 'grok-2-latest',
-    messages,
-    max_tokens: opts.maxTokens,
-    temperature: opts.temperature,
-  });
-  const res = await _post('api.x.ai', '/v1/chat/completions',
-    { Authorization: 'Bearer ' + apiKey }, body, opts.timeoutMs);
-  if (!res || res.status >= 400) return null;
-  const parsed = _parseText(res.body);
-  const text = parsed && parsed.choices && parsed.choices[0] &&
-    parsed.choices[0].message && parsed.choices[0].message.content;
-  return text ? text.trim() : null;
-}
-
-async function _tryMistral(messages, opts) {
-  const apiKey = process.env.MISTRAL_API_KEY || '';
-  if (!apiKey) return null;
-  const body = JSON.stringify({
-    model: 'mistral-small-latest',
-    messages,
-    max_tokens: opts.maxTokens,
-    temperature: opts.temperature,
-  });
-  const res = await _post('api.mistral.ai', '/v1/chat/completions',
-    { Authorization: 'Bearer ' + apiKey }, body, opts.timeoutMs);
-  if (!res || res.status >= 400) return null;
-  const parsed = _parseText(res.body);
-  const text = parsed && parsed.choices && parsed.choices[0] &&
-    parsed.choices[0].message && parsed.choices[0].message.content;
-  return text ? text.trim() : null;
-}
-
-async function _tryDeepSeek(messages, opts) {
-  const apiKey = process.env.DEEPSEEK_API_KEY || '';
-  if (!apiKey) return null;
-  const body = JSON.stringify({
-    model: 'deepseek-chat',
-    messages,
-    max_tokens: opts.maxTokens,
-    temperature: opts.temperature,
-  });
-  const res = await _post('api.deepseek.com', '/v1/chat/completions',
-    { Authorization: 'Bearer ' + apiKey }, body, opts.timeoutMs);
-  if (!res || res.status >= 400) return null;
-  const parsed = _parseText(res.body);
-  const text = parsed && parsed.choices && parsed.choices[0] &&
-    parsed.choices[0].message && parsed.choices[0].message.content;
-  return text ? text.trim() : null;
-}
-
-// ── Provider chain ─────────────────────────────────────────────────────────────
-
-const PROVIDERS = [
-  { name: 'openai',   fn: _tryOpenAI   },
-  { name: 'claude',   fn: _tryClaude   },
-  { name: 'gemini',   fn: _tryGemini   },
-  { name: 'grok',     fn: _tryGrok     },
-  { name: 'mistral',  fn: _tryMistral  },
-  { name: 'deepseek', fn: _tryDeepSeek },
-];
-
-/**
- * Stream OpenAI and resolve as soon as the first sentence is complete.
- * Returns { firstSentence, fullText, provider } — firstSentence available
- * ~300-500ms after the request starts (vs ~1.5s for full response).
- */
-async function askEarly(messages, opts = {}) {
-  const apiKey = process.env.OPENAI_API_KEY || '';
-  if (!apiKey) {
-    const { text, provider } = await ask(messages, opts);
-    const match = text.match(/^[^.?!]*[.?!]/);
-    const firstSentence = (match && match[0].trim().length > 4) ? match[0].trim() : text.trim();
-    return { firstSentence, fullText: text, provider };
-  }
-
-  const resolvedOpts = {
-    maxTokens:   opts.maxTokens   || DEFAULT_MAX_TOKENS,
-    temperature: opts.temperature !== undefined ? opts.temperature : DEFAULT_TEMPERATURE,
-    timeoutMs:   opts.timeoutMs   || DEFAULT_TIMEOUT_MS,
-  };
-
+// ── Streaming request (SSE) ────────────────────────────────────────────────────
+function _streamLLM(body, timeoutMs, onChunk) {
   return new Promise((resolve) => {
-    const body = JSON.stringify({
-      model: 'gpt-4o-mini',
-      messages,
-      max_tokens: resolvedOpts.maxTokens,
-      temperature: resolvedOpts.temperature,
-      stream: true,
-    });
+    const jsonBody = JSON.stringify(body);
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(jsonBody),
+    };
+    if (BACKEND_API_KEY) headers['Authorization'] = 'Bearer ' + BACKEND_API_KEY;
 
     let fullText = '';
-    let firstSentence = '';
-    let earlyResolved = false;
+    let provider = 'backend';
     let settled = false;
 
-    const checkEarly = () => {
-      if (earlyResolved) return;
-      const match = fullText.match(/^[^.?!]*[.?!]/);
-      if (match && match[0].trim().length > 4) {
-        firstSentence = match[0].trim();
-        earlyResolved = true;
-      }
-    };
-
-    const done = () => {
+    const done = (finalProvider) => {
       if (!settled) {
         settled = true;
-        const fs = firstSentence || fullText.trim() || 'Forgive the delay — no answer came in time.';
-        logger.info('[LLM] askEarly complete', { provider: 'openai', firstSentenceLen: fs.length });
-        resolve({ firstSentence: fs, fullText: fullText.trim() || fs, provider: 'openai' });
+        clearTimeout(timeout);
+        resolve({ fullText: fullText.trim(), provider: finalProvider || provider });
       }
     };
 
-    const timeout = setTimeout(done, resolvedOpts.timeoutMs);
+    const timeout = setTimeout(() => {
+      logger.warn('[LLM] Backend stream timeout', { timeoutMs, chars: fullText.length });
+      req.destroy();
+      done();
+    }, timeoutMs);
 
-    const req = https.request({
-      hostname: 'api.openai.com',
-      path: '/v1/chat/completions',
+    const req = http.request({
+      hostname: BACKEND_HOST,
+      port: BACKEND_PORT,
+      path: BACKEND_PATH + '/stream',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + apiKey,
-        'Content-Length': Buffer.byteLength(body),
-      },
-      timeout: resolvedOpts.timeoutMs,
+      headers,
+      timeout: timeoutMs,
     }, (res) => {
+      let buffer = '';
       res.on('data', (chunk) => {
-        const lines = chunk.toString().split('\n');
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line
+
         for (const line of lines) {
           const trimmed = line.trim();
           if (!trimmed.startsWith('data:')) continue;
           const json = trimmed.slice(5).trim();
-          if (json === '[DONE]') { clearTimeout(timeout); done(); return; }
+          if (!json) continue;
           try {
             const parsed = JSON.parse(json);
-            const delta = parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content;
-            if (delta) { fullText += delta; checkEarly(); }
+            if (parsed.done) {
+              done(parsed.provider || provider);
+              return;
+            }
+            if (parsed.error) {
+              logger.warn('[LLM] Backend stream error event', { error: parsed.error });
+              done();
+              return;
+            }
+            if (parsed.text) {
+              fullText += parsed.text;
+              if (parsed.provider) provider = parsed.provider;
+              if (onChunk) onChunk(parsed.text);
+            }
           } catch (_) {}
         }
       });
-      res.on('end', () => { clearTimeout(timeout); done(); });
-      res.on('error', () => { clearTimeout(timeout); done(); });
+      res.on('end', () => done());
+      res.on('error', () => done());
     });
-    req.on('error', () => { clearTimeout(timeout); done(); });
-    req.on('timeout', () => { req.destroy(); clearTimeout(timeout); done(); });
-    req.write(body);
+    req.on('error', (err) => {
+      logger.warn('[LLM] Backend stream request error', { error: err.message });
+      clearTimeout(timeout);
+      done();
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      logger.warn('[LLM] Backend stream socket timeout', { timeoutMs });
+      clearTimeout(timeout);
+      done();
+    });
+    req.write(jsonBody);
     req.end();
   });
 }
 
+// ── Public API ─────────────────────────────────────────────────────────────────
+
 /**
- * Ask the LLM chain. Tries each provider in order until one succeeds.
+ * Ask the backend LLM (non-streaming). Tries the backend's resilient chain.
+ * @param {Array} messages  - [{role, content}, ...]
+ * @param {Object} opts     - { maxTokens, temperature, timeoutMs, taskType }
+ * @returns {Promise<{ text: string, provider: string }>}
  */
 async function ask(messages, opts = {}) {
   const resolvedOpts = {
     maxTokens:   opts.maxTokens   || DEFAULT_MAX_TOKENS,
     temperature: opts.temperature !== undefined ? opts.temperature : DEFAULT_TEMPERATURE,
     timeoutMs:   opts.timeoutMs   || DEFAULT_TIMEOUT_MS,
+    taskType:    opts.taskType    || 'conversational',
   };
 
-  for (const { name, fn } of PROVIDERS) {
-    try {
-      const text = await fn(messages, resolvedOpts);
-      if (text) {
-        logger.info('[LLM] Provider success', { provider: name, chars: text.length });
-        return { text, provider: name };
-      }
-    } catch (err) {
-      logger.warn('[LLM] Provider error', { provider: name, error: err.message });
-    }
+  const { systemPrompt, prompt } = _extractFromMessages(messages);
+  if (!prompt) return { text: '', provider: 'none' };
+
+  const body = {
+    prompt,
+    systemPrompt: systemPrompt || undefined,
+    options: {
+      maxTokens: resolvedOpts.maxTokens,
+      temperature: resolvedOpts.temperature,
+      taskType: resolvedOpts.taskType,
+    },
+  };
+
+  const result = await _postLLM(body, resolvedOpts.timeoutMs);
+  if (result && result.text) {
+    logger.info('[LLM] Backend response', { provider: result.provider, chars: result.text.length, ms: result.time });
+    return { text: result.text, provider: result.provider };
   }
 
-  logger.error('[LLM] All providers failed');
+  logger.error('[LLM] Backend call failed — no response');
   return { text: '', provider: 'none' };
+}
+
+/**
+ * Ask the backend LLM with streaming and resolve as soon as the first sentence
+ * is complete. Returns { firstSentence, fullText, provider }.
+ * @param {Array} messages  - [{role, content}, ...]
+ * @param {Object} opts     - { maxTokens, temperature, timeoutMs, taskType }
+ * @returns {Promise<{ firstSentence: string, fullText: string, provider: string }>}
+ */
+async function askEarly(messages, opts = {}) {
+  const resolvedOpts = {
+    maxTokens:   opts.maxTokens   || DEFAULT_MAX_TOKENS,
+    temperature: opts.temperature !== undefined ? opts.temperature : DEFAULT_TEMPERATURE,
+    timeoutMs:   opts.timeoutMs   || DEFAULT_TIMEOUT_MS,
+    taskType:    opts.taskType    || 'conversational',
+  };
+
+  const { systemPrompt, prompt } = _extractFromMessages(messages);
+  if (!prompt) return { firstSentence: '', fullText: '', provider: 'none' };
+
+  const body = {
+    prompt,
+    systemPrompt: systemPrompt || undefined,
+    options: {
+      maxTokens: resolvedOpts.maxTokens,
+      temperature: resolvedOpts.temperature,
+      taskType: resolvedOpts.taskType,
+    },
+  };
+
+  let accumulated = '';
+  let firstSentence = '';
+  let earlyResolved = false;
+
+  const checkEarly = () => {
+    if (earlyResolved) return;
+    const match = accumulated.match(/^[^.?!]*[.?!]/);
+    if (match && match[0].trim().length > 4) {
+      firstSentence = match[0].trim();
+      earlyResolved = true;
+    }
+  };
+
+  const result = await _streamLLM(body, resolvedOpts.timeoutMs, (chunk) => {
+    accumulated += chunk;
+    checkEarly();
+  });
+
+  // Re-check with full text
+  const fullText = result.fullText;
+  if (!earlyResolved) {
+    const match = fullText.match(/^[^.?!]*[.?!]/);
+    firstSentence = (match && match[0].trim().length > 4) ? match[0].trim() : fullText.trim();
+  }
+
+  const fs = firstSentence || fullText.trim();
+  logger.info('[LLM] askEarly complete', { provider: result.provider, firstSentenceLen: fs.length, fullTextLen: fullText.length });
+
+  return { firstSentence: fs, fullText, provider: result.provider };
 }
 
 /**
@@ -304,4 +289,4 @@ function buildMessages(userText, systemPrompt) {
   return msgs;
 }
 
-module.exports = { ask, askEarly, buildMessages, PROVIDERS };
+module.exports = { ask, askEarly, buildMessages };

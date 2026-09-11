@@ -37,9 +37,9 @@ function _save() {
   try {
     const dir = path.dirname(JOURNAL_PATH);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const arr = Array.from(_tasks.values()).filter(t =>
-      t.status === 'running' || t.status === 'queued' || t.status === 'waiting-for-agent'
-    );
+    // Persist ALL tasks (active + completed) so completed tasks survive restarts.
+    // Old completed tasks are cleaned up by cleanup() based on TTL.
+    const arr = Array.from(_tasks.values());
     fs.writeFileSync(JOURNAL_PATH, JSON.stringify(arr, null, 2), 'utf8');
   } catch (err) {
     logger.warn('[TaskJournal] Persist failed', { error: err.message });
@@ -159,6 +159,21 @@ function setResult(id, result) {
 }
 
 /**
+ * Delete a task from the journal.
+ * @param {string} id
+ * @returns {boolean}
+ */
+function deleteTask(id) {
+  const task = _tasks.get(id);
+  if (!task) return false;
+  _tasks.delete(id);
+  _save();
+  _broadcast();
+  logger.info('[TaskJournal] Deleted', { id });
+  return true;
+}
+
+/**
  * Get a single task by id.
  * @param {string} id
  * @returns {TaskEntry|undefined}
@@ -182,7 +197,7 @@ function getActiveTasks() {
  * @param {number} [limit=10]
  * @returns {TaskEntry[]}
  */
-function getRecentTasks(limit = 10) {
+function getRecentTasks(limit = 50) {
   return Array.from(_tasks.values())
     .filter(t => t.status === 'done' || t.status === 'failed' || t.status === 'cancelled')
     .sort((a, b) => (b.doneAt || 0) - (a.doneAt || 0))
@@ -195,7 +210,7 @@ function getRecentTasks(limit = 10) {
  */
 function getAllTasks() {
   const active = getActiveTasks();
-  const recent = getRecentTasks(5);
+  const recent = getRecentTasks(50);
   return [...active, ...recent];
 }
 
@@ -229,10 +244,12 @@ function formatStatusSummary(filterAgentId) {
 
 /**
  * Clean up old completed tasks (called periodically).
+ * Default TTL: 7 days. Override with TASK_JOURNAL_TTL_DAYS env var.
  */
 function cleanup() {
   const now = Date.now();
-  const MAX_AGE = 30 * 60 * 1000; // 30 minutes
+  const TTL_DAYS = parseFloat(process.env.TASK_JOURNAL_TTL_DAYS || '7');
+  const MAX_AGE = TTL_DAYS * 24 * 60 * 60 * 1000;
   for (const [id, task] of _tasks) {
     if ((task.status === 'done' || task.status === 'failed' || task.status === 'cancelled') &&
         task.doneAt && (now - task.doneAt > MAX_AGE)) {
@@ -251,6 +268,7 @@ module.exports = {
   updateTask,
   updateProgress,
   setResult,
+  deleteTask,
   getTask,
   getActiveTasks,
   getRecentTasks,

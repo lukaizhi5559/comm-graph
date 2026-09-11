@@ -156,4 +156,29 @@ function complete(taskId, agentId, status, result) {
   logger.info('[Handoff] Completed', { taskId, agentId, status });
 }
 
-module.exports = { execute, complete, detectAgent, isLocked, getWaitingCount };
+/**
+ * Remove a task from the journal and release any held agent lock.
+ * @param {string} taskId
+ * @returns {boolean}
+ */
+function remove(taskId) {
+  const task = require('./taskJournal.cjs').getTask(taskId);
+  if (!task) return false;
+  // If the task is active or waiting on an agent, release that agent's lock
+  const activeStatuses = ['queued', 'running', 'waiting-for-agent', 'awaiting-approval', 'waiting-for-input'];
+  if (activeStatuses.includes(task.status) && task.agentId) {
+    const nextTaskId = release(task.agentId, taskId);
+    if (nextTaskId) {
+      const nextTask = require('./taskJournal.cjs').getTask(nextTaskId);
+      if (nextTask) {
+        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null)
+          .catch(() => {});
+      }
+    }
+  }
+  const deleted = require('./taskJournal.cjs').deleteTask(taskId);
+  logger.info('[Handoff] Removed', { taskId, deleted });
+  return deleted;
+}
+
+module.exports = { execute, complete, remove, detectAgent, isLocked, getWaitingCount };

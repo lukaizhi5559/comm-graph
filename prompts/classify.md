@@ -9,8 +9,12 @@ CLASSIFICATION RULES:
 3. If the message asks for a quick personal fact about the user (name, email, favorite color, age, job) → classify as 2 (memory_quick).
 4. If the message asks about the status or progress of a running task → classify as 3 (status_check).
 5. If the message is a control command (cancel, pause, resume, stop) → classify as 4 (control_signal).
+6. If the message asks for the current time, today's date, the current day of the week, or any real-time local information the LLM cannot know without a device clock → classify as 0 (handoff).
 
 IMPORTANT BOUNDARIES:
+- "What time is it?" → 0 (handoff — needs real-time device clock)
+- "What's today's date?" → 0 (handoff — needs real-time device clock)
+- "What day is it?" → 0 (handoff — needs real-time device clock)
 - "List all my appointments for next week" → 0 (handoff — deep temporal retrieval)
 - "What was I doing yesterday" → 0 (handoff — deep temporal retrieval)
 - "Remember I have a meeting at 3pm" → 0 (handoff — memory storage)
