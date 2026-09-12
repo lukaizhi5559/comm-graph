@@ -82,12 +82,23 @@ const CONTROL_SIGNAL_SEEDS = [
   'Cancel everything',
 ];
 
+const MEMORY_STORE_SEEDS = [
+  'I have a dentist appt next week friday',
+  'Remember I have a meeting at 3pm',
+  'Note: buy milk tomorrow',
+  'I have a flight on Monday',
+  'Remember I need to call my mom this weekend',
+  'I have an appointment with Dr. Smith on Tuesday',
+  'Just noting that I finished the report',
+];
+
 const ALL_SEEDS = {
   0: HANDOFF_SEEDS,
   1: GENERAL_QUICK_SEEDS,
   2: MEMORY_QUICK_SEEDS,
   3: STATUS_CHECK_SEEDS,
   4: CONTROL_SIGNAL_SEEDS,
+  5: MEMORY_STORE_SEEDS,
 };
 
 // ── Simple keyword-based fallback (no model dependency) ────────────────────────
@@ -113,8 +124,13 @@ function _keywordClassify(text) {
     return { intent: 2, confidence: 0.75 };
   }
 
+  // Memory store — general memory/note/appointment (NOT personal profile fact)
+  if (/\b(remember\s+i\s+have|i\s+have\s+an?\s+\w+\s+(appt|appointment|meeting|event|flight|call)|note\s*[:)]|just\s+noting|i\s+need\s+to\s+remember)\b/i.test(lower)) {
+    return { intent: 5, confidence: 0.7 };
+  }
+
   // Handoff — action verbs + targets
-  if (/\b(go\s+to|open|close|search|look\s+up|find|browse|navigate|download|send|schedule|screenshot|remember\s+i|what\s+was\s+i\s+doing|list\s+my)\b/i.test(lower)) {
+  if (/\b(go\s+to|open|close|search|look\s+up|find|browse|navigate|download|send|schedule|screenshot|what\s+was\s+i\s+doing|list\s+my)\b/i.test(lower)) {
     return { intent: 0, confidence: 0.65 };
   }
 

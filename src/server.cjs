@@ -39,6 +39,7 @@ const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona
 const { classify, INTENTS } = require('./classify.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
+const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
 const { execute: statusCheck } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const { execute: handoff, complete: handoffComplete } = require('./handoff.cjs');
@@ -345,6 +346,34 @@ async function processMessage(args) {
 
     case 4: { // control_signal
       result = await controlSignal(englishText, systemPrompt);
+      break;
+    }
+
+    case 5: { // memory_store
+      result = await memoryStore(englishText, systemPrompt, context);
+      // If memory_store failed, handoff to main state graph
+      if (result.metadata.shouldHandoff) {
+        const handoffResult = await handoff({
+          englishPrompt: englishText,
+          source,
+          originalPrompt: originalText,
+        });
+        const basePhrase = getHandoffPhrase(intentName, englishText);
+        const handoffText = handoffResult.parked
+          ? `${basePhrase} I'll start on that as soon as the current task finishes.`
+          : basePhrase;
+        result = {
+          text: handoffText,
+          fullText: handoffText,
+          metadata: {
+            ...result.metadata,
+            source: 'memory_store_handoff',
+            taskId: handoffResult.taskId,
+            agentId: handoffResult.agentId,
+            parked: handoffResult.parked,
+          },
+        };
+      }
       break;
     }
 

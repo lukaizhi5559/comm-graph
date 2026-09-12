@@ -23,11 +23,12 @@ const logger = require('./logger.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
-  0: { name: 'handoff',           description: 'Anything needing tools, web search, browser automation, computer actions, memory store, deep memory retrieval, scheduling, file operations, or multi-step tasks' },
+  0: { name: 'handoff',           description: 'Anything needing tools, web search, browser automation, computer actions, deep memory retrieval, scheduling, file operations, or multi-step tasks' },
   1: { name: 'general_quick',    description: 'Chitchat, greetings, opinions, simple knowledge questions the LLM can answer directly without tools' },
-  2: { name: 'memory_quick',      description: 'Quick personal fact recall — name, favorite color, email, job, age. NOT deep temporal history or complex queries' },
+  2: { name: 'memory_quick',      description: 'Quick personal fact recall — name, favorite color, email, job, age. Also handles explicit profile fact storage ("my name is X"). NOT deep temporal history or complex queries' },
   3: { name: 'status_check',      description: 'Asking about the status/progress of a running or recently completed task' },
   4: { name: 'control_signal',    description: 'Cancel, pause, resume, or stop a running task' },
+  5: { name: 'memory_store',      description: 'Storing a general memory, note, appointment, or event — NOT a personal profile fact. E.g., "i have a dentist appt next week", "remember I have a meeting at 3pm", "note: buy milk tomorrow"' },
 };
 
 // ── Load classification prompt ─────────────────────────────────────────────────
