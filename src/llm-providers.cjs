@@ -34,9 +34,9 @@ const BACKEND_API_KEY = process.env.STATEGRAPH_API_KEY || '';
 
 // ── Messages → { systemPrompt, prompt } ────────────────────────────────────────
 function _extractFromMessages(messages) {
-  const systemMsg = messages.find(m => m.role === 'system');
-  const userMsgs  = messages.filter(m => m.role !== 'system');
-  const systemPrompt = systemMsg ? systemMsg.content : '';
+  const systemMsgs = messages.filter(m => m.role === 'system');
+  const userMsgs   = messages.filter(m => m.role !== 'system');
+  const systemPrompt = systemMsgs.map(m => m.content).join('\n\n');
   const prompt = userMsgs.map(m => m.content).join('\n\n');
   return { systemPrompt, prompt };
 }

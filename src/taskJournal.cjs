@@ -51,10 +51,24 @@ function _load() {
     if (!fs.existsSync(JOURNAL_PATH)) return;
     const raw = fs.readFileSync(JOURNAL_PATH, 'utf8');
     const arr = JSON.parse(raw) || [];
+    const STALE_MS = 10 * 60 * 1000; // 10 minutes
+    const now = Date.now();
+    let staleCount = 0;
     for (const item of arr) {
-      // Reset running/auth-required tasks to queued on restart (they didn't survive)
-      if (item.status === 'running' || item.status === 'auth-required') item.status = 'queued';
+      // Mark stale active tasks as failed — the stategraph process that was
+      // supposed to execute them is gone after a restart.
+      const isActive = ['queued', 'waiting-for-agent', 'running', 'auth-required', 'awaiting-approval'].includes(item.status);
+      if (isActive && item.createdAt && (now - item.createdAt > STALE_MS)) {
+        item.status = 'failed';
+        item.error = 'stale after restart';
+        item.doneAt = item.doneAt || now;
+        staleCount++;
+      }
       _tasks.set(item.id, item);
+    }
+    if (staleCount > 0) {
+      logger.info('[TaskJournal] Marked stale tasks as failed', { count: staleCount });
+      _save(); // Persist the cleanup
     }
     logger.info('[TaskJournal] Loaded', { count: _tasks.size });
   } catch (_) {}

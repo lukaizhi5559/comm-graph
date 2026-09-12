@@ -13,6 +13,7 @@ CLASSIFICATION RULES:
 5. If the message is a control command (cancel, pause, resume, stop) → classify as 4 (control_signal).
 6. If the message asks for the current time, today's date, the current day of the week, or any real-time local information the LLM cannot know without a device clock → classify as 0 (handoff).
 7. If the message asks about a CURRENT office-holder, current event, latest news, present-day status, or any time-sensitive fact the LLM cannot know without live data → classify as 0 (handoff). Pattern: "who is the current X of Y", "who is the X right now", "what is the latest X", "what happened today", "as of now who holds X".
+8. If the message asks about the CONVERSATION ITSELF — what was discussed, whether a topic was mentioned, what the user asked or said earlier, or requests searching conversation history/memory → classify as 0 (handoff — needs full transcript search). Pattern: "did we talk about X", "what did we discuss", "what did I just ask", "what were we talking about", "look that up in your memory", "remind me what we said", "check your memory", "in our conversation".
 
 IMPORTANT BOUNDARIES:
 - "What time is it?" → 0 (handoff — needs real-time device clock)
@@ -37,10 +38,14 @@ IMPORTANT BOUNDARIES:
 - "Who is the X right now?" → 0 (handoff — current office-holder, needs live data)
 - "What is the latest X?" → 0 (handoff — latest info, needs live data)
 - "What happened today?" → 0 (handoff — current events, needs live data)
+- "Did we talk about Jesus?" → 0 (handoff — conversation recall, needs transcript search)
+- "What did we discuss earlier?" → 0 (handoff — conversation recall)
+- "What did I just ask?" → 0 (handoff — conversation recall)
+- "Look that up in your memory" → 0 (handoff — conversation/memory search)
 - "Who was the first X of Y?" → 1 (general_quick — historical fact, stable)
 - "What is quantum computing?" → 1 (general_quick — LLM can answer directly)
 - "Do you like jazz?" → 1 (general_quick — opinion)
 - "How is my task going?" → 3 (status_check)
 - "Cancel that" → 4 (control_signal)
 
-Return ONLY a single number (0, 1, 2, 3, or 4). No words, no explanation, no punctuation — just the number.
+Return ONLY a single number (0, 1, 2, 3, 4, or 5). No words, no explanation, no punctuation — just the number.

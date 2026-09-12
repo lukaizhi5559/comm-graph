@@ -10,11 +10,46 @@
  * If the LLM fails (backend down, all providers exhausted), sets
  * metadata.shouldHandoff = true so the server dispatches to the main
  * state graph. Returns a random handoff phrase as immediate acknowledgment.
+ *
+ * ── Sentinel-based handoff detection ──────────────────────────────────────────
+ * The persona prompt teaches the LLM to use handoff phrases ("Routing that to
+ * ThinkDrop now"). This conflicts with general_quick's purpose — answering
+ * directly. Instead of detecting handoff-style natural language with fragile
+ * regex patterns, we append a DIRECT ANSWER MODE directive that overrides the
+ * persona's routing instructions and tells the LLM to either answer directly
+ * or output exactly `0` (the existing handoff intent number) if it cannot.
+ * This is robust across model changes and new phrasings.
  */
 
 const logger = require('../logger.cjs');
 const { askEarly, buildMessages } = require('../llm-providers.cjs');
 const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
+
+// ── Direct answer mode directive ─────────────────────────────────────────────
+// Appended to the system prompt to override the persona's handoff phrase
+// instructions. Tells the LLM to answer directly or signal 0 (handoff).
+const DIRECT_ANSWER_DIRECTIVE = `
+
+═══════════════════════════════════════════════
+DIRECT ANSWER MODE — ACTIVE NOW
+═══════════════════════════════════════════════
+You are in DIRECT ANSWER mode. The user's message was classified as something
+you can answer directly with your own knowledge.
+
+Answer the user's question directly and concisely.
+Do NOT use any handoff or routing phrases like "Routing that to ThinkDrop",
+"Let me check on that", "Passing that along", or "Let me look that up".
+Do NOT promise to look something up — either answer now, or signal that you cannot.
+
+If you cannot answer because:
+- You lack real-time or live data (current prices, news, weather, current office-holders)
+- Your knowledge is outdated or has a cutoff date
+- You lack the capability or tools for what's being asked
+- The question needs web search, browser access, file access, or device context
+
+...then respond with EXACTLY: 0
+Nothing else. Just the number 0. No explanation, no handoff phrase.
+═══════════════════════════════════════════════`;
 
 /**
  * @param {string} englishText  - English user message
@@ -24,7 +59,9 @@ const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
  */
 async function execute(englishText, systemPrompt, conversationContext) {
   try {
-    const messages = buildMessages(englishText, systemPrompt, conversationContext);
+    // Append direct-answer directive to override the persona's routing instructions
+    const directPrompt = systemPrompt + DIRECT_ANSWER_DIRECTIVE;
+    const messages = buildMessages(englishText, directPrompt, conversationContext);
     const { firstSentence, fullText, provider } = await askEarly(messages, {
       maxTokens: 150,
       temperature: 0.7,
@@ -32,37 +69,14 @@ async function execute(englishText, systemPrompt, conversationContext) {
 
     const response = firstSentence || fullText;
 
-    // If the LLM returned an empty response, hand off to main state graph
-    if (!response || !response.trim()) {
+    // ── Sentinel check: LLM signals it cannot answer ────────────────────────
+    // Covers empty responses and explicit 0 (handoff) signals.
+    if (!response || !response.trim() || response.trim() === '0') {
       const phrase = getRandomHandoffPhrase();
-      logger.info('[GeneralQuick] LLM empty — handing off', { phrase, provider });
-      return {
-        text: phrase,
-        fullText: phrase,
-        metadata: { source: 'handoff', provider, intent: 1, shouldHandoff: true },
-      };
-    }
-
-    // Guard: if the LLM admits it can't answer (no real-time access, no capability),
-    // hand off to the main state graph which has tools and device context.
-    const _unhelpful = /^(?:i don'?t have access to|i don'?t have a|i cannot|i can'?t|i am unable to|i have no access)/i.test(response.trim());
-    if (_unhelpful) {
-      const phrase = getRandomHandoffPhrase();
-      logger.info('[GeneralQuick] Unhelpful response — handing off', { phrase, provider, responsePreview: response.substring(0, 60) });
-      return {
-        text: phrase,
-        fullText: phrase,
-        metadata: { source: 'handoff', provider, intent: 1, shouldHandoff: true },
-      };
-    }
-
-    // Guard: if the LLM disclaims stale knowledge (knowledge cutoff, "as of my
-    // latest update"), hand off — the answer is likely outdated and the main
-    // state graph can fetch live data via web search.
-    const _staleDisclaimer = /^(?:as of my latest update|my knowledge cutoff|as of my last update|as of my last training|my training data (?:cuts off|ends|stops)|i don'?t have (?:current|real-time|live) (?:information|data|access))/i.test(response.trim());
-    if (_staleDisclaimer) {
-      const phrase = getRandomHandoffPhrase();
-      logger.info('[GeneralQuick] Stale-knowledge disclaimer — handing off', { phrase, provider, responsePreview: response.substring(0, 60) });
+      logger.info('[GeneralQuick] Handoff signaled', {
+        phrase, provider,
+        reason: !response ? 'empty' : 'sentinel',
+      });
       return {
         text: phrase,
         fullText: phrase,

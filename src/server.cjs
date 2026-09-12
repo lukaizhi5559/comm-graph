@@ -43,7 +43,8 @@ const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
 const { execute: statusCheck } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const { execute: handoff, complete: handoffComplete } = require('./handoff.cjs');
-const { getHandoffPhrase, getRandomHandoffPhrase } = require('./handoffPhrases.cjs');
+const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
+const intentGuesser = require('./intentGuesser.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
 
@@ -92,15 +93,19 @@ agentLock.setLockBroadcast((lockState) => {
 const _conversationHistory = [];
 const MAX_HISTORY = 6;
 
-function _addTurn(userText, intent) {
-  _conversationHistory.push({ text: userText.substring(0, 200), intent, ts: Date.now() });
+function _addTurn(userText, assistantText, intent) {
+  _conversationHistory.push({
+    user: userText.substring(0, 200),
+    assistant: (assistantText || '').substring(0, 200),
+    intent, ts: Date.now(),
+  });
   if (_conversationHistory.length > MAX_HISTORY) _conversationHistory.shift();
 }
 
 function _formatContext() {
   return _conversationHistory
     .slice(-3)
-    .map(t => `User: ${t.text}`)
+    .map(t => `User: ${t.user}\nAssistant: ${t.assistant || ''}`)
     .join('\n');
 }
 
@@ -116,8 +121,8 @@ function _fetchConversationHistory() {
     const body = JSON.stringify({
       version: 'mcp.v1',
       service: 'conversation',
-      action: 'session.route',
-      payload: { text: '' },
+      action: 'session.getActive',
+      payload: {},
       requestId: 'cg_conv_' + Date.now(),
     });
     const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
@@ -126,7 +131,7 @@ function _fetchConversationHistory() {
     const req = http.request({
       hostname: '127.0.0.1',
       port: CONVERSATION_SERVICE_PORT,
-      path: '/session.route',
+      path: '/session.getActive',
       method: 'POST',
       headers,
       timeout: 1500,
@@ -143,7 +148,7 @@ function _fetchConversationHistory() {
             version: 'mcp.v1',
             service: 'conversation',
             action: 'message.list',
-            payload: { sessionId, limit: 8, direction: 'DESC' },
+            payload: { sessionId, limit: 16, direction: 'DESC' },
             requestId: 'cg_conv_list_' + Date.now(),
           });
           const listHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(listBody) };
@@ -165,7 +170,7 @@ function _fetchConversationHistory() {
                 // Format as "User: ... \n Assistant: ..." (last 6, reversed to chronological)
                 const formatted = messages
                   .filter(m => m.sender !== 'system')
-                  .slice(0, 6)
+                  .slice(0, 12)
                   .reverse()
                   .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}: ${(m.text || m.content || '').substring(0, 200)}`)
                   .join('\n');
@@ -185,6 +190,92 @@ function _fetchConversationHistory() {
     req.write(body);
     req.end();
   });
+}
+
+// ── Log conversation turn to conversation-service (fire-and-forget) ────────────
+// Logs both user and assistant messages so follow-up prompts have full context.
+// Mirrors the stategraph's logConversation.js pattern. Only called for quick
+// intents (general_quick, memory_quick, memory_store) — handoff intents are
+// logged by the stategraph's logConversation node.
+function _logConversationTurn(userText, assistantText, intentName) {
+  if (!CONV_API_KEY) return; // no key — skip silently
+  const ts = new Date().toISOString();
+  const _post = (action, payload) => {
+    const body = JSON.stringify({
+      version: 'mcp.v1', service: 'conversation', action, payload,
+      requestId: 'cg_log_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+    });
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+    if (CONV_API_KEY) headers['Authorization'] = 'Bearer ' + CONV_API_KEY;
+    const req = http.request({
+      hostname: '127.0.0.1', port: CONVERSATION_SERVICE_PORT,
+      path: '/' + action, method: 'POST', headers, timeout: 2000,
+    }, () => {});
+    req.on('error', () => {});
+    req.on('timeout', () => req.destroy());
+    req.write(body);
+    req.end();
+  };
+  // 1. Route to session, 2. log user + assistant messages in parallel after session resolved
+  const routeBody = JSON.stringify({
+    version: 'mcp.v1', service: 'conversation', action: 'session.route',
+    payload: { text: userText },
+    requestId: 'cg_route_' + Date.now(),
+  });
+  const routeHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(routeBody) };
+  if (CONV_API_KEY) routeHeaders['Authorization'] = 'Bearer ' + CONV_API_KEY;
+  const routeReq = http.request({
+    hostname: '127.0.0.1', port: CONVERSATION_SERVICE_PORT,
+    path: '/session.route', method: 'POST', headers: routeHeaders, timeout: 2000,
+  }, (res) => {
+    let raw = '';
+    res.on('data', c => { raw += c; });
+    res.on('end', () => {
+      try {
+        const parsed = JSON.parse(raw);
+        const sessionId = (parsed.data || parsed)?.sessionId;
+        if (!sessionId) return;
+        _post('message.add', { sessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+        if (assistantText) {
+          _post('message.add', { sessionId, text: assistantText, sender: 'assistant', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+        }
+      } catch (_) {}
+    });
+  });
+  routeReq.on('error', () => {});
+  routeReq.on('timeout', () => routeReq.destroy());
+  routeReq.write(routeBody);
+  routeReq.end();
+}
+
+// ── Handoff phrase generation helper ──────────────────────────────────────────
+/**
+ * Generate an intent-aware handoff phrase based on the guessed stategraph intent.
+ *
+ * - command_automate → LLM generates a "background task" phrase
+ * - Other intents → pick from multilingual static pool (handoffPhrases.json)
+ * - Regex miss → default generic phrase from the pool
+ * - Language not in pool → empty string (no phrase displayed)
+ *
+ * @param {string} englishText - English translation of user prompt
+ * @param {string} detectedLanguage - ISO 639-1 language code
+ * @param {string} [conversationContext] - Recent conversation turns
+ * @returns {Promise<{ phrase: string, guessedIntent: string|null }>}
+ */
+async function _generateHandoffPhrase(englishText, detectedLanguage, conversationContext) {
+  const { guessedIntent } = intentGuesser.guess(englishText);
+
+  let phrase = '';
+
+  if (guessedIntent === 'command_automate') {
+    // LLM-generated phrase for command_automate
+    phrase = await getCommandAutomatePhrase(englishText, conversationContext);
+  } else {
+    // Static multilingual pool for non-command_automate intents
+    phrase = getHandoffPhraseForIntent(guessedIntent, detectedLanguage, englishText);
+  }
+
+  return { phrase, guessedIntent };
 }
 
 // ── Main pipeline ───────────────────────────────────────────────────────────────
@@ -261,9 +352,8 @@ async function processMessage(args) {
         originalPrompt: originalText,
       });
 
-      // Use intent-specific handoff phrase (no more "routing to ThinkDrop")
-      // For parked tasks, add a note about waiting for the agent.
-      const basePhrase = getHandoffPhrase(intentName, englishText);
+      // Generate intent-aware handoff phrase (LLM for command_automate, static pool for others)
+      const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context);
       const handoffText = handoffResult.parked
         ? `${basePhrase} I'll start on that as soon as the current task finishes.`
         : basePhrase;
@@ -278,6 +368,8 @@ async function processMessage(args) {
           agentId: handoffResult.agentId,
           parked: handoffResult.parked,
           waitingBehind: handoffResult.waitingBehind,
+          speakable: false,
+          guessedIntent,
         },
       };
       break;
@@ -292,7 +384,7 @@ async function processMessage(args) {
           source,
           originalPrompt: originalText,
         });
-        const basePhrase = getHandoffPhrase(intentName, englishText);
+        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context);
         const handoffText = handoffResult.parked
           ? `${basePhrase} I'll start on that as soon as the current task finishes.`
           : basePhrase;
@@ -306,6 +398,8 @@ async function processMessage(args) {
             taskId: handoffResult.taskId,
             agentId: handoffResult.agentId,
             parked: handoffResult.parked,
+            speakable: false,
+            guessedIntent,
           },
         };
       }
@@ -321,7 +415,7 @@ async function processMessage(args) {
           source,
           originalPrompt: originalText,
         });
-        const basePhrase = getHandoffPhrase(intentName, englishText);
+        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context);
         const handoffText = handoffResult.parked
           ? `${basePhrase} I'll start on that as soon as the current task finishes.`
           : basePhrase;
@@ -333,6 +427,8 @@ async function processMessage(args) {
             source: 'memory_quick_handoff',
             taskId: handoffResult.taskId,
             agentId: handoffResult.agentId,
+            speakable: false,
+            guessedIntent,
           },
         };
       }
@@ -358,7 +454,7 @@ async function processMessage(args) {
           source,
           originalPrompt: originalText,
         });
-        const basePhrase = getHandoffPhrase(intentName, englishText);
+        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context);
         const handoffText = handoffResult.parked
           ? `${basePhrase} I'll start on that as soon as the current task finishes.`
           : basePhrase;
@@ -371,6 +467,8 @@ async function processMessage(args) {
             taskId: handoffResult.taskId,
             agentId: handoffResult.agentId,
             parked: handoffResult.parked,
+            speakable: false,
+            guessedIntent,
           },
         };
       }
@@ -385,7 +483,7 @@ async function processMessage(args) {
 
   // ── Step 5: Translate response back to user's language (if non-English) ──────
   let finalText = result.text;
-  if (wasTranslated && detectedLanguage !== 'en') {
+  if (wasTranslated && detectedLanguage !== 'en' && finalText && finalText.trim()) {
     try {
       finalText = await fromEnglish(result.text, detectedLanguage);
       logger.info('[Process] Translated response back', {
@@ -398,7 +496,11 @@ async function processMessage(args) {
   }
 
   // ── Record conversation turn ──────────────────────────────────────────────────
-  _addTurn(englishText, intent);
+  _addTurn(englishText, finalText, intent);
+  // Log to conversation-service for quick intents (handoff is logged by stategraph)
+  if (intent === 1 || intent === 2 || intent === 5) {
+    _logConversationTurn(englishText, finalText, intentName);
+  }
 
   const latencyMs = Date.now() - startTime;
   logger.info('[Process] Complete', {
@@ -513,6 +615,22 @@ const server = http.createServer(async (req, res) => {
     }
     const ok = handoff.remove(body.taskId);
     return _send(res, ok ? 200 : 404, { ok });
+  }
+
+  // ── Task cancel (from main.js) — mark task as cancelled in journal ───────────────
+  if (req.url === '/comms.cancel' && req.method === 'POST') {
+    const body = await _readBody(req);
+    if (!body.taskId) {
+      return _send(res, 400, { error: 'taskId is required' });
+    }
+    const task = taskJournal.getTask(body.taskId);
+    if (!task) {
+      return _send(res, 404, { ok: false, error: 'task not found' });
+    }
+    // Release agent lock if held, then mark cancelled
+    try { handoff.remove(body.taskId); } catch (_) {}
+    taskJournal.updateTask(body.taskId, 'cancelled', { error: 'cancelled by user' });
+    return _send(res, 200, { ok: true });
   }
 
   // ── 404 ────────────────────────────────────────────────────────────────────────

@@ -55,7 +55,7 @@ function _buildClassifyMessages(englishText, conversationContext) {
 
 ${intentList}
 
-Return ONLY a single number (0, 1, 2, 3, or 4). No words, no explanation, no punctuation — just the number.`;
+Return ONLY a single number (${_intentListStr}). No words, no explanation, no punctuation — just the number.`;
 
   const userContent = conversationContext
     ? `Conversation context (last 3 turns):\n${conversationContext}\n\nCurrent message: ${englishText}`
@@ -67,11 +67,16 @@ Return ONLY a single number (0, 1, 2, 3, or 4). No words, no explanation, no pun
   ];
 }
 
-// ── Regex guard for parsing ────────────────────────────────────────────────────
-const NUMBER_RE = /^\s*([0-4])\s*$/;
+// ── Regex guard for parsing (derived from INTENTS — auto-maintains) ─────────────
+const _intentKeys = Object.keys(INTENTS).map(Number);
+const _intentMin = Math.min(..._intentKeys);
+const _intentMax = Math.max(..._intentKeys);
+const NUMBER_RE = new RegExp(`^\\s*([${_intentMin}-${_intentMax}])\\s*$`);
+const _EXTRACT_RE = new RegExp(`([${_intentMin}-${_intentMax}])`);
+const _intentListStr = _intentKeys.join(', ');
 
 /**
- * Classify an English user message into an intent (0-4).
+ * Classify an English user message into an intent.
  *
  * @param {string} englishText       - English translation of user input
  * @param {string[]} [conversationContext] - Recent conversation turns for context
@@ -105,7 +110,7 @@ async function classify(englishText, conversationContext) {
         return { intent, intentName: info.name, confidence: 0.92, source: 'force_prompt' };
       }
       // LLM returned something but not a clean number — try to extract
-      const numMatch = trimmed.match(/([0-4])/);
+      const numMatch = trimmed.match(_EXTRACT_RE);
       if (numMatch) {
         const intent = parseInt(numMatch[1], 10);
         const info = INTENTS[intent];

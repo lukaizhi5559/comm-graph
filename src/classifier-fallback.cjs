@@ -119,6 +119,12 @@ function _keywordClassify(text) {
     return { intent: 3, confidence: 0.7 };
   }
 
+  // Conversation recall — meta-questions about the chat transcript itself
+  // Route to handoff so the stategraph can search the full conversation history
+  if (/\b(did\s+we|have\s+we|what\s+did\s+we|what\s+were\s+we|what\s+we\s+were)\s+(talk|speak|chat|discuss)|what\s+did\s+i\s+(just\s+)?(ask|say)|what\s+was\s+my\s+(last|previous)\s+(question|prompt|message)|look\s+(that\s+|it\s+)?up\s+in\s+(your\s+|the\s+)?(memory|conversation|chat|history)|remind\s+me\s+what\s+we|check\s+(your\s+|the\s+)?(memory|conversation|chat|history)|in\s+our\s+(conversation|chat|history)\b/i.test(lower)) {
+    return { intent: 0, confidence: 0.7 };
+  }
+
   // Memory quick — personal fact recall
   if (/\b(what's?\s+my\s+name|my\s+name|my\s+email|my\s+favorite\s+color|how\s+old\s+am\s+i|my\s+job|about\s+me)\b/i.test(lower)) {
     return { intent: 2, confidence: 0.75 };
