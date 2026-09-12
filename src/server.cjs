@@ -42,7 +42,7 @@ const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
 const { execute: statusCheck } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const { execute: handoff, complete: handoffComplete } = require('./handoff.cjs');
-const { getRandomHandoffPhrase } = require('./handoffPhrases.cjs');
+const { getHandoffPhrase, getRandomHandoffPhrase } = require('./handoffPhrases.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
 
@@ -103,6 +103,89 @@ function _formatContext() {
     .join('\n');
 }
 
+// ── Conversation-service history fetch (parallel, with timeout) ──────────────
+// Fetches recent conversation turns (user + assistant) from the conversation-service
+// so comms-graph has real context awareness like the main stategraph.
+// Falls back to the in-memory _conversationHistory if the service is unreachable.
+const CONVERSATION_SERVICE_PORT = parseInt(process.env.CONVERSATION_SERVICE_PORT || '3004', 10);
+const CONV_API_KEY = process.env.MCP_CONVERSATION_API_KEY || process.env.MCP_API_KEY || '';
+
+function _fetchConversationHistory() {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      version: 'mcp.v1',
+      service: 'conversation',
+      action: 'session.route',
+      payload: { text: '' },
+      requestId: 'cg_conv_' + Date.now(),
+    });
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+    if (CONV_API_KEY) headers['Authorization'] = 'Bearer ' + CONV_API_KEY;
+
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: CONVERSATION_SERVICE_PORT,
+      path: '/session.route',
+      method: 'POST',
+      headers,
+      timeout: 1500,
+    }, (res) => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(raw);
+          const sessionId = (parsed.data || parsed)?.sessionId;
+          if (!sessionId) return resolve(null);
+          // Now fetch the message list for this session
+          const listBody = JSON.stringify({
+            version: 'mcp.v1',
+            service: 'conversation',
+            action: 'message.list',
+            payload: { sessionId, limit: 8, direction: 'DESC' },
+            requestId: 'cg_conv_list_' + Date.now(),
+          });
+          const listHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(listBody) };
+          if (CONV_API_KEY) listHeaders['Authorization'] = 'Bearer ' + CONV_API_KEY;
+          const listReq = http.request({
+            hostname: '127.0.0.1',
+            port: CONVERSATION_SERVICE_PORT,
+            path: '/message.list',
+            method: 'POST',
+            headers: listHeaders,
+            timeout: 1500,
+          }, (listRes) => {
+            let listRaw = '';
+            listRes.on('data', c => { listRaw += c; });
+            listRes.on('end', () => {
+              try {
+                const listParsed = JSON.parse(listRaw);
+                const messages = (listParsed.data || listParsed)?.messages || [];
+                // Format as "User: ... \n Assistant: ..." (last 6, reversed to chronological)
+                const formatted = messages
+                  .filter(m => m.sender !== 'system')
+                  .slice(0, 6)
+                  .reverse()
+                  .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}: ${(m.text || m.content || '').substring(0, 200)}`)
+                  .join('\n');
+                resolve(formatted || null);
+              } catch (_) { resolve(null); }
+            });
+          });
+          listReq.on('error', () => resolve(null));
+          listReq.on('timeout', () => { listReq.destroy(); resolve(null); });
+          listReq.write(listBody);
+          listReq.end();
+        } catch (_) { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
+
 // ── Main pipeline ───────────────────────────────────────────────────────────────
 /**
  * Process a user message through the full comms-graph pipeline.
@@ -134,12 +217,19 @@ async function processMessage(args) {
   });
 
   // ── Step 1: Translate to English (deterministic, no LLM for language check) ──
-  const { englishText, originalText, detectedLanguage, wasTranslated } =
-    await toEnglish({ text, language });
+  // Run translation, persona fetch, and conversation-service history fetch in parallel
+  // for maximum speed. Conversation history fetch has a 1500ms timeout and falls back
+  // to the in-memory history if the service is unreachable.
+  const [translateResult, convHistory] = await Promise.all([
+    toEnglish({ text, language }),
+    _fetchConversationHistory(),
+  ]);
+  const { englishText, originalText, detectedLanguage, wasTranslated } = translateResult;
 
   logger.info('[Process] Translated', {
     wasTranslated, detectedLanguage,
     englishPreview: englishText.substring(0, 80),
+    hasConvHistory: !!convHistory,
   });
 
   // ── Step 2: Fetch personality overlay + build system prompt ───────────────────
@@ -150,7 +240,8 @@ async function processMessage(args) {
   });
 
   // ── Step 3: Classify intent (force-prompt, numbered) ───────────────────────────
-  const context = _formatContext();
+  // Use conversation-service history if available, otherwise fall back to in-memory
+  const context = convHistory || _formatContext();
   const { intent, intentName, confidence, source: classifySource } =
     await classify(englishText, context);
 
@@ -169,19 +260,16 @@ async function processMessage(args) {
         originalPrompt: originalText,
       });
 
-      // Generate handoff phrase through personality layer
-      const handoffMessages = [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: `The user said: "${englishText}"\nThis needs to be routed to ThinkDrop for execution. Respond with a natural handoff phrase (1-2 sentences). ${handoffResult.parked ? 'The agent is currently busy with another task, so mention it will start once the current one finishes.' : ''}` },
-      ];
-      const { askEarly } = require('./llm-providers.cjs');
-      const { firstSentence } = await askEarly(handoffMessages, {
-        maxTokens: 80, temperature: 0.7,
-      });
+      // Use intent-specific handoff phrase (no more "routing to ThinkDrop")
+      // For parked tasks, add a note about waiting for the agent.
+      const basePhrase = getHandoffPhrase(intentName, englishText);
+      const handoffText = handoffResult.parked
+        ? `${basePhrase} I'll start on that as soon as the current task finishes.`
+        : basePhrase;
 
       result = {
-        text: firstSentence || getRandomHandoffPhrase(),
-        fullText: firstSentence || getRandomHandoffPhrase(),
+        text: handoffText,
+        fullText: handoffText,
         metadata: {
           source: 'handoff',
           intent: 0,
@@ -195,7 +283,7 @@ async function processMessage(args) {
     }
 
     case 1: { // general_quick
-      result = await generalQuick(englishText, systemPrompt);
+      result = await generalQuick(englishText, systemPrompt, context);
       // If generalQuick couldn't answer (LLM failed), handoff to main state graph
       if (result.metadata.shouldHandoff) {
         const handoffResult = await handoff({
@@ -203,9 +291,13 @@ async function processMessage(args) {
           source,
           originalPrompt: originalText,
         });
+        const basePhrase = getHandoffPhrase(intentName, englishText);
+        const handoffText = handoffResult.parked
+          ? `${basePhrase} I'll start on that as soon as the current task finishes.`
+          : basePhrase;
         result = {
-          text: result.text,
-          fullText: result.fullText,
+          text: handoffText,
+          fullText: handoffText,
           metadata: {
             ...result.metadata,
             source: 'general_quick_handoff',
@@ -220,7 +312,7 @@ async function processMessage(args) {
     }
 
     case 2: { // memory_quick
-      result = await memoryQuick(englishText, systemPrompt);
+      result = await memoryQuick(englishText, systemPrompt, context);
       // If memory_quick couldn't find a match, handoff instead
       if (result.metadata.shouldHandoff) {
         const handoffResult = await handoff({
@@ -228,9 +320,13 @@ async function processMessage(args) {
           source,
           originalPrompt: originalText,
         });
+        const basePhrase = getHandoffPhrase(intentName, englishText);
+        const handoffText = handoffResult.parked
+          ? `${basePhrase} I'll start on that as soon as the current task finishes.`
+          : basePhrase;
         result = {
-          text: result.text,
-          fullText: result.fullText,
+          text: handoffText,
+          fullText: handoffText,
           metadata: {
             ...result.metadata,
             source: 'memory_quick_handoff',
@@ -254,7 +350,7 @@ async function processMessage(args) {
 
     default: {
       // Unknown intent — default to general_quick
-      result = await generalQuick(englishText, systemPrompt);
+      result = await generalQuick(englishText, systemPrompt, context);
     }
   }
 

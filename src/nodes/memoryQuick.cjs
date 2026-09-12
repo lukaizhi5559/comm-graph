@@ -87,9 +87,10 @@ function _queryMemory(key) {
 /**
  * @param {string} englishText  - English user message
  * @param {string} systemPrompt - Full system prompt (persona + personality)
+ * @param {string} [conversationContext] - Recent conversation turns for context awareness
  * @returns {Promise<{ text: string, fullText: string, metadata: Object }>}
  */
-async function execute(englishText, systemPrompt) {
+async function execute(englishText, systemPrompt, conversationContext) {
   const fact = detectFactQuery(englishText);
 
   if (!fact) {
@@ -120,7 +121,7 @@ async function execute(englishText, systemPrompt) {
 
   // Naturalize the response through the personality layer
   const naturalizePrompt = `The user asked: "${englishText}"\nTheir ${fact.label} is: ${value}\nRespond naturally in 1-2 sentences as ThinkDrop. No markdown. Be conversational, not robotic.`;
-  const messages = buildMessages(naturalizePrompt, systemPrompt);
+  const messages = buildMessages(naturalizePrompt, systemPrompt, conversationContext);
   const { text: naturalized } = await ask(messages, {
     maxTokens: 100,
     temperature: 0.7,

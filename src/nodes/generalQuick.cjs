@@ -19,11 +19,12 @@ const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
 /**
  * @param {string} englishText  - English user message
  * @param {string} systemPrompt - Full system prompt (persona + personality overlay + language)
+ * @param {string} [conversationContext] - Recent conversation turns for context awareness
  * @returns {Promise<{ text: string, fullText: string, metadata: Object }>}
  */
-async function execute(englishText, systemPrompt) {
+async function execute(englishText, systemPrompt, conversationContext) {
   try {
-    const messages = buildMessages(englishText, systemPrompt);
+    const messages = buildMessages(englishText, systemPrompt, conversationContext);
     const { firstSentence, fullText, provider } = await askEarly(messages, {
       maxTokens: 150,
       temperature: 0.7,
@@ -48,6 +49,20 @@ async function execute(englishText, systemPrompt) {
     if (_unhelpful) {
       const phrase = getRandomHandoffPhrase();
       logger.info('[GeneralQuick] Unhelpful response — handing off', { phrase, provider, responsePreview: response.substring(0, 60) });
+      return {
+        text: phrase,
+        fullText: phrase,
+        metadata: { source: 'handoff', provider, intent: 1, shouldHandoff: true },
+      };
+    }
+
+    // Guard: if the LLM disclaims stale knowledge (knowledge cutoff, "as of my
+    // latest update"), hand off — the answer is likely outdated and the main
+    // state graph can fetch live data via web search.
+    const _staleDisclaimer = /^(?:as of my latest update|my knowledge cutoff|as of my last update|as of my last training|my training data (?:cuts off|ends|stops)|i don'?t have (?:current|real-time|live) (?:information|data|access))/i.test(response.trim());
+    if (_staleDisclaimer) {
+      const phrase = getRandomHandoffPhrase();
+      logger.info('[GeneralQuick] Stale-knowledge disclaimer — handing off', { phrase, provider, responsePreview: response.substring(0, 60) });
       return {
         text: phrase,
         fullText: phrase,

@@ -282,9 +282,13 @@ async function askEarly(messages, opts = {}) {
 /**
  * Convenience: build messages array from a simple prompt + system prompt.
  */
-function buildMessages(userText, systemPrompt) {
+function buildMessages(userText, systemPrompt, conversationContext) {
   const msgs = [];
   if (systemPrompt && systemPrompt.trim()) msgs.push({ role: 'system', content: systemPrompt.trim() });
+  // Inject conversation history so the LLM can reference prior context
+  if (conversationContext && conversationContext.trim()) {
+    msgs.push({ role: 'system', content: `=== RECENT CONVERSATION ===\n${conversationContext}\n=== END CONVERSATION ===\nUse this context to understand references in the user's message.` });
+  }
   msgs.push({ role: 'user', content: userText });
   return msgs;
 }

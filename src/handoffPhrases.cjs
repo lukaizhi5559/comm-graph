@@ -1,116 +1,154 @@
 'use strict';
 
 /**
- * handoffPhrases.cjs — Natural acknowledgment phrases for handoff
+ * handoffPhrases.cjs — Intent-specific acknowledgment phrases for handoff
  *
- * When comms-graph can't answer a prompt directly (LLM failure or needs
- * main state graph), it picks a random phrase from this list so the user
- * gets an immediate, natural, varied response instead of a static fallback
- * or an apology.
+ * When comms-graph can't answer a prompt directly (needs main state graph),
+ * it picks a phrase from the intent-specific pool so the user gets an
+ * immediate, natural, varied response that matches what ThinkDrop is about
+ * to do — instead of a generic "routing to ThinkDrop".
  *
- * Phrases are short (1-6 words), personable, and match ThinkDrop's
- * "sharp, composed AI butler" tone.
+ * Phrases are short, personable, and match ThinkDrop's tone.
+ * Emojis are included for mood/personality where appropriate.
  */
 
-const PHRASES = [
-  'One moment.',
-  'Checking now.',
-  'On it.',
-  'Let me look into that.',
-  'Give me a second.',
-  'Looking that up.',
-  'Right away.',
-  'Let me check.',
-  'Hold on — I\'ll find out.',
-  'Processing that now.',
-  'Just a moment.',
-  'Let me think about that.',
-  'Working on it.',
-  'Give me just a sec.',
-  'Checking that for you.',
-  'On it — one moment.',
-  'Let me get that for you.',
-  'Sure — looking now.',
-  'Let me see what I can find.',
-  'Digging into that now.',
-  'Give me a beat.',
-  'Hang tight.',
-  'Let me pull that up.',
-  'Coming right up.',
-  'Let me work on that.',
-  'I\'m on it.',
-  'Checking my notes.',
-  'One sec.',
-  'Let me find out for you.',
-  'Looking into it now.',
-  'Just a sec.',
-  'Let me get right back to you.',
-  'Processing — hold tight.',
-  'Let me sort that out.',
-  'Give me a moment to check.',
-  'On the case.',
-  'Let me see what I\'ve got.',
-  'Checking now — won\'t be long.',
-  'Let me dig into that.',
-  'Brief pause — looking it up.',
-  'Let me trace that down.',
-  'Working on it now.',
-  'Give me a second to check.',
-  'Let me pull that together.',
-  'Hold on, checking.',
-  'Let me get you an answer.',
-  'Right — looking into that.',
-  'Let me sort that out for you.',
-  'Just looking that up now.',
-  'One moment, please.',
-  'Let me check on that.',
-  'Checking — just a moment.',
-  'On it — give me a second.',
-  'Let me find the right answer.',
-  'Looking that up now.',
-  'Let me get to the bottom of that.',
-  'Give me a flash.',
-  'Let me see here.',
-  'Checking that out.',
-  'Let me work through that.',
-  'Hold tight — checking now.',
-  'Let me get you sorted.',
-  'On it — won\'t be a minute.',
-  'Let me look that over.',
-  'Checking into it.',
-  'Let me get the details.',
-  'Give me a tick.',
-  'Let me track that down.',
-  'Looking it up — one moment.',
-  'Let me put that together.',
-  'Checking — back in a flash.',
-  'Let me see what comes up.',
-  'On it — just looking now.',
-  'Let me find you a solid answer.',
-  'Give me a moment to dig in.',
-  'Checking that out now.',
-  'Let me get to work on that.',
-  'Let me see what I can pull up.',
-  'On it — checking the details.',
-  'Give me a second to look that up.',
-  'Let me get that sorted for you.',
+// ── Intent-specific phrase pools ──────────────────────────────────────────────
+const HANDOFF_PHRASES = {
+  // Web search — "let me look that up online" energy
+  web_search: [
+    'One sec while I look that up online. 🔍',
+    'Let me search for that — back in a moment.',
+    'Looking that up now… 🔎',
+    'Give me a sec — checking the web for you.',
+    'On it — pulling that up from the web.',
+    'Let me find you a solid answer on that. 🌐',
+    'Searching now — won\'t be a moment.',
+    'Hold on, let me look that up for you.',
+  ],
+
+  // Memory retrieval — "trying to remember" energy
+  memory_retrieve: [
+    'Hmm, one moment — trying to remember. 🤔',
+    'Hold on, let me check my memory…',
+    'Thinking… give me just a second. 💭',
+    'Let me dig into that for you — one moment.',
+    'Checking my notes on that. 📝',
+    'Let me see what I can recall…',
+    'One sec — looking through my memories.',
+    'Hold on, that\'s in here somewhere…',
+  ],
+
+  // Command automation — "on it, doing that now" energy
+  command_automate: [
+    'On it — I\'ll look into that now. ⚡',
+    'Got it — starting that right away.',
+    'Let me take care of that for you. ✨',
+    'Working on it now — won\'t be long.',
+    'Sure thing — getting that done.',
+    'On the case. 🛠️',
+    'Let me handle that for you now.',
+    'Got it — one moment while I set that up.',
+  ],
+
+  // General fallback (unknown intent or screen_intelligence)
+  general_handoff: [
+    'One moment.',
+    'On it.',
+    'Let me look into that.',
+    'Give me a second.',
+    'Checking now.',
+    'Let me check.',
+    'Hold on — I\'ll find out.',
+    'Just a moment.',
+    'Working on it.',
+    'Let me think about that.',
+    'Give me a beat.',
+    'Hang tight.',
+  ],
+};
+
+// ── Goal extraction for command_automate ───────────────────────────────────────
+// Extracts the core action+object from a prompt so the phrase can reference it
+// (e.g., "Open Google Docs and create a document" → "Creating that document now.")
+const _GOAL_PATTERNS = [
+  { regex: /\b(?:create|make|new)\s+(?:a\s+)?(?:document|doc|note|page|file|spreadsheet|sheet|presentation|slide|playlist|album)\b/i, phrase: (m) => `Creating that ${m[0].replace(/^(?:create|make|new)\s+(?:a\s+)?/i, '').trim()} now. ✨` },
+  { regex: /\b(?:send|email|message|text|dm)\s+/i, phrase: (m) => `Sending that now. 📨` },
+  { regex: /\b(?:open|launch|go to|navigate to)\s+/i, phrase: (m) => `Opening that up now. 🚀` },
+  { regex: /\b(?:search|find|look up|look for)\s+/i, phrase: (m) => `Looking that up now. 🔍` },
+  { regex: /\b(?:schedule|remind|set (?:a )?reminder)\b/i, phrase: (m) => `Setting that up now. ⏰` },
+  { regex: /\b(?:update|edit|modify|change|rename)\s+/i, phrase: (m) => `Updating that now. ✏️` },
+  { regex: /\b(?:delete|remove|close|cancel)\s+/i, phrase: () => `Taking care of that now.` },
 ];
 
-let _lastIndex = -1;
+/**
+ * Try to generate a goal-specific phrase for command_automate prompts.
+ * Returns null if no pattern matches.
+ * @param {string} promptText
+ * @returns {string|null}
+ */
+function _extractGoalPhrase(promptText) {
+  if (!promptText) return null;
+  for (const { regex, phrase } of _GOAL_PATTERNS) {
+    const match = promptText.match(regex);
+    if (match) {
+      try { return phrase(match); } catch (_) { return null; }
+    }
+  }
+  return null;
+}
+
+// ── Last-index tracking per pool to avoid repeats ──────────────────────────────
+const _lastIndex = {};
 
 /**
- * Get a random handoff phrase.
- * Tracks the last index to avoid repeating the same phrase twice in a row.
+ * Get an intent-specific handoff phrase.
+ *
+ * @param {string} intentName - One of: 'web_search', 'memory_retrieve', 'command_automate',
+ *                              'general_knowledge', 'screen_intelligence', or null
+ * @param {string} [promptText] - The user's prompt (for goal extraction in command_automate)
+ * @returns {string}
+ */
+function getHandoffPhrase(intentName, promptText) {
+  // Map stategraph intent names to our pools
+  let poolKey = 'general_handoff';
+  if (intentName === 'web_search' || intentName === 'general_knowledge') {
+    poolKey = 'web_search';
+  } else if (intentName === 'memory_retrieve') {
+    poolKey = 'memory_retrieve';
+  } else if (intentName === 'command_automate') {
+    poolKey = 'command_automate';
+  }
+
+  // For command_automate, try goal-specific phrase first (more personal)
+  if (poolKey === 'command_automate') {
+    const goalPhrase = _extractGoalPhrase(promptText);
+    if (goalPhrase && Math.random() < 0.6) {
+      return goalPhrase;
+    }
+  }
+
+  const pool = HANDOFF_PHRASES[poolKey] || HANDOFF_PHRASES.general_handoff;
+  if (pool.length <= 1) return pool[0];
+
+  let idx;
+  const last = _lastIndex[poolKey] ?? -1;
+  do {
+    idx = Math.floor(Math.random() * pool.length);
+  } while (idx === last);
+  _lastIndex[poolKey] = idx;
+  return pool[idx];
+}
+
+/**
+ * Get a random handoff phrase (legacy API — uses general pool).
+ * Kept for backward compatibility.
  * @returns {string}
  */
 function getRandomHandoffPhrase() {
-  if (PHRASES.length <= 1) return PHRASES[0];
-  let idx;
-  do {
-    idx = Math.floor(Math.random() * PHRASES.length);
-  } while (idx === _lastIndex);
-  _lastIndex = idx;
-  return PHRASES[idx];
+  return getHandoffPhrase(null, null);
 }
 
-module.exports = { PHRASES, getRandomHandoffPhrase };
+// Legacy export of the flat phrase list (for any code that imports PHRASES directly)
+const PHRASES = HANDOFF_PHRASES.general_handoff;
+
+module.exports = { PHRASES, HANDOFF_PHRASES, getHandoffPhrase, getRandomHandoffPhrase };

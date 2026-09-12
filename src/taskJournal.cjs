@@ -28,7 +28,7 @@ const _tasks = new Map();
 
 // ── Types (JSDoc) ──────────────────────────────────────────────────────────────
 /**
- * @typedef {'waiting-for-agent'|'queued'|'running'|'done'|'failed'|'cancelled'} TaskStatus
+ * @typedef {'waiting-for-agent'|'queued'|'running'|'auth-required'|'done'|'failed'|'cancelled'} TaskStatus
  * @typedef {{ id: string, prompt: string, agentId: string|null, status: TaskStatus, createdAt: number, startedAt: number|null, doneAt: number|null, error: string|null, progress: { step: number, totalSteps: number, currentStep: string|null, eta: { lo: number, hi: number }|null }, result: string|null, intent: string, source: string }} TaskEntry
  */
 
@@ -52,8 +52,8 @@ function _load() {
     const raw = fs.readFileSync(JOURNAL_PATH, 'utf8');
     const arr = JSON.parse(raw) || [];
     for (const item of arr) {
-      // Reset running tasks to queued on restart (they didn't survive)
-      if (item.status === 'running') item.status = 'queued';
+      // Reset running/auth-required tasks to queued on restart (they didn't survive)
+      if (item.status === 'running' || item.status === 'auth-required') item.status = 'queued';
       _tasks.set(item.id, item);
     }
     logger.info('[TaskJournal] Loaded', { count: _tasks.size });
@@ -128,6 +128,7 @@ function updateTask(id, status, extra = {}) {
   if (status === 'done' || status === 'failed' || status === 'cancelled') {
     updates.doneAt = Date.now();
   }
+  // 'auth-required' is an intermediate state (not terminal) — do NOT set doneAt.
   _tasks.set(id, { ...task, ...updates });
   _save();
   _broadcast();
@@ -188,7 +189,7 @@ function getTask(id) {
  */
 function getActiveTasks() {
   return Array.from(_tasks.values())
-    .filter(t => t.status === 'queued' || t.status === 'waiting-for-agent' || t.status === 'running')
+    .filter(t => t.status === 'queued' || t.status === 'waiting-for-agent' || t.status === 'running' || t.status === 'auth-required')
     .sort((a, b) => a.createdAt - b.createdAt);
 }
 
