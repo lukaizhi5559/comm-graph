@@ -47,5 +47,12 @@ IMPORTANT BOUNDARIES:
 - "Do you like jazz?" → 1 (general_quick — opinion)
 - "How is my task going?" → 3 (status_check)
 - "Cancel that" → 4 (control_signal)
+- "Tell me the file that you printed" → 0 (handoff — conversation recall about a past action, not status check)
+- "What file did you just open?" → 0 (handoff — conversation recall)
+- "What did you just do?" → 0 (handoff — conversation recall)
+- "What was the last file you worked on?" → 0 (handoff — conversation recall)
+- "Tell me the X that you Y'd" → 0 (handoff — conversation recall about a past action)
+- "Is the download done?" → 3 (status_check — asking about completion)
+- "What's the status of X?" → 3 (status_check — asking about progress)
 
 Return ONLY a single number (0, 1, 2, 3, 4, or 5). No words, no explanation, no punctuation — just the number.

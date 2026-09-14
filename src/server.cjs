@@ -260,10 +260,14 @@ function _logConversationTurn(userText, assistantText, intentName) {
  * @param {string} englishText - English translation of user prompt
  * @param {string} detectedLanguage - ISO 639-1 language code
  * @param {string} [conversationContext] - Recent conversation turns
+ * @param {string|null} [precomputedIntent] - Pre-computed guessedIntent (avoids recomputing)
  * @returns {Promise<{ phrase: string, guessedIntent: string|null }>}
  */
-async function _generateHandoffPhrase(englishText, detectedLanguage, conversationContext) {
-  const { guessedIntent } = intentGuesser.guess(englishText);
+async function _generateHandoffPhrase(englishText, detectedLanguage, conversationContext, precomputedIntent) {
+  // Use pre-computed intent if provided (avoids recomputing the regex), else guess now
+  const guessedIntent = precomputedIntent !== undefined
+    ? precomputedIntent
+    : intentGuesser.guess(englishText).guessedIntent;
 
   let phrase = '';
 
@@ -346,14 +350,18 @@ async function processMessage(args) {
 
   switch (intent) {
     case 0: { // handoff
+      // Compute guessedIntent BEFORE handoff() so it's available for task:created
+      // (intentGuesser.guess is a pure synchronous regex — ~1ms, no LLM/async)
+      const { guessedIntent: _gi0 } = intentGuesser.guess(englishText);
       const handoffResult = await handoff({
         englishPrompt: englishText,
         source,
         originalPrompt: originalText,
+        guessedIntent: _gi0,
       });
 
       // Generate intent-aware handoff phrase (LLM for command_automate, static pool for others)
-      const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context);
+      const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi0);
       const handoffText = handoffResult.parked
         ? `${basePhrase} I'll start on that as soon as the current task finishes.`
         : basePhrase;
@@ -379,12 +387,14 @@ async function processMessage(args) {
       result = await generalQuick(englishText, systemPrompt, context);
       // If generalQuick couldn't answer (LLM failed), handoff to main state graph
       if (result.metadata.shouldHandoff) {
+        const { guessedIntent: _gi1 } = intentGuesser.guess(englishText);
         const handoffResult = await handoff({
           englishPrompt: englishText,
           source,
           originalPrompt: originalText,
+          guessedIntent: _gi1,
         });
-        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context);
+        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi1);
         const handoffText = handoffResult.parked
           ? `${basePhrase} I'll start on that as soon as the current task finishes.`
           : basePhrase;
@@ -410,12 +420,14 @@ async function processMessage(args) {
       result = await memoryQuick(englishText, systemPrompt, context);
       // If memory_quick couldn't find a match, handoff instead
       if (result.metadata.shouldHandoff) {
+        const { guessedIntent: _gi2 } = intentGuesser.guess(englishText);
         const handoffResult = await handoff({
           englishPrompt: englishText,
           source,
           originalPrompt: originalText,
+          guessedIntent: _gi2,
         });
-        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context);
+        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi2);
         const handoffText = handoffResult.parked
           ? `${basePhrase} I'll start on that as soon as the current task finishes.`
           : basePhrase;
@@ -449,12 +461,14 @@ async function processMessage(args) {
       result = await memoryStore(englishText, systemPrompt, context);
       // If memory_store failed, handoff to main state graph
       if (result.metadata.shouldHandoff) {
+        const { guessedIntent: _gi5 } = intentGuesser.guess(englishText);
         const handoffResult = await handoff({
           englishPrompt: englishText,
           source,
           originalPrompt: originalText,
+          guessedIntent: _gi5,
         });
-        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context);
+        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi5);
         const handoffText = handoffResult.parked
           ? `${basePhrase} I'll start on that as soon as the current task finishes.`
           : basePhrase;
