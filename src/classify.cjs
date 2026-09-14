@@ -94,7 +94,7 @@ async function classify(englishText, conversationContext) {
     const { text, provider } = await ask(messages, {
       maxTokens: 5,
       temperature: 0.1,
-      timeoutMs: 5000,
+      timeoutMs: 12000,
     });
 
     if (text) {
@@ -125,28 +125,11 @@ async function classify(englishText, conversationContext) {
     logger.warn('[Classify] Force-prompt error', { error: err.message });
   }
 
-  // ── Fallback: embedding-based classification ─────────────────────────────────
-  try {
-    const fallback = require('./classifier-fallback.cjs');
-    const result = await fallback.classify(englishText);
-    if (result && result.intent !== undefined) {
-      logger.info('[Classify] Fallback result', {
-        intent: result.intent, intentName: INTENTS[result.intent]?.name,
-        source: 'embedding_fallback',
-      });
-      return {
-        intent: result.intent,
-        intentName: INTENTS[result.intent]?.name || 'general_quick',
-        confidence: result.confidence || 0.5,
-        source: 'embedding_fallback',
-      };
-    }
-  } catch (err) {
-    logger.warn('[Classify] Fallback error', { error: err.message });
-  }
-
-  // ── Ultimate fallback: default to handoff (safe — let main stategraph handle) ──
-  logger.info('[Classify] All classification failed — defaulting to handoff');
+  // ── Fallback: default to handoff (safe) ──────────────────────────────────────
+  // When the LLM fails, default to handoff — the main stategraph can handle
+  // anything (including chitchat — it would just answer directly). Don't run
+  // a regex classifier that can misclassify commands as chitchat.
+  logger.info('[Classify] LLM failed — defaulting to handoff (safe)');
   return { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'default_handoff' };
 }
 

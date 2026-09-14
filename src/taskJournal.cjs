@@ -29,7 +29,7 @@ const _tasks = new Map();
 // ── Types (JSDoc) ──────────────────────────────────────────────────────────────
 /**
  * @typedef {'waiting-for-agent'|'queued'|'running'|'auth-required'|'done'|'failed'|'cancelled'} TaskStatus
- * @typedef {{ id: string, prompt: string, agentId: string|null, status: TaskStatus, createdAt: number, startedAt: number|null, doneAt: number|null, error: string|null, progress: { step: number, totalSteps: number, currentStep: string|null, eta: { lo: number, hi: number }|null }, result: string|null, intent: string, source: string }} TaskEntry
+ * @typedef {{ id: string, prompt: string, agentId: string|null, status: TaskStatus, createdAt: number, startedAt: number|null, doneAt: number|null, error: string|null, progress: { step: number, totalSteps: number, currentStep: string|null, eta: { lo: number, hi: number }|null }, result: string|null, intent: string, source: string, items?: Array<{title?:string,imageUrl?:string,url?:string,price?:string,snippet?:string,hostname?:string}>|null }} TaskEntry
  */
 
 // ── Persistence ────────────────────────────────────────────────────────────────

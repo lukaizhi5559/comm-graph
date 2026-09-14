@@ -583,7 +583,7 @@ const server = http.createServer(async (req, res) => {
     if (!body.taskId) {
       return _send(res, 400, { error: 'taskId is required' });
     }
-    handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result);
+    handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items);
     return _send(res, 200, { ok: true });
   }
 

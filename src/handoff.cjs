@@ -139,9 +139,10 @@ async function execute({ englishPrompt, source, originalPrompt }) {
  * @param {string} agentId
  * @param {string} status  - 'done' | 'failed' | 'cancelled'
  * @param {string} [result]
+ * @param {Array}  [items] - structured page cards extracted by web.crawl/browser.agent
  */
-function complete(taskId, agentId, status, result) {
-  updateTask(taskId, status, { result: result || null });
+function complete(taskId, agentId, status, result, items) {
+  updateTask(taskId, status, { result: result || null, items: items || null });
   if (agentId) {
     const nextTaskId = release(agentId, taskId);
     if (nextTaskId) {
