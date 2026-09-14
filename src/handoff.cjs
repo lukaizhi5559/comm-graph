@@ -142,7 +142,10 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent })
  * @param {string} agentId
  * @param {string} status  - 'done' | 'failed' | 'cancelled'
  * @param {string} [result]
- * @param {Array}  [items] - structured page cards extracted by web.crawl/browser.agent
+ * @param {Array}  [items] - structured page cards extracted by web.crawl/browser.agent.
+ *   Item shape: { title?, imageUrl?, url?, price?, snippet?, hostname?,
+ *                mediaType?, videoUrl?, embedUrl?, posterUrl?, duration?,
+ *                channel?, sourceUrl? }
  */
 function complete(taskId, agentId, status, result, items) {
   updateTask(taskId, status, { result: result || null, items: items || null });
