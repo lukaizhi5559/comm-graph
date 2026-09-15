@@ -116,25 +116,41 @@ function _formatContext() {
 const CONVERSATION_SERVICE_PORT = parseInt(process.env.CONVERSATION_SERVICE_PORT || '3004', 10);
 const CONV_API_KEY = process.env.MCP_CONVERSATION_API_KEY || process.env.MCP_API_KEY || '';
 
-function _fetchConversationHistory() {
+// Detect an explicit "new conversation" request so we can force a fresh session.
+function _isForceNew(text) {
+  const t = (text || '').toLowerCase().trim();
+  if (!t) return false;
+  const phrases = [
+    'new conversation', 'start fresh', 'start a new conversation',
+    'new chat', 'start new chat', 'clear conversation', 'forget this conversation',
+  ];
+  return phrases.some(p => t === p || t.startsWith(p + ' ') || t.includes(p));
+}
+
+// Route the current message through the smart session router and fetch recent
+// history for the routed session. Replaces the old `session.getActive` flow,
+// which always returned the same long-lived active session regardless of topic.
+// Returns { sessionId, history } or null on failure.
+function _fetchConversationHistory(userText) {
   return new Promise((resolve) => {
-    const body = JSON.stringify({
+    const forceNew = _isForceNew(userText);
+    const routeBody = JSON.stringify({
       version: 'mcp.v1',
       service: 'conversation',
-      action: 'session.getActive',
-      payload: {},
-      requestId: 'cg_conv_' + Date.now(),
+      action: 'session.route',
+      payload: { text: userText || '', forceNew },
+      requestId: 'cg_route_' + Date.now(),
     });
-    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(routeBody) };
     if (CONV_API_KEY) headers['Authorization'] = 'Bearer ' + CONV_API_KEY;
 
     const req = http.request({
       hostname: '127.0.0.1',
       port: CONVERSATION_SERVICE_PORT,
-      path: '/session.getActive',
+      path: '/session.route',
       method: 'POST',
       headers,
-      timeout: 1500,
+      timeout: 2000,
     }, (res) => {
       let raw = '';
       res.on('data', c => { raw += c; });
@@ -143,7 +159,7 @@ function _fetchConversationHistory() {
           const parsed = JSON.parse(raw);
           const sessionId = (parsed.data || parsed)?.sessionId;
           if (!sessionId) return resolve(null);
-          // Now fetch the message list for this session
+          // Now fetch the message list for the routed session
           const listBody = JSON.stringify({
             version: 'mcp.v1',
             service: 'conversation',
@@ -174,12 +190,12 @@ function _fetchConversationHistory() {
                   .reverse()
                   .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}: ${(m.text || m.content || '').substring(0, 200)}`)
                   .join('\n');
-                resolve(formatted || null);
-              } catch (_) { resolve(null); }
+                resolve({ sessionId, history: formatted || null });
+              } catch (_) { resolve({ sessionId, history: null }); }
             });
           });
-          listReq.on('error', () => resolve(null));
-          listReq.on('timeout', () => { listReq.destroy(); resolve(null); });
+          listReq.on('error', () => resolve({ sessionId, history: null }));
+          listReq.on('timeout', () => { listReq.destroy(); resolve({ sessionId, history: null }); });
           listReq.write(listBody);
           listReq.end();
         } catch (_) { resolve(null); }
@@ -187,7 +203,7 @@ function _fetchConversationHistory() {
     });
     req.on('error', () => resolve(null));
     req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.write(body);
+    req.write(routeBody);
     req.end();
   });
 }
@@ -197,7 +213,7 @@ function _fetchConversationHistory() {
 // Mirrors the stategraph's logConversation.js pattern. Only called for quick
 // intents (general_quick, memory_quick, memory_store) — handoff intents are
 // logged by the stategraph's logConversation node.
-function _logConversationTurn(userText, assistantText, intentName) {
+function _logConversationTurn(userText, assistantText, intentName, preRoutedSessionId) {
   if (!CONV_API_KEY) return; // no key — skip silently
   const ts = new Date().toISOString();
   const _post = (action, payload) => {
@@ -216,7 +232,16 @@ function _logConversationTurn(userText, assistantText, intentName) {
     req.write(body);
     req.end();
   };
-  // 1. Route to session, 2. log user + assistant messages in parallel after session resolved
+  // If we already routed during history fetch, reuse that sessionId — do NOT
+  // route again (a second route call could rotate the session a second time).
+  if (preRoutedSessionId) {
+    _post('message.add', { sessionId: preRoutedSessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+    if (assistantText) {
+      _post('message.add', { sessionId: preRoutedSessionId, text: assistantText, sender: 'assistant', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+    }
+    return;
+  }
+  // Fallback: route then log (used only when history fetch failed/unavailable)
   const routeBody = JSON.stringify({
     version: 'mcp.v1', service: 'conversation', action: 'session.route',
     payload: { text: userText },
@@ -316,16 +341,19 @@ async function processMessage(args) {
   // Run translation, persona fetch, and conversation-service history fetch in parallel
   // for maximum speed. Conversation history fetch has a 1500ms timeout and falls back
   // to the in-memory history if the service is unreachable.
-  const [translateResult, convHistory] = await Promise.all([
+  const [translateResult, routeResult] = await Promise.all([
     toEnglish({ text, language }),
-    _fetchConversationHistory(),
+    _fetchConversationHistory(text),
   ]);
   const { englishText, originalText, detectedLanguage, wasTranslated } = translateResult;
+  const routedSessionId = routeResult?.sessionId || null;
+  const convHistory = routeResult?.history || null;
 
   logger.info('[Process] Translated', {
     wasTranslated, detectedLanguage,
     englishPreview: englishText.substring(0, 80),
     hasConvHistory: !!convHistory,
+    routedSessionId,
   });
 
   // ── Step 2: Fetch personality overlay + build system prompt ───────────────────
@@ -513,7 +541,7 @@ async function processMessage(args) {
   _addTurn(englishText, finalText, intent);
   // Log to conversation-service for quick intents (handoff is logged by stategraph)
   if (intent === 1 || intent === 2 || intent === 5) {
-    _logConversationTurn(englishText, finalText, intentName);
+    _logConversationTurn(englishText, finalText, intentName, routedSessionId);
   }
 
   const latencyMs = Date.now() - startTime;

@@ -55,4 +55,12 @@ IMPORTANT BOUNDARIES:
 - "Is the download done?" → 3 (status_check — asking about completion)
 - "What's the status of X?" → 3 (status_check — asking about progress)
 
+DISAMBIGUATION — "remember" is ambiguous:
+- "Remember I have a meeting at 3pm" → 5 (memory_store — storing a fact)
+- "Remember my birthday is May 5th" → 5 (memory_store — storing a fact)
+- "you need to add the images there remember?" → 0 (handoff — "remember" means "as we discussed", not "store this")
+- "not from my computer but from the web remember" → 0 (handoff — correction/instruction, not memory storage)
+- If the message contains an action verb (add, download, create, find, copy, save, put, send, open, close) AND "remember" → 0 (handoff — "remember" is a conversational reference, not a storage command)
+- If the message is a CORRECTION or CLARIFICATION of a previous task ("not from X but from Y", "I meant Z", "actually W") → 0 (handoff — it's a task instruction, not memory storage)
+
 Return ONLY a single number (0, 1, 2, 3, 4, or 5). No words, no explanation, no punctuation — just the number.
