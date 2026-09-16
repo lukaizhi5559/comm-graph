@@ -42,7 +42,7 @@ const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
 const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
 const { execute: statusCheck } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
-const { execute: handoff, complete: handoffComplete } = require('./handoff.cjs');
+const { execute: handoff, complete: handoffComplete, remove: handoffRemove } = require('./handoff.cjs');
 const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
 const intentGuesser = require('./intentGuesser.cjs');
 const taskJournal = require('./taskJournal.cjs');
@@ -563,6 +563,7 @@ async function processMessage(args) {
 
 // ── HTTP server ────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
+ try {
   // ── SSE stream for task/lock updates ──────────────────────────────────────────
   if (req.url === '/events' && req.method === 'GET') {
     res.writeHead(200, {
@@ -655,7 +656,7 @@ const server = http.createServer(async (req, res) => {
     if (!body.taskId) {
       return _send(res, 400, { error: 'taskId is required' });
     }
-    const ok = handoff.remove(body.taskId);
+    const ok = handoffRemove(body.taskId);
     return _send(res, ok ? 200 : 404, { ok });
   }
 
@@ -670,13 +671,19 @@ const server = http.createServer(async (req, res) => {
       return _send(res, 404, { ok: false, error: 'task not found' });
     }
     // Release agent lock if held, then mark cancelled
-    try { handoff.remove(body.taskId); } catch (_) {}
+    try { handoffRemove(body.taskId); } catch (_) {}
     taskJournal.updateTask(body.taskId, 'cancelled', { error: 'cancelled by user' });
     return _send(res, 200, { ok: true });
   }
 
   // ── 404 ────────────────────────────────────────────────────────────────────────
   _send(res, 404, { error: 'Not found', url: req.url, method: req.method });
+ } catch (err) {
+  logger.error('[Server] Unhandled route error', { url: req.url, error: err?.message });
+  if (!res.headersSent && !res.writableEnded) {
+    _send(res, 500, { error: 'internal error' });
+  }
+ }
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────────
