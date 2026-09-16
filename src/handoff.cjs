@@ -63,9 +63,10 @@ function detectAgent(englishPrompt) {
  * @param {string} source  - 'voice' or 'text'
  * @param {string|null} originalPrompt - non-English original (for display)
  * @param {string|null} [guessedIntent] - comms-graph regex guess (for early sound/UX)
+ * @param {string|null} [sessionId] - Conversation session this task belongs to
  * @returns {Promise<boolean>} true if notification was sent
  */
-function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent) {
+function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       taskId,
@@ -74,6 +75,7 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
       source,
       originalPrompt: originalPrompt || englishPrompt,
       guessedIntent: guessedIntent !== undefined ? guessedIntent : null,
+      sessionId: sessionId || null,
     });
     const req = http.request({
       hostname: '127.0.0.1',
@@ -101,9 +103,10 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
  * @param {string} args.source        - 'voice' or 'text'
  * @param {string|null} [args.originalPrompt] - Non-English original (for display)
  * @param {string|null} [args.guessedIntent] - comms-graph regex guess (forwarded to main.js)
+ * @param {string|null} [args.sessionId] - Conversation session this prompt was routed into
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, guessedIntent }) {
+async function execute({ englishPrompt, source, originalPrompt, guessedIntent, sessionId = null }) {
   const agentId = detectAgent(englishPrompt);
 
   // Create task in journal
@@ -112,6 +115,7 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent })
     agentId,
     intent: 'handoff',
     source,
+    sessionId,
   });
 
   // Try to acquire agent lock
@@ -120,7 +124,7 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent })
   if (acquired) {
     // Lock acquired — notify main.js to spawn stategraph run
     updateTask(taskId, 'queued');
-    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent);
+    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId);
     if (!notified) {
       logger.warn('[Handoff] Failed to notify main.js — task will be picked up on retry', { taskId });
     }
@@ -146,16 +150,17 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent })
  *   Item shape: { title?, imageUrl?, url?, price?, snippet?, hostname?,
  *                mediaType?, videoUrl?, embedUrl?, posterUrl?, duration?,
  *                channel?, sourceUrl? }
+ * @param {string|null} [sessionId] - Conversation session the run resolved into
  */
-function complete(taskId, agentId, status, result, items) {
-  updateTask(taskId, status, { result: result || null, items: items || null });
+function complete(taskId, agentId, status, result, items, sessionId = null, planFile = null) {
+  updateTask(taskId, status, { result: result || null, items: items || null, sessionId, ...(planFile ? { planFile } : {}) });
   if (agentId) {
     const nextTaskId = release(agentId, taskId);
     if (nextTaskId) {
       // A waiting task was resumed — notify main.js to start it
       const task = require('./taskJournal.cjs').getTask(nextTaskId);
       if (task) {
-        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null)
+        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, null, task.sessionId)
           .catch(() => {});
       }
     }
@@ -178,7 +183,7 @@ function remove(taskId) {
     if (nextTaskId) {
       const nextTask = require('./taskJournal.cjs').getTask(nextTaskId);
       if (nextTask) {
-        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null)
+        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, null, nextTask.sessionId)
           .catch(() => {});
       }
     }

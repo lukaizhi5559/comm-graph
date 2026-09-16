@@ -127,11 +127,61 @@ function _isForceNew(text) {
   return phrases.some(p => t === p || t.startsWith(p + ' ') || t.includes(p));
 }
 
+// Fetch the formatted message list for a session.
+// Returns { sessionId, history } — history is null if the fetch fails.
+function _listSessionMessages(sessionId) {
+  return new Promise((resolve) => {
+    const listBody = JSON.stringify({
+      version: 'mcp.v1',
+      service: 'conversation',
+      action: 'message.list',
+      payload: { sessionId, limit: 16, direction: 'DESC' },
+      requestId: 'cg_conv_list_' + Date.now(),
+    });
+    const listHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(listBody) };
+    if (CONV_API_KEY) listHeaders['Authorization'] = 'Bearer ' + CONV_API_KEY;
+    const listReq = http.request({
+      hostname: '127.0.0.1',
+      port: CONVERSATION_SERVICE_PORT,
+      path: '/message.list',
+      method: 'POST',
+      headers: listHeaders,
+      timeout: 1500,
+    }, (listRes) => {
+      let listRaw = '';
+      listRes.on('data', c => { listRaw += c; });
+      listRes.on('end', () => {
+        try {
+          const listParsed = JSON.parse(listRaw);
+          const messages = (listParsed.data || listParsed)?.messages || [];
+          // Format as "User: ... \n Assistant: ..." (last 6, reversed to chronological)
+          const formatted = messages
+            .filter(m => m.sender !== 'system')
+            .slice(0, 12)
+            .reverse()
+            .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}: ${(m.text || m.content || '').substring(0, 200)}`)
+            .join('\n');
+          resolve({ sessionId, history: formatted || null });
+        } catch (_) { resolve({ sessionId, history: null }); }
+      });
+    });
+    listReq.on('error', () => resolve({ sessionId, history: null }));
+    listReq.on('timeout', () => { listReq.destroy(); resolve({ sessionId, history: null }); });
+    listReq.write(listBody);
+    listReq.end();
+  });
+}
+
 // Route the current message through the smart session router and fetch recent
 // history for the routed session. Replaces the old `session.getActive` flow,
 // which always returned the same long-lived active session regardless of topic.
 // Returns { sessionId, history } or null on failure.
-function _fetchConversationHistory(userText) {
+// When pinnedSessionId is set (task recall / "Continue Thread"), routing is
+// skipped entirely — the session is authoritative regardless of topic drift.
+function _fetchConversationHistory(userText, pinnedSessionId = null) {
+  if (pinnedSessionId) {
+    return _listSessionMessages(pinnedSessionId);
+  }
   return new Promise((resolve) => {
     const forceNew = _isForceNew(userText);
     const routeBody = JSON.stringify({
@@ -160,44 +210,7 @@ function _fetchConversationHistory(userText) {
           const sessionId = (parsed.data || parsed)?.sessionId;
           if (!sessionId) return resolve(null);
           // Now fetch the message list for the routed session
-          const listBody = JSON.stringify({
-            version: 'mcp.v1',
-            service: 'conversation',
-            action: 'message.list',
-            payload: { sessionId, limit: 16, direction: 'DESC' },
-            requestId: 'cg_conv_list_' + Date.now(),
-          });
-          const listHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(listBody) };
-          if (CONV_API_KEY) listHeaders['Authorization'] = 'Bearer ' + CONV_API_KEY;
-          const listReq = http.request({
-            hostname: '127.0.0.1',
-            port: CONVERSATION_SERVICE_PORT,
-            path: '/message.list',
-            method: 'POST',
-            headers: listHeaders,
-            timeout: 1500,
-          }, (listRes) => {
-            let listRaw = '';
-            listRes.on('data', c => { listRaw += c; });
-            listRes.on('end', () => {
-              try {
-                const listParsed = JSON.parse(listRaw);
-                const messages = (listParsed.data || listParsed)?.messages || [];
-                // Format as "User: ... \n Assistant: ..." (last 6, reversed to chronological)
-                const formatted = messages
-                  .filter(m => m.sender !== 'system')
-                  .slice(0, 12)
-                  .reverse()
-                  .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}: ${(m.text || m.content || '').substring(0, 200)}`)
-                  .join('\n');
-                resolve({ sessionId, history: formatted || null });
-              } catch (_) { resolve({ sessionId, history: null }); }
-            });
-          });
-          listReq.on('error', () => resolve({ sessionId, history: null }));
-          listReq.on('timeout', () => { listReq.destroy(); resolve({ sessionId, history: null }); });
-          listReq.write(listBody);
-          listReq.end();
+          _listSessionMessages(sessionId).then(resolve);
         } catch (_) { resolve(null); }
       });
     });
@@ -343,10 +356,11 @@ async function processMessage(args) {
   // to the in-memory history if the service is unreachable.
   const [translateResult, routeResult] = await Promise.all([
     toEnglish({ text, language }),
-    _fetchConversationHistory(text),
+    _fetchConversationHistory(text, args.sessionId || null),
   ]);
   const { englishText, originalText, detectedLanguage, wasTranslated } = translateResult;
-  const routedSessionId = routeResult?.sessionId || null;
+  // args.sessionId is a pin (task recall) — it wins over semantic routing.
+  const routedSessionId = args.sessionId || routeResult?.sessionId || null;
   const convHistory = routeResult?.history || null;
 
   logger.info('[Process] Translated', {
@@ -386,6 +400,7 @@ async function processMessage(args) {
         source,
         originalPrompt: originalText,
         guessedIntent: _gi0,
+        sessionId: routedSessionId,
       });
 
       // Generate intent-aware handoff phrase (LLM for command_automate, static pool for others)
@@ -421,6 +436,7 @@ async function processMessage(args) {
           source,
           originalPrompt: originalText,
           guessedIntent: _gi1,
+          sessionId: routedSessionId,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi1);
         const handoffText = handoffResult.parked
@@ -454,6 +470,7 @@ async function processMessage(args) {
           source,
           originalPrompt: originalText,
           guessedIntent: _gi2,
+          sessionId: routedSessionId,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi2);
         const handoffText = handoffResult.parked
@@ -495,6 +512,7 @@ async function processMessage(args) {
           source,
           originalPrompt: originalText,
           guessedIntent: _gi5,
+          sessionId: routedSessionId,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi5);
         const handoffText = handoffResult.parked
@@ -626,7 +644,7 @@ const server = http.createServer(async (req, res) => {
     if (!body.taskId) {
       return _send(res, 400, { error: 'taskId is required' });
     }
-    handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items);
+    handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items, body.sessionId || null, body.planFile || null);
     return _send(res, 200, { ok: true });
   }
 

@@ -102,9 +102,10 @@ function _broadcast() {
  * @param {string|null} [opts.agentId] - Target agent (if known)
  * @param {string} [opts.intent]     - Intent that triggered the handoff
  * @param {string} [opts.source]     - 'voice' or 'text'
+ * @param {string|null} [opts.sessionId] - Conversation session the task belongs to (for recall)
  * @returns {string} task id
  */
-function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text' }) {
+function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null }) {
   const id = _uid();
   /** @type {TaskEntry} */
   const task = {
@@ -120,6 +121,7 @@ function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text
     result: null,
     intent,
     source,
+    sessionId,
   };
   _tasks.set(id, task);
   _save();
@@ -141,6 +143,7 @@ function updateTask(id, status, extra = {}) {
   if (status === 'running' && !task.startedAt) updates.startedAt = Date.now();
   if (status === 'done' || status === 'failed' || status === 'cancelled') {
     updates.doneAt = Date.now();
+    updates.planFile = null; // terminal tasks must not retain reviewable-plan state
   }
   // 'auth-required' is an intermediate state (not terminal) — do NOT set doneAt.
   _tasks.set(id, { ...task, ...updates });
