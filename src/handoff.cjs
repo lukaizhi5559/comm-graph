@@ -157,10 +157,13 @@ function complete(taskId, agentId, status, result, items, sessionId = null, plan
   if (agentId) {
     const nextTaskId = release(agentId, taskId);
     if (nextTaskId) {
-      // A waiting task was resumed — notify main.js to start it
+      // A waiting task was resumed — notify main.js to start it.
+      // Re-guess the intent so the resumed task:created carries it (the guess
+      // is not stored in the journal — task.intent stays 'handoff').
       const task = require('./taskJournal.cjs').getTask(nextTaskId);
       if (task) {
-        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, null, task.sessionId)
+        const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
+        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, guessedIntent, task.sessionId)
           .catch(() => {});
       }
     }
@@ -183,7 +186,8 @@ function remove(taskId) {
     if (nextTaskId) {
       const nextTask = require('./taskJournal.cjs').getTask(nextTaskId);
       if (nextTask) {
-        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, null, nextTask.sessionId)
+        const guessedIntent = require('./intentGuesser.cjs').guess(nextTask.prompt).guessedIntent;
+        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, guessedIntent, nextTask.sessionId)
           .catch(() => {});
       }
     }
