@@ -93,6 +93,15 @@ function _broadcast() {
   if (_broadcastFn) _broadcastFn(getActiveTasks());
 }
 
+// ── Terminal-state hook (thought engine queue producer) ───────────────────────
+let _onTerminalFn = null;
+
+function setOnTerminal(fn) {
+  _onTerminalFn = fn;
+}
+
+const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled']);
+
 // ── Public API ──────────────────────────────────────────────────────────────────
 
 /**
@@ -150,6 +159,9 @@ function updateTask(id, status, extra = {}) {
   _save();
   _broadcast();
   logger.info('[TaskJournal] Updated', { id, status, ...extra });
+  if (TERMINAL_STATUSES.has(status) && _onTerminalFn) {
+    try { _onTerminalFn(_tasks.get(id)); } catch (_) { /* hook must never break journal */ }
+  }
 }
 
 /**
@@ -282,6 +294,7 @@ setInterval(cleanup, 5 * 60 * 1000);
 
 module.exports = {
   setBroadcast,
+  setOnTerminal,
   createTask,
   updateTask,
   updateProgress,

@@ -48,6 +48,28 @@ const intentGuesser = require('./intentGuesser.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
 
+// ── Thought engine prompt producer ─────────────────────────────────────────────
+// Fire-and-forget POST of each user prompt to personality-service so the
+// Thought/Trigger engine can accumulate prompt-derived thoughts.
+const PERSONALITY_PORT = parseInt(process.env.PERSONALITY_SERVICE_PORT || '3012', 10);
+function _notifyThoughtEngine(type, info) {
+  try {
+    const body = JSON.stringify({
+      version: 'mcp.v1', service: 'personality-service', action: 'thought.input',
+      payload: { type, ...info }, requestId: 'cg_th_' + Date.now(),
+    });
+    const req = http.request({
+      hostname: '127.0.0.1', port: PERSONALITY_PORT, path: '/thought.input',
+      method: 'POST', timeout: 3000,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => res.resume());
+    req.on('error', () => {});
+    req.on('timeout', () => req.destroy());
+    req.write(body);
+    req.end();
+  } catch (_) {}
+}
+
 // ── HTTP helpers ────────────────────────────────────────────────────────────────
 function _readBody(req) {
   return new Promise((resolve) => {
@@ -82,6 +104,17 @@ function _broadcastTasks() {
 }
 
 taskJournal.setBroadcast(_broadcastTasks);
+
+// Feed task completions into the thought engine as 'queue' inputs — the engine
+// gains awareness of its own dispatched work and can correlate artifacts back.
+taskJournal.setOnTerminal((task) => {
+  _notifyThoughtEngine('queue', {
+    taskId: task.id,
+    status: task.status,
+    text: `Task ${task.status}: ${task.prompt}`,
+    result: typeof task.result === 'string' ? task.result.slice(0, 500) : null,
+  });
+});
 agentLock.setLockBroadcast((lockState) => {
   const msg = JSON.stringify({ type: 'locks:update', locks: lockState });
   for (const res of _clients) {
@@ -387,6 +420,9 @@ async function processMessage(args) {
     intent, intentName, confidence, classifySource,
   });
 
+  // ── Thought engine: feed the prompt as a candidate input (fire-and-forget) ────
+  _notifyThoughtEngine('prompt', { text: englishText, sessionId: routedSessionId, intentName });
+
   // ── Step 4: Execute based on intent ───────────────────────────────────────────
   let result;
 
@@ -627,6 +663,31 @@ const server = http.createServer(async (req, res) => {
       return _send(res, 200, { ok: true, data: result });
     } catch (err) {
       logger.error('[Server] processMessage error', { error: err.message, stack: err.stack });
+      return _send(res, 500, { error: 'Internal error', message: err.message });
+    }
+  }
+
+  // ── Proactive work dispatch (from personality-service Thought engine) ────────
+  // A triggered 'prompt' action dispatches autonomous work through the normal
+  // handoff path (lock check → task journal → main.js stategraph run).
+  if (req.url === '/comms.proactive' && req.method === 'POST') {
+    const body = await _readBody(req);
+    if (!body.prompt) {
+      return _send(res, 400, { error: 'prompt is required' });
+    }
+    try {
+      const { guessedIntent } = intentGuesser.guess(body.prompt);
+      const result = await handoff({
+        englishPrompt: body.prompt,
+        source: 'proactive',
+        originalPrompt: body.prompt,
+        guessedIntent,
+        sessionId: body.sessionId || null,
+      });
+      logger.info('[Server] Proactive dispatch', { taskId: result.taskId, thoughtId: body.thoughtId });
+      return _send(res, 200, { ok: true, ...result });
+    } catch (err) {
+      logger.error('[Server] proactive dispatch error', { error: err.message });
       return _send(res, 500, { error: 'Internal error', message: err.message });
     }
   }
