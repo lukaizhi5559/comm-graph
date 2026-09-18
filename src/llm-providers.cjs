@@ -254,7 +254,12 @@ async function askEarly(messages, opts = {}) {
 
   const checkEarly = () => {
     if (earlyResolved) return;
-    const match = accumulated.match(/^[^.?!]*[.?!]/);
+    // First "real" sentence boundary: ≥5 chars, terminator followed by
+    // whitespace + a non-lowercase char (lowercase continuation = mid-sentence,
+    // e.g. "e.g. you..."), and not preceded by a short title-case word
+    // (Mr./Dr./Jr./Jan.-style abbreviations). Mid-token dots ("Three.js",
+    // "v1.2", "3.14") and chunk boundaries ending in "." are skipped.
+    const match = accumulated.match(/^[\s\S]{5,}?(?<![A-Z][a-z]{1,3})[.?!](?=\s+[^a-z])/);
     if (match && match[0].trim().length > 4) {
       firstSentence = match[0].trim();
       earlyResolved = true;
@@ -266,10 +271,10 @@ async function askEarly(messages, opts = {}) {
     checkEarly();
   });
 
-  // Re-check with full text
+  // Re-check with full text — end-of-string also counts as a boundary here
   const fullText = result.fullText;
   if (!earlyResolved) {
-    const match = fullText.match(/^[^.?!]*[.?!]/);
+    const match = fullText.match(/^[\s\S]{5,}?(?<![A-Z][a-z]{1,3})[.?!](?=\s+[^a-z]|$)/);
     firstSentence = (match && match[0].trim().length > 4) ? match[0].trim() : fullText.trim();
   }
 

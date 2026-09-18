@@ -581,10 +581,12 @@ async function processMessage(args) {
   }
 
   // ── Step 5: Translate response back to user's language (if non-English) ──────
-  let finalText = result.text;
+  // Use fullText (the complete answer) not text (the first-sentence preview) —
+  // display, translate-back, and conversation history all need the full reply.
+  let finalText = result.fullText || result.text;
   if (wasTranslated && detectedLanguage !== 'en' && finalText && finalText.trim()) {
     try {
-      finalText = await fromEnglish(result.text, detectedLanguage);
+      finalText = await fromEnglish(finalText, detectedLanguage);
       logger.info('[Process] Translated response back', {
         to: detectedLanguage,
         preview: finalText.substring(0, 80),

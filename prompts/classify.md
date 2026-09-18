@@ -15,6 +15,7 @@ CLASSIFICATION RULES:
 7. If the message asks about a CURRENT office-holder, current event, latest news, present-day status, or any time-sensitive fact the LLM cannot know without live data → classify as 0 (handoff). Pattern: "who is the current X of Y", "who is the X right now", "what is the latest X", "what happened today", "as of now who holds X".
 8. If the message asks about the CONVERSATION ITSELF — what was discussed, whether a topic was mentioned, what the user asked or said earlier, or requests searching conversation history/memory → classify as 0 (handoff — needs full transcript search). Pattern: "did we talk about X", "what did we discuss", "what did I just ask", "what were we talking about", "look that up in your memory", "remind me what we said", "check your memory", "in our conversation".
 9. If the message is a SHORT conversational follow-up REACTING to the assistant's previous answer — asking why, expressing confusion, or requesting clarification of what was just said → classify as 1 (general_quick — it continues the conversation, it does not request a task). This differs from rule 8: reacting to an answer is chitchat; asking WHAT was said is recall. Pattern: "why?", "why not", "how come", "what do you mean", "huh", "really?", "seriously?".
+10. If answering the message well requires a LONG-FORM response or a generated deliverable — code/snippets/starter code, scripts, essays, stories, poems, detailed step-by-step guides, long lists, documents → classify as 0 (handoff — the stategraph produces the full answer). This differs from rule 2: a quick fact or opinion stays inline; a deliverable does not. Pattern: "show me X code", "write me a script/essay/poem", "give me a step-by-step guide to X", "draft a document about X".
 
 IMPORTANT BOUNDARIES:
 - "What time is it?" → 0 (handoff — needs real-time device clock)
@@ -46,6 +47,12 @@ IMPORTANT BOUNDARIES:
 - "Who was the first X of Y?" → 1 (general_quick — historical fact, stable)
 - "What is quantum computing?" → 1 (general_quick — LLM can answer directly)
 - "Do you like jazz?" → 1 (general_quick — opinion)
+- "What is Three.js?" → 1 (general_quick — short definition, quick answer)
+- "What does .js stand for?" → 1 (general_quick — quick fact)
+- "Show me some Three.js starter code" → 0 (handoff — code deliverable, long-form)
+- "Write a Python script that does X" → 0 (handoff — code deliverable)
+- "Write a poem about X" → 0 (handoff — creative deliverable)
+- "Give me a step-by-step guide to X" → 0 (handoff — long-form guide)
 - "How is my task going?" → 3 (status_check)
 - "Cancel that" → 4 (control_signal)
 - "Tell me the file that you printed" → 0 (handoff — conversation recall about a past action, not status check)
