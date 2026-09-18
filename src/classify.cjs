@@ -82,9 +82,30 @@ const _intentListStr = _intentKeys.join(', ');
  * @param {string[]} [conversationContext] - Recent conversation turns for context
  * @returns {Promise<{ intent: number, intentName: string, confidence: number, source: string }>}
  */
+// ── Bare follow-up guard ──────────────────────────────────────────────────────
+// Short conversational follow-ups about the previous answer can never be
+// actionable tasks — but the LLM classifier occasionally routes them to
+// handoff (observed: "why not" → intent 0 → a spurious queued task).
+// Exact-match a small set after stripping punctuation — no regexes.
+// Requires conversation history so a bare "why" as a session opener still
+// goes through normal classification.
+const BARE_FOLLOWUPS = new Set([
+  'why', 'why not', 'how come', 'what do you mean', 'huh', 'really',
+  'seriously', 'what', 'and', 'so', 'ok', 'okay',
+]);
+
 async function classify(englishText, conversationContext) {
   if (!englishText || !englishText.trim()) {
     return { intent: 1, intentName: 'general_quick', confidence: 0.5, source: 'empty_input' };
+  }
+
+  const normalized = englishText.toLowerCase().trim()
+    .replaceAll('?', '').replaceAll('!', '').replaceAll('.', '').trim();
+  if (conversationContext && BARE_FOLLOWUPS.has(normalized)) {
+    logger.info('[Classify] Bare follow-up → general_quick', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 1, intentName: 'general_quick', confidence: 0.95, source: 'bare_followup' };
   }
 
   // ── Try force-prompt classification (primary) ────────────────────────────────

@@ -37,6 +37,7 @@ const PORT = parseInt(process.env.PORT || '3015', 10);
 const { toEnglish, fromEnglish, normalizeLanguage } = require('./translate.cjs');
 const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona.cjs');
 const { classify, INTENTS } = require('./classify.cjs');
+const { sanitizeContext } = require('./refusal.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
 const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
@@ -412,7 +413,9 @@ async function processMessage(args) {
 
   // ── Step 3: Classify intent (force-prompt, numbered) ───────────────────────────
   // Use conversation-service history if available, otherwise fall back to in-memory
-  const context = convHistory || _formatContext();
+  // Strip canned-refusal Assistant lines left over from pre-fix sessions so
+  // models don't mimic the refusal voice (heals already-poisoned history).
+  const context = sanitizeContext(convHistory || _formatContext());
   const { intent, intentName, confidence, source: classifySource } =
     await classify(englishText, context);
 

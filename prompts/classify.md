@@ -14,6 +14,7 @@ CLASSIFICATION RULES:
 6. If the message asks for the current time, today's date, the current day of the week, or any real-time local information the LLM cannot know without a device clock → classify as 0 (handoff).
 7. If the message asks about a CURRENT office-holder, current event, latest news, present-day status, or any time-sensitive fact the LLM cannot know without live data → classify as 0 (handoff). Pattern: "who is the current X of Y", "who is the X right now", "what is the latest X", "what happened today", "as of now who holds X".
 8. If the message asks about the CONVERSATION ITSELF — what was discussed, whether a topic was mentioned, what the user asked or said earlier, or requests searching conversation history/memory → classify as 0 (handoff — needs full transcript search). Pattern: "did we talk about X", "what did we discuss", "what did I just ask", "what were we talking about", "look that up in your memory", "remind me what we said", "check your memory", "in our conversation".
+9. If the message is a SHORT conversational follow-up REACTING to the assistant's previous answer — asking why, expressing confusion, or requesting clarification of what was just said → classify as 1 (general_quick — it continues the conversation, it does not request a task). This differs from rule 8: reacting to an answer is chitchat; asking WHAT was said is recall. Pattern: "why?", "why not", "how come", "what do you mean", "huh", "really?", "seriously?".
 
 IMPORTANT BOUNDARIES:
 - "What time is it?" → 0 (handoff — needs real-time device clock)
@@ -54,6 +55,10 @@ IMPORTANT BOUNDARIES:
 - "Tell me the X that you Y'd" → 0 (handoff — conversation recall about a past action)
 - "Is the download done?" → 3 (status_check — asking about completion)
 - "What's the status of X?" → 3 (status_check — asking about progress)
+- "Why not?" (reacting to your previous answer) → 1 (general_quick — follow-up, not a task)
+- "How come?" → 1 (general_quick — follow-up)
+- "What do you mean?" → 1 (general_quick — follow-up asking for clarification)
+- "Why can't you help with X?" → 1 (general_quick — asks about the refusal/answer, not requesting X itself)
 
 DISAMBIGUATION — "remember" is ambiguous:
 - "Remember I have a meeting at 3pm" → 5 (memory_store — storing a fact)

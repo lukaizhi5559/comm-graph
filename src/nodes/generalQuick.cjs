@@ -24,6 +24,7 @@
 const logger = require('../logger.cjs');
 const { askEarly, buildMessages } = require('../llm-providers.cjs');
 const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
+const { isCannedRefusal } = require('../refusal.cjs');
 
 // ── Direct answer mode directive ─────────────────────────────────────────────
 // Appended to the system prompt to override the persona's handoff phrase
@@ -70,12 +71,15 @@ async function execute(englishText, systemPrompt, conversationContext) {
     const response = firstSentence || fullText;
 
     // ── Sentinel check: LLM signals it cannot answer ────────────────────────
-    // Covers empty responses and explicit 0 (handoff) signals.
-    if (!response || !response.trim() || response.trim() === '0') {
+    // Covers empty responses, explicit 0 (handoff) signals, and canned
+    // refusals — the backend's last-refusal grace returns refusal text when
+    // EVERY provider declined; never echo that to the user, hand off instead.
+    const refusal = isCannedRefusal(response);
+    if (!response || !response.trim() || response.trim() === '0' || refusal) {
       const phrase = getRandomHandoffPhrase();
       logger.info('[GeneralQuick] Handoff signaled', {
         phrase, provider,
-        reason: !response ? 'empty' : 'sentinel',
+        reason: !response ? 'empty' : (refusal ? 'refusal' : 'sentinel'),
       });
       return {
         text: phrase,
