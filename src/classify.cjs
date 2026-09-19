@@ -20,6 +20,8 @@
 const fs = require('fs');
 const path = require('path');
 const logger = require('./logger.cjs');
+// Canonical patterns live in shared/text-patterns.cjs — update there, not here.
+const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE } = require('../../shared/text-patterns.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
@@ -89,20 +91,13 @@ const _intentListStr = _intentKeys.join(', ');
 // Exact-match a small set after stripping punctuation — no regexes.
 // Requires conversation history so a bare "why" as a session opener still
 // goes through normal classification.
-const BARE_FOLLOWUPS = new Set([
-  'why', 'why not', 'how come', 'what do you mean', 'huh', 'really',
-  'seriously', 'what', 'and', 'so', 'ok', 'okay',
-]);
-
 // ── Offer-consent guard ──────────────────────────────────────────────────────
 // A bare affirmation ("yes", "sure", "ok", "go ahead", "yes you can") replying
 // to an assistant OFFER ("Would you like me to X?", "Want me to X?", "I can X")
 // means "do the offered thing" — that needs the stategraph, not a quick "Sure!".
 // Without this, general_quick can acknowledge the consent without executing the
 // offer (and the stategraph then has to reverse-engineer the referent).
-const BARE_AFFIRM_RE = /^(?:yes|yeah|yep|yup|sure|ok(?:ay)?|go\s+ahead|do\s+it|yes\s+you\s+can|please\s+do|sounds?\s+good|absolutely|definitely|of\s+course|please)$/;
-const OFFER_RE = /\b(?:would you like me to|want me to|shall i|should i|do you want me to|i can|i could|let me know if you'?d like|if you'?d like)\b/i;
-
+// Patterns are canonical in shared/text-patterns.cjs.
 function _lastAssistantTurn(conversationContext) {
   if (typeof conversationContext !== 'string') return '';
   const matches = conversationContext.match(/Assistant: ([^\n]*)/g);
@@ -117,26 +112,8 @@ function _lastAssistantTurn(conversationContext) {
 // recent turns and will confidently (wrongly) deny prior conversations exist.
 // The LLM classifier (rule 8) catches clean phrasings but slips on
 // voice-transcribed/borderline ones, so this deterministic check runs first.
-const CONVERSATION_RECALL_RE = new RegExp([
-  // explicit transcript nouns: "our previous conversation", "the chat history", "chat log"
-  '\\b(our|your|my|previous|past|prior|earlier|the)\\s+(?:\\w+\\s+){0,2}(conversations?|chats?|chat\\s*(?:history|logs?)|conversation\\s*(?:history|logs?)|discussions?)\\b',
-  // "what have we been talking/chatting about", "we've been chatting about what"
-  // (\w* stems tolerate STT truncation: "chatt", "talkin", "discussin")
-  '\\b(?:we|i)(?:\'(?:ve|re))?\\s+(?:have|had|were|are|been)\\s+.{0,20}?\\b(?:talk\\w*|chat\\w*|discuss\\w*|spoke|went\\s+over|covered)\\b',
-  // "did we talk about X", "have we discussed/chatted"
-  '\\b(?:did|have|had)\\s+we\\s+(?:talk\\w*|chat\\w*|discuss\\w*|speak|go\\s+over|cover|mention)\\b',
-  // "what did I (just) ask/say/tell you", "what was my last question/prompt"
-  '\\bwhat\\s+did\\s+i\\s+(?:just\\s+)?(?:ask|say|tell\\s+you|mention)\\b',
-  '\\bwhat\\s+was\\s+my\\s+(?:last|first|previous)\\s+(?:question|prompt|message|request)\\b',
-  // "remind me what we said", "look/pull up (our/the) conversation"
-  '\\bremind\\s+me\\s+what\\s+we\\b',
-  '\\b(?:look|pull|bring)\\s+up\\s+.{0,30}?\\b(?:conversations?|chats?)\\b',
-  // "summarize/recap our conversation", "the messages we chatted/sent"
-  '\\b(?:summarize|recap|sum\\s+up)\\s+.{0,20}?\\b(?:conversations?|chats?|discussed)\\b',
-  '\\bmessages?\\s+we\\s+(?:chatted|talked|sent|discussed|exchanged)\\b',
-  // "no/any conversation with you (at all)", "conversations with you"
-  '\\bconversations?\\s+with\\s+(?:you|thinkdrop)\\b',
-].join('|'), 'i');
+// CONVERSATION_RECALL_RE is canonical in shared/text-patterns.cjs (tolerant
+// multi-alternative version — STT stems "chatt"/"talkin" handled there).
 
 async function classify(englishText, conversationContext) {
   if (!englishText || !englishText.trim()) {

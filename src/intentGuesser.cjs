@@ -19,17 +19,18 @@
 
 const logger = require('./logger.cjs');
 
-// ── Named apps/sites that indicate command_automate (not web_search) ──────────
-const _NAMED_APP_RE = /\b(chatgpt|chat\s*gpt|openai|claude|anthropic|perplexity|grok|x\.ai|gmail|google\s*mail|youtube|yt|amazon|twitter|x\.com|tweet|reddit|github|git\s*hub|notion|slack|spotify|netflix|whatsapp|telegram|discord|linkedin|facebook|instagram|tiktok|maps|google\s*maps|apple\s*music|zoom|figma|vscode|vs\s*code|safari|chrome|firefox|edge|word|excel|powerpoint|outlook|calendar|dropbox|drive|google\s*docs|google\s*sheets|google\s*slides)\b/i;
-
-// ── Action verbs that indicate command_automate (paired with a named app) ─────
-// Lookup verbs (search/find/check) are intentionally EXCLUDED — "search X on
+// Canonical patterns live in shared/text-patterns.cjs — update there, not here.
+// NAMED_APP_RE + ACTION_VERB_RE: named-app + action-verb → command_automate.
+// Lookup verbs are intentionally EXCLUDED from ACTION_VERB_RE — "search X on
 // YouTube" is a lookup on a site, which the stategraph routes as web_search.
-const _ACTION_VERB_RE = /\b(open|close|send|post|share|create|make|new|delete|remove|cancel|navigate|go\s+to|launch|start|stop|schedule|remind|update|edit|modify|change|rename|fill|submit|download|upload|copy|paste|click|type|press|install|uninstall|sign\s+in|log\s+in|log\s+out|play|pause|watch|listen|order|book|buy|shop|browse|scroll|refresh|reload|turn|toggle|enable|disable|connect|disconnect|pair|mute|unmute|record|print|quit|restart|shut\s*down|lock|unlock|sleep|wake|minimize|maximize|screenshot|snap|capture|adjust|set)\b/i;
-
-// ── Episodic-recall markers — used by memory_retrieve and as a command_automate
-// guard so "what was I watching on Netflix" isn't stolen by named-app + verb.
-const _EPISODIC_RE = /\b(yesterday|last\s+(night|week|time|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|this\s+(morning|afternoon)|earlier(\s+today)?|a\s+(few|couple)\s+(minutes|hours|days|weeks)\s+ago|the\s+other\s+day|what\s+was\s+i|was\s+i\s+(watching|listening|reading|playing|browsing|looking)|what\s+did\s+i|what\s+was\s+on\s+my\s+screen)\b/i;
+// EPISODIC_RE: past-activity markers — used by memory_retrieve and as a
+// command_automate guard so "what was I watching on Netflix" isn't stolen.
+const {
+  CONVERSATION_RECALL_RE,
+  EPISODIC_RE: _EPISODIC_RE,
+  NAMED_APP_RE: _NAMED_APP_RE,
+  ACTION_VERB_RE: _ACTION_VERB_RE,
+} = require('../../shared/text-patterns.cjs');
 
 // ── Intent patterns (ordered by specificity — first match wins) ──────────────
 // Order: screen_analysis (most specific) → memory_retrieve (recall must beat
@@ -52,8 +53,10 @@ const INTENT_PATTERNS = [
   {
     intent: 'memory_retrieve',
     test: (text) => {
-      // Conversation recall
-      if (/\b(did\s+we\s+talk|do\s+you\s+remember|have\s+we\s+(talked|discussed|mentioned|chatted|chatting)|what\s+did\s+we\s+(talk|chat|discuss|go\s+over|cover|speak)|what\s+(were|have|had)\s+we\s+(been\s+)?(talk\w*|chat\w*|discuss\w*)|we'?ve\s+been\s+\w{0,10}\s*(talk\w*|chat\w*|discuss\w*)|what\s+did\s+i\s+(just\s+)?(ask|say|tell\s+you)|what\s+was\s+my\s+last|we\s+(talked|discussed|spoke|chatted|went\s+over|covered)\s+about|previous\s+(conversation|chat)|conversation\s+(history|logs?)|chat\s+(history|logs?)|conversations?\s+with\s+you|messages?\s+we\s+(chatted|talked|sent|exchanged)|look\s+(that|it)\s+up\s+in\s+(your\s+)?(memory|conversation|chat|history)|check\s+(your\s+)?(memory|conversation|chat|history)|in\s+our\s+(conversation|chat|history)|remind\s+me\s+what\s+we|didn'?t\s+i\s+(say|tell|mention|ask)|you\s+(told|said|mentioned)\s+(me|that)|earlier\s+you\s+(said|told|mentioned))\b/i.test(text)) return true;
+      // Conversation recall — canonical pattern (shared/text-patterns.cjs)
+      if (CONVERSATION_RECALL_RE.test(text)) return true;
+      // Recall-flavored phrasings the canonical recall regex doesn't cover
+      if (/\b(do\s+you\s+remember|didn'?t\s+i\s+(say|tell|mention|ask)|you\s+(told|said|mentioned)\s+(me|that)|earlier\s+you\s+(said|told|mentioned)|we\s+(talked|discussed|spoke|chatted|went\s+over|covered)\s+about|look\s+(that|it)\s+up\s+in\s+(your\s+)?(memory|conversation|chat|history)|check\s+(your\s+)?(memory|conversation|chat|history)|what\s+was\s+my\s+last)\b/i.test(text)) return true;
       // Personal fact recall
       if (/\b(what'?s\s+my\s+(name|email|phone|favorite|address|job|age|birthday|number|wifi|password|username)|who\s+is\s+my\s+(wife|husband|mom|dad|brother|sister|boss|doctor|dentist|lawyer|manager)|what\s+do\s+you\s+know\s+about\s+my|show\s+my\s+(info|profile|contacts|family|notes|bookmarks)|list\s+my\s+(info|contacts|family|appointments|meetings|notes))\b/i.test(text)) return true;
       // Third-party personal data: "what's John's number", "Sarah's email"
