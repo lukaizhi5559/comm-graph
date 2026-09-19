@@ -66,7 +66,7 @@ function detectAgent(englishPrompt) {
  * @param {string|null} [sessionId] - Conversation session this task belongs to
  * @returns {Promise<boolean>} true if notification was sent
  */
-function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null) {
+function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       taskId,
@@ -76,6 +76,7 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
       originalPrompt: originalPrompt || englishPrompt,
       guessedIntent: guessedIntent !== undefined ? guessedIntent : null,
       sessionId: sessionId || null,
+      userApproved: userApproved === true,
     });
     const req = http.request({
       hostname: '127.0.0.1',
@@ -106,7 +107,7 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
  * @param {string|null} [args.sessionId] - Conversation session this prompt was routed into
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, guessedIntent, sessionId = null }) {
+async function execute({ englishPrompt, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false }) {
   const agentId = detectAgent(englishPrompt);
 
   // Create task in journal
@@ -116,6 +117,7 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent, s
     intent: 'handoff',
     source,
     sessionId,
+    userApproved,
   });
 
   // Try to acquire agent lock
@@ -124,7 +126,7 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent, s
   if (acquired) {
     // Lock acquired — notify main.js to spawn stategraph run
     updateTask(taskId, 'queued');
-    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId);
+    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved);
     if (!notified) {
       logger.warn('[Handoff] Failed to notify main.js — task will be picked up on retry', { taskId });
     }
@@ -163,7 +165,7 @@ function complete(taskId, agentId, status, result, items, sessionId = null, plan
       const task = require('./taskJournal.cjs').getTask(nextTaskId);
       if (task) {
         const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
-        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, guessedIntent, task.sessionId)
+        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, guessedIntent, task.sessionId, task.userApproved === true)
           .catch(() => {});
       }
     }
@@ -187,7 +189,7 @@ function remove(taskId) {
       const nextTask = require('./taskJournal.cjs').getTask(nextTaskId);
       if (nextTask) {
         const guessedIntent = require('./intentGuesser.cjs').guess(nextTask.prompt).guessedIntent;
-        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, guessedIntent, nextTask.sessionId)
+        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, guessedIntent, nextTask.sessionId, nextTask.userApproved === true)
           .catch(() => {});
       }
     }

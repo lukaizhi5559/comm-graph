@@ -688,6 +688,8 @@ const server = http.createServer(async (req, res) => {
         originalPrompt: body.prompt,
         guessedIntent,
         sessionId: body.sessionId || null,
+        // Brain-approved thoughts skip the second Queue approval gate.
+        userApproved: body.userApproved === true,
       });
       logger.info('[Server] Proactive dispatch', { taskId: result.taskId, thoughtId: body.thoughtId });
       return _send(res, 200, { ok: true, ...result });

@@ -94,6 +94,50 @@ const BARE_FOLLOWUPS = new Set([
   'seriously', 'what', 'and', 'so', 'ok', 'okay',
 ]);
 
+// ── Offer-consent guard ──────────────────────────────────────────────────────
+// A bare affirmation ("yes", "sure", "ok", "go ahead", "yes you can") replying
+// to an assistant OFFER ("Would you like me to X?", "Want me to X?", "I can X")
+// means "do the offered thing" — that needs the stategraph, not a quick "Sure!".
+// Without this, general_quick can acknowledge the consent without executing the
+// offer (and the stategraph then has to reverse-engineer the referent).
+const BARE_AFFIRM_RE = /^(?:yes|yeah|yep|yup|sure|ok(?:ay)?|go\s+ahead|do\s+it|yes\s+you\s+can|please\s+do|sounds?\s+good|absolutely|definitely|of\s+course|please)$/;
+const OFFER_RE = /\b(?:would you like me to|want me to|shall i|should i|do you want me to|i can|i could|let me know if you'?d like|if you'?d like)\b/i;
+
+function _lastAssistantTurn(conversationContext) {
+  if (typeof conversationContext !== 'string') return '';
+  const matches = conversationContext.match(/Assistant: ([^\n]*)/g);
+  if (!matches || matches.length === 0) return '';
+  return matches[matches.length - 1].replace(/^Assistant: /, '');
+}
+
+// ── Conversation-recall guard ────────────────────────────────────────────────
+// Questions that ask to inspect the chat transcript itself ("what have we been
+// chatting about", "look up our previous conversation", "no conversation with
+// you at all") must hand off — general_quick only sees the current session's
+// recent turns and will confidently (wrongly) deny prior conversations exist.
+// The LLM classifier (rule 8) catches clean phrasings but slips on
+// voice-transcribed/borderline ones, so this deterministic check runs first.
+const CONVERSATION_RECALL_RE = new RegExp([
+  // explicit transcript nouns: "our previous conversation", "the chat history", "chat log"
+  '\\b(our|your|my|previous|past|prior|earlier|the)\\s+(?:\\w+\\s+){0,2}(conversations?|chats?|chat\\s*(?:history|logs?)|conversation\\s*(?:history|logs?)|discussions?)\\b',
+  // "what have we been talking/chatting about", "we've been chatting about what"
+  // (\w* stems tolerate STT truncation: "chatt", "talkin", "discussin")
+  '\\b(?:we|i)(?:\'(?:ve|re))?\\s+(?:have|had|were|are|been)\\s+.{0,20}?\\b(?:talk\\w*|chat\\w*|discuss\\w*|spoke|went\\s+over|covered)\\b',
+  // "did we talk about X", "have we discussed/chatted"
+  '\\b(?:did|have|had)\\s+we\\s+(?:talk\\w*|chat\\w*|discuss\\w*|speak|go\\s+over|cover|mention)\\b',
+  // "what did I (just) ask/say/tell you", "what was my last question/prompt"
+  '\\bwhat\\s+did\\s+i\\s+(?:just\\s+)?(?:ask|say|tell\\s+you|mention)\\b',
+  '\\bwhat\\s+was\\s+my\\s+(?:last|first|previous)\\s+(?:question|prompt|message|request)\\b',
+  // "remind me what we said", "look/pull up (our/the) conversation"
+  '\\bremind\\s+me\\s+what\\s+we\\b',
+  '\\b(?:look|pull|bring)\\s+up\\s+.{0,30}?\\b(?:conversations?|chats?)\\b',
+  // "summarize/recap our conversation", "the messages we chatted/sent"
+  '\\b(?:summarize|recap|sum\\s+up)\\s+.{0,20}?\\b(?:conversations?|chats?|discussed)\\b',
+  '\\bmessages?\\s+we\\s+(?:chatted|talked|sent|discussed|exchanged)\\b',
+  // "no/any conversation with you (at all)", "conversations with you"
+  '\\bconversations?\\s+with\\s+(?:you|thinkdrop)\\b',
+].join('|'), 'i');
+
 async function classify(englishText, conversationContext) {
   if (!englishText || !englishText.trim()) {
     return { intent: 1, intentName: 'general_quick', confidence: 0.5, source: 'empty_input' };
@@ -101,11 +145,33 @@ async function classify(englishText, conversationContext) {
 
   const normalized = englishText.toLowerCase().trim()
     .replaceAll('?', '').replaceAll('!', '').replaceAll('.', '').trim();
+  // Offer-consent: bare affirmation + last assistant turn was an offer → handoff
+  // (the user is asking us to DO the offered action, not just chatting).
+  if (conversationContext && BARE_AFFIRM_RE.test(normalized)) {
+    const lastAsst = _lastAssistantTurn(conversationContext);
+    if (lastAsst && OFFER_RE.test(lastAsst)) {
+      logger.info('[Classify] Offer-consent guard → handoff', {
+        inputPreview: englishText.substring(0, 60),
+        offerPreview: lastAsst.substring(0, 80),
+      });
+      return { intent: 0, intentName: 'handoff', confidence: 0.9, source: 'offer_consent_guard' };
+    }
+  }
+
   if (conversationContext && BARE_FOLLOWUPS.has(normalized)) {
     logger.info('[Classify] Bare follow-up → general_quick', {
       inputPreview: englishText.substring(0, 60),
     });
     return { intent: 1, intentName: 'general_quick', confidence: 0.95, source: 'bare_followup' };
+  }
+
+  // Conversation-recall questions always need the full transcript search —
+  // hand off deterministically instead of trusting the LLM classifier.
+  if (CONVERSATION_RECALL_RE.test(englishText)) {
+    logger.info('[Classify] Conversation-recall guard → handoff', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'conversation_recall_guard' };
   }
 
   // ── Try force-prompt classification (primary) ────────────────────────────────

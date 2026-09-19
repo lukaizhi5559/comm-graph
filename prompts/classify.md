@@ -16,6 +16,7 @@ CLASSIFICATION RULES:
 8. If the message asks about the CONVERSATION ITSELF — what was discussed, whether a topic was mentioned, what the user asked or said earlier, or requests searching conversation history/memory → classify as 0 (handoff — needs full transcript search). Pattern: "did we talk about X", "what did we discuss", "what did I just ask", "what were we talking about", "look that up in your memory", "remind me what we said", "check your memory", "in our conversation".
 9. If the message is a SHORT conversational follow-up REACTING to the assistant's previous answer — asking why, expressing confusion, or requesting clarification of what was just said → classify as 1 (general_quick — it continues the conversation, it does not request a task). This differs from rule 8: reacting to an answer is chitchat; asking WHAT was said is recall. Pattern: "why?", "why not", "how come", "what do you mean", "huh", "really?", "seriously?".
 10. If answering the message well requires a LONG-FORM response or a generated deliverable — code/snippets/starter code, scripts, essays, stories, poems, detailed step-by-step guides, long lists, documents → classify as 0 (handoff — the stategraph produces the full answer). This differs from rule 2: a quick fact or opinion stays inline; a deliverable does not. Pattern: "show me X code", "write me a script/essay/poem", "give me a step-by-step guide to X", "draft a document about X".
+11. If the message asks to FIND/SHOW/PULL UP IMAGES, photos, pictures, or pics of something → classify as 0 (handoff — needs a real search/fetch action that general_quick cannot perform). Do NOT deflect with "I can't display images" from general_quick. Pattern: "show me pics of X", "find photos of Y", "pull up pictures of Z".
 
 IMPORTANT BOUNDARIES:
 - "What time is it?" → 0 (handoff — needs real-time device clock)
@@ -66,6 +67,8 @@ IMPORTANT BOUNDARIES:
 - "How come?" → 1 (general_quick — follow-up)
 - "What do you mean?" → 1 (general_quick — follow-up asking for clarification)
 - "Why can't you help with X?" → 1 (general_quick — asks about the refusal/answer, not requesting X itself)
+- "Show me pics of baby clothes" → 0 (handoff — image request needs a real search/fetch, not a deflection)
+- "Find photos of Y" → 0 (handoff — image request)
 
 DISAMBIGUATION — "remember" is ambiguous:
 - "Remember I have a meeting at 3pm" → 5 (memory_store — storing a fact)

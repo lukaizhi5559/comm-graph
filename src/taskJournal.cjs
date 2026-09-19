@@ -114,7 +114,7 @@ const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled']);
  * @param {string|null} [opts.sessionId] - Conversation session the task belongs to (for recall)
  * @returns {string} task id
  */
-function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null }) {
+function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null, userApproved = false }) {
   const id = _uid();
   /** @type {TaskEntry} */
   const task = {
@@ -131,6 +131,10 @@ function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text
     intent,
     source,
     sessionId,
+    // True when an upstream surface (e.g. Brain thought approval) already
+    // collected the user's OK — forwarded to main so planSkillsV2 skips the
+    // duplicate Queue approval gate.
+    userApproved: userApproved === true,
   };
   _tasks.set(id, task);
   _save();
