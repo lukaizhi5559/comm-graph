@@ -278,11 +278,12 @@ function formatStatusSummary(filterAgentId) {
 
 /**
  * Clean up old completed tasks (called periodically).
- * Default TTL: 7 days. Override with TASK_JOURNAL_TTL_DAYS env var.
+ * Default TTL: 90 days. Override with TASK_JOURNAL_TTL_DAYS env var.
+ * (Raised from 7d — the journal feeds long-ago recall; entries are tiny.)
  */
 function cleanup() {
   const now = Date.now();
-  const TTL_DAYS = parseFloat(process.env.TASK_JOURNAL_TTL_DAYS || '7');
+  const TTL_DAYS = parseFloat(process.env.TASK_JOURNAL_TTL_DAYS || '90');
   const MAX_AGE = TTL_DAYS * 24 * 60 * 60 * 1000;
   for (const [id, task] of _tasks) {
     if ((task.status === 'done' || task.status === 'failed' || task.status === 'cancelled') &&
