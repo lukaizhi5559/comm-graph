@@ -64,9 +64,10 @@ function detectAgent(englishPrompt) {
  * @param {string|null} originalPrompt - non-English original (for display)
  * @param {string|null} [guessedIntent] - comms-graph regex guess (for early sound/UX)
  * @param {string|null} [sessionId] - Conversation session this task belongs to
+ * @param {object|null} [thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<boolean>} true if notification was sent
  */
-function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false) {
+function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       taskId,
@@ -77,6 +78,7 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
       guessedIntent: guessedIntent !== undefined ? guessedIntent : null,
       sessionId: sessionId || null,
       userApproved: userApproved === true,
+      thoughtContext: thoughtContext || null,
     });
     const req = http.request({
       hostname: '127.0.0.1',
@@ -105,9 +107,10 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
  * @param {string|null} [args.originalPrompt] - Non-English original (for display)
  * @param {string|null} [args.guessedIntent] - comms-graph regex guess (forwarded to main.js)
  * @param {string|null} [args.sessionId] - Conversation session this prompt was routed into
+ * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false }) {
+async function execute({ englishPrompt, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null }) {
   const agentId = detectAgent(englishPrompt);
 
   // Create task in journal
@@ -118,6 +121,7 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent, s
     source,
     sessionId,
     userApproved,
+    thoughtContext,
   });
 
   // Try to acquire agent lock
@@ -126,7 +130,7 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent, s
   if (acquired) {
     // Lock acquired — notify main.js to spawn stategraph run
     updateTask(taskId, 'queued');
-    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved);
+    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext);
     if (!notified) {
       logger.warn('[Handoff] Failed to notify main.js — task will be picked up on retry', { taskId });
     }
@@ -165,7 +169,7 @@ function complete(taskId, agentId, status, result, items, sessionId = null, plan
       const task = require('./taskJournal.cjs').getTask(nextTaskId);
       if (task) {
         const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
-        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, guessedIntent, task.sessionId, task.userApproved === true)
+        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null)
           .catch(() => {});
       }
     }
@@ -189,7 +193,7 @@ function remove(taskId) {
       const nextTask = require('./taskJournal.cjs').getTask(nextTaskId);
       if (nextTask) {
         const guessedIntent = require('./intentGuesser.cjs').guess(nextTask.prompt).guessedIntent;
-        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, guessedIntent, nextTask.sessionId, nextTask.userApproved === true)
+        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, guessedIntent, nextTask.sessionId, nextTask.userApproved === true, nextTask.thoughtContext || null)
           .catch(() => {});
       }
     }

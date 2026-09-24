@@ -374,7 +374,7 @@ async function _generateHandoffPhrase(englishText, detectedLanguage, conversatio
  */
 async function processMessage(args) {
   const startTime = Date.now();
-  const { text, language, source = 'text', speakerProfile, isResemble } = args;
+  const { text, language, source = 'text', speakerProfile, isResemble, thoughtContext = null } = args;
 
   if (!text || !text.trim()) {
     return {
@@ -423,15 +423,38 @@ async function processMessage(args) {
   // Strip canned-refusal Assistant lines left over from pre-fix sessions so
   // models don't mimic the refusal voice (heals already-poisoned history).
   const context = sanitizeContext(convHistory || _formatContext());
-  const { intent, intentName, confidence, source: classifySource } =
+  let { intent, intentName, confidence, source: classifySource } =
     await classify(englishText, context);
+
+  // ── Proactive-card reply → always handoff ────────────────────────────────────
+  // A prompt carrying thoughtContext is a reply to a proactive card. Quick
+  // intents (general_quick et al.) lack the context machinery to resolve it —
+  // and "yes" once produced a chatty ack with NO task dispatched. Route it to
+  // stategraph where classifyTask can weigh the card against conversation turns.
+  if (thoughtContext && intent !== 0) {
+    logger.info('[Process] thoughtContext present — forcing handoff', {
+      was: intentName, thoughtId: thoughtContext.id || null,
+    });
+    intent = 0;
+    intentName = 'handoff';
+  }
 
   logger.info('[Process] Classified', {
     intent, intentName, confidence, classifySource,
   });
 
   // ── Thought engine: feed the prompt as a candidate input (fire-and-forget) ────
-  _notifyThoughtEngine('prompt', { text: englishText, sessionId: routedSessionId, intentName });
+  // For card replies send the REPLY text only (not the card blob) plus the
+  // thoughtId so the engine doesn't re-ingest its own card as a candidate.
+  const _replyOnlyText = thoughtContext?.tag
+    ? englishText.replace(thoughtContext.tag, '').trim()
+    : englishText;
+  _notifyThoughtEngine('prompt', {
+    text: _replyOnlyText || englishText,
+    sessionId: routedSessionId,
+    intentName,
+    ...(thoughtContext?.id ? { thoughtId: thoughtContext.id } : {}),
+  });
 
   // ── Step 4: Execute based on intent ───────────────────────────────────────────
   let result;
@@ -447,6 +470,7 @@ async function processMessage(args) {
         originalPrompt: originalText,
         guessedIntent: _gi0,
         sessionId: routedSessionId,
+        thoughtContext,
       });
 
       // Generate intent-aware handoff phrase (LLM for command_automate, static pool for others)

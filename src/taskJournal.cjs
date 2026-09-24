@@ -114,7 +114,7 @@ const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled']);
  * @param {string|null} [opts.sessionId] - Conversation session the task belongs to (for recall)
  * @returns {string} task id
  */
-function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null, userApproved = false }) {
+function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null, userApproved = false, thoughtContext = null }) {
   const id = _uid();
   /** @type {TaskEntry} */
   const task = {
@@ -135,6 +135,9 @@ function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text
     // collected the user's OK — forwarded to main so planSkillsV2 skips the
     // duplicate Queue approval gate.
     userApproved: userApproved === true,
+    // Proactive-card context when the prompt is a reply to a Thought —
+    // retained on the record so parked/queued replays keep it.
+    thoughtContext: thoughtContext || null,
   };
   _tasks.set(id, task);
   _save();
