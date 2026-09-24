@@ -206,6 +206,12 @@ function _listSessionMessages(sessionId) {
   });
 }
 
+// Last session this process routed to / resolved a task into. Sent as
+// hintSessionId on the next session.route so rapid follow-ups (<5 min) stick to
+// the prior session via the router's hint fast-path — even when that session
+// would otherwise rotate or semantically mismatch an elliptical follow-up.
+let _lastSessionId = null;
+
 // Route the current message through the smart session router and fetch recent
 // history for the routed session. Replaces the old `session.getActive` flow,
 // which always returned the same long-lived active session regardless of topic.
@@ -222,7 +228,7 @@ function _fetchConversationHistory(userText, pinnedSessionId = null) {
       version: 'mcp.v1',
       service: 'conversation',
       action: 'session.route',
-      payload: { text: userText || '', forceNew },
+      payload: { text: userText || '', forceNew, hintSessionId: _lastSessionId },
       requestId: 'cg_route_' + Date.now(),
     });
     const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(routeBody) };
@@ -395,6 +401,7 @@ async function processMessage(args) {
   const { englishText, originalText, detectedLanguage, wasTranslated } = translateResult;
   // args.sessionId is a pin (task recall) — it wins over semantic routing.
   const routedSessionId = args.sessionId || routeResult?.sessionId || null;
+  if (routedSessionId) _lastSessionId = routedSessionId;
   const convHistory = routeResult?.history || null;
 
   logger.info('[Process] Translated', {
@@ -712,6 +719,7 @@ const server = http.createServer(async (req, res) => {
     if (!body.taskId) {
       return _send(res, 400, { error: 'taskId is required' });
     }
+    if (body.sessionId) _lastSessionId = body.sessionId;
     handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items, body.sessionId || null, body.planFile || null);
     return _send(res, 200, { ok: true });
   }
