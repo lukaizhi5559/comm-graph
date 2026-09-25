@@ -154,10 +154,14 @@ function _keywordClassify(text) {
   // residual so the wiring threshold (conf > 0.5) accepts it — otherwise
   // "good morning" falls through to handoff and pays a full graph run.
   // "what is/what's" knowledge questions count too — but anything referencing
-  // the system surface (screen/app/task/memory/history) is excluded: those
-  // need the real graph (screen_intelligence / status / deep memory), and the
-  // tiers above that wanted them have already had their shot.
-  const _hasSystemRef = /\b(screen|app|window|task|memory|conversation|history|running|process)\b/i.test(lower);
+  // the system surface (screen/monitor/task/memory/files/…) is excluded:
+  // those need the real graph (screen_intelligence / status / deep memory /
+  // automation), and the tiers above that wanted them have already had
+  // their shot. The list must cover the whole device surface — a keyword
+  // hit here can veto an LLM handoff in classify.cjs, so a miss on e.g.
+  // "what is on my second monitor" would misroute a screen question to a
+  // blind text answer.
+  const _hasSystemRef = /\b(screens?|apps?|windows?|tasks?|memor(?:y|ies)|conversations?|history|running|process(?:es)?|monitors?|displays?|desktops?|tabs?|browsers?|files?|folders?|notifications?|clipboard)\b/i.test(lower);
   if (lower.split(/\s+/).length <= 15 && !_hasSystemRef &&
       /\b(hello|hi|hey|howdy|greetings|good\s+(morning|afternoon|evening|night|day)|how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|thank(s|\s+you)|you'?re\s+welcome|bye|goodbye|see\s+you|joke|who\s+are\s+you|what'?s\s+your\s+name|are\s+you\s+(there|awake|alive)|can\s+you\s+hear\s+me|what\s+do\s+you\s+think|explain|tell\s+me\s+(a\s+|about\s+|why|how)|why\s+(is|are|does|do|did)|who\s+(is|was|were|wrote|invented)|when\s+(is|was|did)|where\s+(is|was)|how\s+(many|much|long|old|far)|is\s+(it|there|this|that)|do\s+you|what\s+(is|are|was|were)|what'?s)\b/i.test(lower)) {
     return { intent: 1, confidence: 0.65 };

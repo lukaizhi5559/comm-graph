@@ -201,6 +201,14 @@ async function classify(englishText, conversationContext) {
         if (match) {
           const intent = parseInt(match[1], 10);
           const info = INTENTS[intent];
+          // Residual-bucket veto: intent 0 is the least-informative class
+          // ("send it to the graph"), and providers flake toward it —
+          // the same prompt draws 0 and 1 across calls. A confident
+          // deterministic keyword hit is positive evidence for a closed
+          // quick-intent domain and outweighs a forced single-digit guess
+          // that landed on the catch-all. Never vetoes a specific
+          // non-zero intent — the LLM remains primary for real routing.
+          if (intent === 0 && keywordHit) return _adoptKeyword('veto_llm_handoff');
           logger.info('[Classify] Force-prompt result', {
             intent, intentName: info.name, provider, text: trimmed,
             inputPreview: englishText.substring(0, 60),
@@ -219,6 +227,7 @@ async function classify(englishText, conversationContext) {
           const intent = parseInt(uniqueDigits[0], 10);
           const info = INTENTS[intent];
           if (info) {
+            if (intent === 0 && keywordHit) return _adoptKeyword('veto_llm_handoff');
             logger.info('[Classify] Force-prompt (extracted)', {
               intent, intentName: info.name, provider, raw: trimmed,
             });
