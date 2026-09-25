@@ -26,9 +26,13 @@ const JOURNAL_PATH = process.env.TASK_JOURNAL_PATH
 /** @type {Map<string, TaskEntry>} */
 const _tasks = new Map();
 
+// Terminal states are one-way — a task that reaches one is never reactivated
+// by late-arriving updates from a cancelled/ lingering graph run.
+const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled']);
+
 // ── Types (JSDoc) ──────────────────────────────────────────────────────────────
 /**
- * @typedef {'waiting-for-agent'|'queued'|'running'|'auth-required'|'done'|'failed'|'cancelled'} TaskStatus
+ * @typedef {'waiting-for-agent'|'queued'|'running'|'auth-required'|'awaiting-approval'|'waiting-for-input'|'allowlist-denied'|'training-handoff'|'done'|'failed'|'cancelled'} TaskStatus
  * @typedef {{ id: string, prompt: string, agentId: string|null, status: TaskStatus, createdAt: number, startedAt: number|null, doneAt: number|null, error: string|null, progress: { step: number, totalSteps: number, currentStep: string|null, eta: { lo: number, hi: number }|null }, result: string|null, intent: string, source: string, items?: Array<{title?:string,imageUrl?:string,url?:string,price?:string,snippet?:string,hostname?:string,mediaType?:string,videoUrl?:string,embedUrl?:string,posterUrl?:string,duration?:string,channel?:string,sourceUrl?:string}>|null }} TaskEntry
  */
 
@@ -57,7 +61,7 @@ function _load() {
     for (const item of arr) {
       // Mark stale active tasks as failed — the stategraph process that was
       // supposed to execute them is gone after a restart.
-      const isActive = ['queued', 'waiting-for-agent', 'running', 'auth-required', 'awaiting-approval'].includes(item.status);
+      const isActive = !TERMINAL_STATUSES.has(item.status);
       if (isActive && item.createdAt && (now - item.createdAt > STALE_MS)) {
         item.status = 'failed';
         item.error = 'stale after restart';
@@ -99,8 +103,6 @@ let _onTerminalFn = null;
 function setOnTerminal(fn) {
   _onTerminalFn = fn;
 }
-
-const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled']);
 
 // ── Public API ──────────────────────────────────────────────────────────────────
 
@@ -155,6 +157,12 @@ function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text
 function updateTask(id, status, extra = {}) {
   const task = _tasks.get(id);
   if (!task) return;
+  // Terminal states are one-way. A late update from a still-running graph
+  // node (e.g. plan-gen finishing after cancel) must not resurrect the task.
+  if (TERMINAL_STATUSES.has(task.status)) {
+    logger.warn('[TaskJournal] Ignoring status update on terminal task', { id, current: task.status, attempted: status });
+    return;
+  }
   const updates = { status, ...extra };
   if (status === 'running' && !task.startedAt) updates.startedAt = Date.now();
   if (status === 'done' || status === 'failed' || status === 'cancelled') {
@@ -179,7 +187,11 @@ function updateTask(id, status, extra = {}) {
 function updateProgress(id, progress) {
   const task = _tasks.get(id);
   if (!task) return;
-  _tasks.set(id, { ...task, progress: { ...task.progress, ...progress } });
+  // First progress ping marks the task as actually running — without this a
+  // dispatched task reads as 'queued' forever (startedAt never set).
+  const status = (task.status === 'queued' || task.status === 'waiting-for-agent') ? 'running' : task.status;
+  const startedAt = status === 'running' && !task.startedAt ? Date.now() : task.startedAt;
+  _tasks.set(id, { ...task, status, startedAt, progress: { ...task.progress, ...progress } });
   _broadcast();
 }
 
@@ -224,8 +236,11 @@ function getTask(id) {
  * @returns {TaskEntry[]}
  */
 function getActiveTasks() {
+  // Every non-terminal status is active: 'awaiting-approval' and
+  // 'waiting-for-input' are live tasks the user can still act on — dropping
+  // them here made pending-approval tasks vanish from /tasks entirely.
   return Array.from(_tasks.values())
-    .filter(t => t.status === 'queued' || t.status === 'waiting-for-agent' || t.status === 'running' || t.status === 'auth-required')
+    .filter(t => !TERMINAL_STATUSES.has(t.status))
     .sort((a, b) => a.createdAt - b.createdAt);
 }
 
