@@ -151,6 +151,16 @@ async function classify(englishText, conversationContext) {
     return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'conversation_recall_guard' };
   }
 
+  // Screen-output commands ("show it on the screen", "make it rain on my
+  // screen", "clear the screen") drive the GhostLayer display channel in the
+  // stategraph — never let them land in general_quick or control_signal.
+  if (/\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(englishText)) {
+    logger.info('[Classify] Screen-output guard → handoff', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'screen_output_guard' };
+  }
+
   // ── Try force-prompt classification (primary) ────────────────────────────────
   try {
     const { ask } = require('./llm-providers.cjs');
