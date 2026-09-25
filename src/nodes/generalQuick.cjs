@@ -24,7 +24,7 @@
 const logger = require('../logger.cjs');
 const { askEarly, buildMessages } = require('../llm-providers.cjs');
 const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
-const { isCannedRefusal } = require('../refusal.cjs');
+const { isCannedRefusal, isPromptEcho } = require('../refusal.cjs');
 
 // ── Direct answer mode directive ─────────────────────────────────────────────
 // Appended to the system prompt to override the persona's handoff phrase
@@ -59,6 +59,10 @@ handles those) — then respond with EXACTLY: 0
 Nothing else. Just the number 0. No explanation, no handoff phrase.
 ═══════════════════════════════════════════════`;
 
+// Questions asking about ThinkDrop/the assistant itself — a persona echo is
+// the CORRECT answer for these, never a sentinel.
+const SELF_REFERENTIAL_RE = /\bthinkdrop\b|\bwho are you\b|\bwhat can you do\b|\byour (?:capabilit\w*|features?|tools?|skills?|limits?)\b|\babout yourself\b/i;
+
 /**
  * @param {string} englishText  - English user message
  * @param {string} systemPrompt - Full system prompt (persona + personality overlay + language)
@@ -78,15 +82,19 @@ async function execute(englishText, systemPrompt, conversationContext) {
     const response = firstSentence || fullText;
 
     // ── Sentinel check: LLM signals it cannot answer ────────────────────────
-    // Covers empty responses, explicit 0 (handoff) signals, and canned
-    // refusals — the backend's last-refusal grace returns refusal text when
-    // EVERY provider declined; never echo that to the user, hand off instead.
+    // Covers empty responses, explicit 0 (handoff) signals, canned refusals —
+    // and system-prompt echoes: a failing provider may dump the persona block
+    // ("ThinkDrop is a full desktop AI …") as the answer instead of emitting
+    // 0 (observed on a TCP/UDP interview-prep question). Self-referential
+    // questions ("what can you do") are exempt — the persona block IS the
+    // correct answer there.
     const refusal = isCannedRefusal(response);
-    if (!response || !response.trim() || response.trim() === '0' || refusal) {
+    const promptEcho = !SELF_REFERENTIAL_RE.test(englishText) && isPromptEcho(response, systemPrompt);
+    if (!response || !response.trim() || response.trim() === '0' || refusal || promptEcho) {
       const phrase = getRandomHandoffPhrase();
       logger.info('[GeneralQuick] Handoff signaled', {
         phrase, provider,
-        reason: !response ? 'empty' : (refusal ? 'refusal' : 'sentinel'),
+        reason: !response ? 'empty' : (refusal ? 'refusal' : (promptEcho ? 'prompt-echo' : 'sentinel')),
       });
       return {
         text: phrase,

@@ -130,6 +130,14 @@ function _keywordClassify(text) {
     return { intent: 0, confidence: 0.7 };
   }
 
+  // First-person recall — "when did I last mention X", "did I mention Y",
+  // "have I told you my Z", "summarize what I worked on". These are memory
+  // lookups over the user's own history; general_quick can only defer to a
+  // canned "let me check" non-answer. Handoff → memory_retrieve.
+  if (/\b(when\s+did\s+i\s+(last\s+)?(mention|say|tell|ask|talk|discuss|bring\s+up|write|note)|when'?s\s+the\s+last\s+time\s+i\s+(said|mentioned|told|asked|talked|wrote|used|did|was|worked)|did\s+i\s+(mention|say|tell|ask|talk\s+about)|have\s+i\s+(told|said|mentioned|shared|given)|do\s+i\s+mention|summari[sz]e\s+.{0,40}\b(what\s+i|my\s+(day|week|work|activity|recent))|recap\s+.{0,40}\b(what\s+i|my\s+(day|week|work|activity|recent)))\b/i.test(lower)) {
+    return { intent: 0, confidence: 0.7 };
+  }
+
   // Memory quick — personal fact recall
   if (/\b(what's?\s+my\s+name|my\s+name|my\s+email|my\s+favorite\s+color|how\s+old\s+am\s+i|my\s+job|about\s+me)\b/i.test(lower)) {
     return { intent: 2, confidence: 0.75 };
@@ -162,7 +170,16 @@ function _keywordClassify(text) {
   // "what is on my second monitor" would misroute a screen question to a
   // blind text answer.
   const _hasSystemRef = /\b(screens?|apps?|windows?|tasks?|memor(?:y|ies)|conversations?|history|running|process(?:es)?|monitors?|displays?|desktops?|tabs?|browsers?|files?|folders?|notifications?|clipboard)\b/i.test(lower);
-  if (lower.split(/\s+/).length <= 15 && !_hasSystemRef &&
+  // Live-data questions (news/prices/weather/scores/schedule) need tools —
+  // a blind general_quick answer would hallucinate freshness. A keyword hit
+  // here can veto an LLM handoff, so this exclusion is load-bearing.
+  const _needsLiveData = /\b(news|latest|breaking|trending|headlines?|currently?|recent(?:ly)?|right\s+now|today|tonight|this\s+(week|morning|afternoon|evening)|prices?|stocks?|weather|forecast|scores?|who\s+won|happening|updates?)\b/i.test(lower);
+  // First-person past-tense recall — "when did I mention X", "did I say Y",
+  // "what did I do" — asks about the user's own history, which needs the
+  // memory graph, not a blind quick answer. Mirrors the recall tier above;
+  // a keyword hit here can veto an LLM handoff so the exclusion is load-bearing.
+  const _isSelfRecall = /\b(when\s+did\s+i|what\s+did\s+i|did\s+i\s+(mention|say|tell|ask|talk)|have\s+i\s+(told|said|mentioned|shared)|did\s+we|have\s+we|i\s+(last\s+)?(mentioned|told|said|asked)|last\s+time\s+i|what\s+was\s+i|was\s+i\s+(doing|working|watching|looking))\b/i.test(lower);
+  if (lower.split(/\s+/).length <= 15 && !_hasSystemRef && !_needsLiveData && !_isSelfRecall &&
       /\b(hello|hi|hey|howdy|greetings|good\s+(morning|afternoon|evening|night|day)|how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|thank(s|\s+you)|you'?re\s+welcome|bye|goodbye|see\s+you|joke|who\s+are\s+you|what'?s\s+your\s+name|are\s+you\s+(there|awake|alive)|can\s+you\s+hear\s+me|what\s+do\s+you\s+think|explain|tell\s+me\s+(a\s+|about\s+|why|how)|why\s+(is|are|does|do|did)|who\s+(is|was|were|wrote|invented)|when\s+(is|was|did)|where\s+(is|was)|how\s+(many|much|long|old|far)|is\s+(it|there|this|that)|do\s+you|what\s+(is|are|was|were)|what'?s)\b/i.test(lower)) {
     return { intent: 1, confidence: 0.65 };
   }

@@ -30,6 +30,7 @@ const {
   EPISODIC_RE: _EPISODIC_RE,
   NAMED_APP_RE: _NAMED_APP_RE,
   ACTION_VERB_RE: _ACTION_VERB_RE,
+  SCREEN_OBSERVATION_RE,
 } = require('../../shared/text-patterns.cjs');
 
 // ── Intent patterns (ordered by specificity — first match wins) ──────────────
@@ -41,10 +42,7 @@ const INTENT_PATTERNS = [
   // ── screen_analysis: "what's on my screen", "describe what I see" ────────────
   {
     intent: 'screen_analysis',
-    test: (text) => {
-      if (/\b(what'?s\s+on\s+(my\s+)?screen|what\s+am\s+i\s+looking\s+at|what\s+i'?m\s+looking\s+at|describe\s+(what'?s\s+on|what\s+i'?m\s+looking\s+at)|read\s+(what'?s\s+)?on\s+screen|what\s+(does|do)\s+(my|the)\s+screen\s+show|what\s+app\s+am\s+i\s+in|what'?s\s+the\s+active\s+app|what\s+window\s+is\s+open|analyze\s+(the\s+|my\s+)?screen|scan\s+(my\s+)?screen|what\s+app\s+is\s+(open|focused|running)|what\s+program\s+is\s+running|what\s+is\s+currently\s+displayed|check\s+(this|the)\s+\w+\s+on\s+(my\s+|the\s+)?screen)\b/i.test(text)) return true;
-      return false;
-    },
+    test: (text) => SCREEN_OBSERVATION_RE.test(text),
   },
 
   // ── memory_retrieve: recall of conversation, personal info, past activity ───
@@ -68,7 +66,18 @@ const INTENT_PATTERNS = [
       // "that thing/link/article I saw earlier" style recall
       if (/\bthat\s+(thing|article|link|page|site|website|video|song|music|post|tweet|image|picture|photo|meme|file|email|message|recipe|document|tab|window)\b.{0,50}\b(i\s+)?(saw|had|looked|read|watched|opened|visited|saved|copied|sent|received|found)\b/i.test(text)) return true;
       // Time-qualified recall: a past-time marker + recall-ish verb/noun
-      if (_EPISODIC_RE.test(text) && /\b(what|did|show|find|was|were|saw|looked|watched|read|played|listened|open|had|screen|activity|doing|working|listening|watching)\b/i.test(text)) return true;
+      if (_EPISODIC_RE.test(text) && /\b(what|did|show|find|was|were|saw|looked|watched|read|played|listened|open|had|screen|activity|doing|working|listening|watching|worked|used|spent|summariz)\b/i.test(text)) return true;
+      // "when did I last mention/say X" — recall questions phrased as
+      // time-queries; also "when's the last time I said/told/mentioned"
+      if (/\bwhen\s+did\s+i\s+(last\s+)?(mention|say|tell|ask|talk|discuss|bring\s+up|write|note)\b/i.test(text)) return true;
+      if (/\bwhen'?s\s+the\s+last\s+time\s+i\s+(said|mentioned|told|asked|talked|wrote|used|did|was|worked)\b/i.test(text)) return true;
+      // "have I told you my favorite color" — stored-fact recall phrased as a
+      // self-report question; also "did I mention…"
+      if (/\bhave\s+i\s+(told|said|mentioned|shared|given)\s+(you|that)\b/i.test(text)) return true;
+      if (/\b(did|do)\s+i\s+mention\b/i.test(text)) return true;
+      // Activity summaries: "summarize what I worked on recently",
+      // "sum up my day", "recap what I did this week"
+      if (/\b(summarize|sum\s+up|recap|summarise)\b.{0,40}\b(what\s+i|my\s+(day|week|work|activity|progress|recent)|i\s+(worked|did|was\s+doing|accomplished))\b/i.test(text)) return true;
       return false;
     },
   },
@@ -138,7 +147,10 @@ const INTENT_PATTERNS = [
       // "Best X" / "top X" (recommendations need search)
       // Matches both "What's the best X" and "What is the best X"
       if (/\b(what'?(?:s|\s+is)\s+the\s+best|what\s+are\s+the\s+best|top\s+\d+|best\s+\w+\s+(for|to|in)|recommend\s+(a|an|some))\b/i.test(text)) return true;
-      if (/\b(best|top|top\s+rated|good|great|highest\s+rated|most\s+popular|recommended)\s+[\w\s]{1,40}\s+(nearby|near\s+me|in\s+\w+|to\s+(buy|get|try|watch|read|visit|use)|for)\b/i.test(text)) return true;
+      if (/\b(best|top|top\s+rated|good|great|highest\s+rated|highly\s+rated|most\s+popular|recommended|well[-\s]reviewed|popular)\s+[\w\s]{1,40}\s+(nearby|near\s+me|in\s+\w+|to\s+(buy|get|try|watch|read|visit|use)|for)\b/i.test(text)) return true;
+      // Local-business lookups: "find me three ramen restaurants in SF",
+      // "good cafes near downtown" — ratings/availability are live data
+      if (/\b(restaurants?|cafes?|coffee\s+shops?|bars?|pubs?|bakeries?|stores?|shops?|hotels?|gyms?|parks?|museums?|attractions?|things\s+to\s+do|places\s+to\s+(eat|visit|go|see|stay)|spots?\s+to)\s+(in|near|around)\s+[a-z]/i.test(text)) return true;
       // Recipes & how-to
       if (/\b(recipe|recipes|how\s+to\s+(make|cook|bake|fix|repair|build|grow|tie|draw|do|get|remove|clean|install|set\s+up)|instructions\s+(for|on|to)|tutorial|diy)\b/i.test(text)) return true;
       // Time-sensitive queries
@@ -164,6 +176,11 @@ const INTENT_PATTERNS = [
       if (/\b(explain|define|tell\s+me\s+(about|what|who|why|how)|meaning\s+of|capital\s+of|population\s+of|what\s+(time|day|date)(\s+is|\s+of)?)\b/i.test(text)) return true;
       // Math & unit conversions: "what is 5*7", "convert 88s to minutes"
       if (/\b(calculate|compute|convert|solve|what\s+is|what'?s)\b.{0,30}\b\d+|\b\d+\s*(plus|minus|times|divided|percent|degrees|celsius|fahrenheit|miles|km|feet|inches|kg|pounds|ounces|cups|minutes|seconds|hours)\b/i.test(text)) return true;
+      // Creative writing — the LLM writes it directly (no tools needed):
+      // "write a haiku about X", "compose a limerick", "tell me a joke".
+      // Messaging variants ("write an email to Bob") hit command_automate's
+      // earlier messaging patterns first, so this only sees non-messaging text.
+      if (/\b(write|compose|craft|pen|draft|create|generate|make\s+up|come\s+up\s+with|invent|tell|share)\s+(a\s+|an\s+|the\s+|some\s+|me\s+a\s+|me\s+an\s+)?[\w\s]{0,25}?\s*(poem|poems|haiku|sonnet|limerick|acrostic|ode|ballad|story|short\s+story|tale|fable|joke|jokes|riddle|riddles|pun|puns|song|songs|lyrics|essay|paragraph|slogan|tagline|caption|quote|speech|toast|eulogy|lullaby|rap|verse|rhyme|recipe\s+name|team\s+name|band\s+name|pet\s+name|baby\s+name|username)\b/i.test(text)) return true;
       return false;
     },
   },
@@ -181,9 +198,13 @@ function guess(englishText) {
     return { guessedIntent: null, confidence: 0 };
   }
 
+  // Normalize curly/smart apostrophes → ASCII so every pattern's ' class
+  // matches autocorrected input ("what’s on my screen", "I’m looking at").
+  const text = englishText.replace(/[’‘]/g, "'");
+
   for (const { intent, test } of INTENT_PATTERNS) {
     try {
-      if (test(englishText)) {
+      if (test(text)) {
         logger.info('[IntentGuesser] Matched', {
           intent,
           textPreview: englishText.substring(0, 60),

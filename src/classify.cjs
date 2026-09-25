@@ -21,7 +21,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('./logger.cjs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE } = require('../../shared/text-patterns.cjs');
+const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE } = require('../../shared/text-patterns.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
@@ -158,6 +158,17 @@ async function classify(englishText, conversationContext) {
       inputPreview: englishText.substring(0, 60),
     });
     return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'screen_output_guard' };
+  }
+
+  // Screen-observation questions ("what's on my screen", "describe what I'm
+  // looking at", "read the text on screen") need a live capture — general_quick
+  // has no eyes. The classifier LLM slips here because the question *looks*
+  // answerable; deterministic handoff instead.
+  if (SCREEN_OBSERVATION_RE.test(englishText)) {
+    logger.info('[Classify] Screen-observation guard → handoff', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'screen_observation_guard' };
   }
 
   // ── Pre-compute the keyword fallback (synchronous, free) ─────────────────────

@@ -35,6 +35,16 @@ const CASES = [
   ['search the web for ai news', 0, 'web search → handoff'],
   ['take a screenshot', 0, 'screenshot → handoff'],
 
+  // First-person recall — these hit `when did`/`did i` in the general tier
+  // and previously got claimed as general_quick, answering a memory question
+  // with a canned "let me check your records" deferral (s2-mem-dentist).
+  ['when did I last mention my dentist appointment', 0, 'when-did-i recall → handoff'],
+  ['did I mention my flight details', 0, 'did-i-mention recall → handoff'],
+  ["when's the last time I told you my address", 0, 'last-time recall → handoff'],
+  ['have I told you my wifi password', 0, 'have-i-told recall → handoff'],
+  ['summarize what I worked on recently', 0, 'activity summary → handoff'],
+  ['what did we talk about yesterday', 0, 'conversation recall → handoff'],
+
   ['good morning', 1, 'greeting → general_quick (was falling to 0.5 residual → handoff)'],
   ['good afternoon', 1, 'afternoon greeting → general_quick'],
   ['how are you', 1, 'pleasantry → general_quick'],

@@ -118,18 +118,23 @@ function _streamLLM(body, timeoutMs, onChunk) {
     let provider = 'backend';
     let settled = false;
 
-    const done = (finalProvider) => {
+    // `complete` distinguishes a finished generation (protocol `done` event or
+    // clean HTTP end) from an aborted stream (timeout/socket error mid-token).
+    // Without it, a truncated partial is indistinguishable from a real answer —
+    // observed: a TCP/UDP answer cut at "…it's a" (127 chars) was returned to
+    // the user as complete.
+    const done = (finalProvider, complete = true) => {
       if (!settled) {
         settled = true;
         clearTimeout(timeout);
-        resolve({ fullText: fullText.trim(), provider: finalProvider || provider });
+        resolve({ fullText: fullText.trim(), provider: finalProvider || provider, complete });
       }
     };
 
     const timeout = setTimeout(() => {
       logger.warn('[LLM] Backend stream timeout', { timeoutMs, chars: fullText.length });
       req.destroy();
-      done();
+      done(undefined, false);
     }, timeoutMs);
 
     const req = http.request({
@@ -159,7 +164,7 @@ function _streamLLM(body, timeoutMs, onChunk) {
             }
             if (parsed.error) {
               logger.warn('[LLM] Backend stream error event', { error: parsed.error });
-              done();
+              done(undefined, false);
               return;
             }
             if (parsed.text) {
@@ -171,18 +176,18 @@ function _streamLLM(body, timeoutMs, onChunk) {
         }
       });
       res.on('end', () => done());
-      res.on('error', () => done());
+      res.on('error', () => done(undefined, false));
     });
     req.on('error', (err) => {
       logger.warn('[LLM] Backend stream request error', { error: err.message });
       clearTimeout(timeout);
-      done();
+      done(undefined, false);
     });
     req.on('timeout', () => {
       req.destroy();
       logger.warn('[LLM] Backend stream socket timeout', { timeoutMs });
       clearTimeout(timeout);
-      done();
+      done(undefined, false);
     });
     req.write(jsonBody);
     req.end();
@@ -291,8 +296,12 @@ async function askEarly(messages, opts = {}) {
       checkEarly();
     });
 
-    if (result.fullText || attempt === MAX_ATTEMPTS) break;
-    logger.warn('[LLM] Backend stream returned no text — retrying after delay', { attempt });
+    // Only a completed stream counts as a usable answer — an aborted one
+    // (timeout/error mid-generation) holds partial text that reads as a
+    // truncated reply. Retry like an empty response; keep the last partial
+    // if attempts exhaust.
+    if ((result.complete && result.fullText) || attempt === MAX_ATTEMPTS) break;
+    logger.warn(`[LLM] Backend stream ${result.fullText ? 'aborted mid-generation' : 'returned no text'} — retrying after delay`, { attempt, chars: result.fullText.length });
     await _sleep(RETRY_DELAY_MS);
   }
 

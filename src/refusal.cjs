@@ -115,4 +115,33 @@ function sanitizeContext(context) {
     .join('\n');
 }
 
-module.exports = { REFUSAL_OPENERS, REFUSAL_MAX_LEN, isCannedRefusal, sanitizeContext };
+/**
+ * Is this response an echo of the model's own system prompt? Failing
+ * providers sometimes dump their instructions verbatim as the answer
+ * (observed: "explain the difference between TCP and UDP" → the persona
+ * capability listicle "ThinkDrop is a full desktop AI …" instead of an
+ * answer or a 0 sentinel). Detection is line-overlap: if a majority of the
+ * response's content lines appear verbatim in the system prompt, it is an
+ * echo, not an answer.
+ */
+function isPromptEcho(response, systemPrompt) {
+  // Compare word sequences — markdown (**bold**, - bullets, #) decorates the
+  // echo but never the source, so strip to alphanumerics before matching.
+  const strip = s => _normalize(s).replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const sys = strip(systemPrompt);
+  if (!sys) return false;
+  // Split the RAW response on sentence/line boundaries first — a bullet
+  // block echoes as one long segment whose words still align contiguously.
+  const lines = String(response || '')
+    .split(/[.\n!?]+/)
+    .map(strip)
+    .filter(l => l.length >= 12);
+  if (lines.length < 2) {
+    const whole = strip(response);
+    return whole.length >= 12 && sys.includes(whole);
+  }
+  const hits = lines.filter(l => sys.includes(l)).length;
+  return hits >= 2 && hits >= Math.ceil(lines.length / 2);
+}
+
+module.exports = { REFUSAL_OPENERS, REFUSAL_MAX_LEN, isCannedRefusal, isPromptEcho, sanitizeContext };

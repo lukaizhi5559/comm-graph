@@ -74,6 +74,47 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
       r.intent === 4 && r.source === 'keyword_fallback');
   });
 
+  // ── Screen-observation guard (deterministic, pre-LLM) ──────────────────────
+  // Regression: "describe what I'm looking at" classified general_quick by
+  // cerebras in run3 (confident-but-wrong — no veto applies to non-zero).
+  // Screen questions need a live capture; general_quick has no eyes.
+
+  await withAsk(async () => { throw new Error('LLM must not be called — guard fires first'); }, async () => {
+    const r = await classify("describe what I'm looking at");
+    check('screen-observation guard → handoff (LLM verdict bypassed)',
+      r.intent === 0 && r.source === 'screen_observation_guard');
+  });
+
+  await withAsk(async () => { throw new Error('LLM must not be called'); }, async () => {
+    const r = await classify("what's on my screen right now");
+    check('"what\'s on my screen" → handoff (either screen guard)',
+      r.intent === 0 && r.source.startsWith('screen_'));
+  });
+
+  await withAsk(async () => { throw new Error('LLM must not be called'); }, async () => {
+    const r = await classify('is there an error dialog visible on my screen');
+    check('visible-on-screen phrasing → handoff (either screen guard)',
+      r.intent === 0 && r.source.startsWith('screen_'));
+  });
+
+  await withAsk(async () => { throw new Error('LLM must not be called'); }, async () => {
+    const r = await classify('read the text visible on my screen');
+    check('read-text-on-screen phrasing → handoff (either screen guard)',
+      r.intent === 0 && r.source.startsWith('screen_'));
+  });
+
+  await withAsk(async () => { throw new Error('LLM must not be called'); }, async () => {
+    const r = await classify('what app am I in');
+    check('no literal "screen" words → observation guard specifically',
+      r.intent === 0 && r.source === 'screen_observation_guard');
+  });
+
+  await withAsk(async () => ({ text: '1', provider: 'mock' }), async () => {
+    const r = await classify('what is a screen');
+    check('non-observational "screen" mention → LLM verdict stands (no guard)',
+      r.intent === 1);
+  });
+
   console.log(`\n${passed}/${tests} passed`);
   process.exit(passed === tests ? 0 : 1);
 })().catch(e => { console.error(e); process.exit(1); });
