@@ -74,7 +74,6 @@ const _intentKeys = Object.keys(INTENTS).map(Number);
 const _intentMin = Math.min(..._intentKeys);
 const _intentMax = Math.max(..._intentKeys);
 const NUMBER_RE = new RegExp(`^\\s*([${_intentMin}-${_intentMax}])\\s*$`);
-const _EXTRACT_RE = new RegExp(`([${_intentMin}-${_intentMax}])`);
 const _intentListStr = _intentKeys.join(', ');
 
 /**
@@ -161,48 +160,91 @@ async function classify(englishText, conversationContext) {
     return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'screen_output_guard' };
   }
 
-  // ── Try force-prompt classification (primary) ────────────────────────────────
+  // ── Pre-compute the keyword fallback (synchronous, free) ─────────────────────
+  // It only fires when the LLM path fails or returns garbage — but computing it
+  // up front lets a confident keyword hit short-circuit a failed LLM attempt
+  // instead of paying a second 12s provider call. LLM stays primary.
+  const { ask } = require('./llm-providers.cjs');
+  let keywordHit = null;
   try {
-    const { ask } = require('./llm-providers.cjs');
-    const messages = _buildClassifyMessages(englishText, conversationContext);
-    const { text, provider } = await ask(messages, {
-      maxTokens: 5,
-      temperature: 0.1,
-      timeoutMs: 12000,
-    });
-
-    if (text) {
-      const trimmed = text.trim();
-      const match = trimmed.match(NUMBER_RE);
-      if (match) {
-        const intent = parseInt(match[1], 10);
-        const info = INTENTS[intent];
-        logger.info('[Classify] Force-prompt result', {
-          intent, intentName: info.name, provider, text: trimmed,
-          inputPreview: englishText.substring(0, 60),
-        });
-        return { intent, intentName: info.name, confidence: 0.92, source: 'force_prompt' };
-      }
-      // LLM returned something but not a clean number — try to extract
-      const numMatch = trimmed.match(_EXTRACT_RE);
-      if (numMatch) {
-        const intent = parseInt(numMatch[1], 10);
-        const info = INTENTS[intent];
-        logger.info('[Classify] Force-prompt (extracted)', {
-          intent, intentName: info.name, provider, raw: trimmed,
-        });
-        return { intent, intentName: info.name, confidence: 0.75, source: 'force_prompt_extracted' };
-      }
-      logger.warn('[Classify] Force-prompt returned unparseable response', { raw: trimmed, provider });
+    const fb = require('./classifier-fallback.cjs');
+    const r = fb._keywordClassify(englishText);
+    if (r && r.confidence > 0.5 && INTENTS[r.intent]) {
+      keywordHit = { intent: r.intent, intentName: INTENTS[r.intent].name, confidence: r.confidence };
     }
-  } catch (err) {
-    logger.warn('[Classify] Force-prompt error', { error: err.message });
+  } catch (_) { /* fallback unavailable — LLM path proceeds normally */ }
+
+  const _adoptKeyword = (reason) => {
+    logger.info('[Classify] Keyword fallback result', {
+      intent: keywordHit.intent, intentName: keywordHit.intentName,
+      confidence: keywordHit.confidence, reason,
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { ...keywordHit, source: 'keyword_fallback' };
+  };
+
+  // ── Try force-prompt classification (primary) ────────────────────────────────
+  // One retry on unparseable responses — a flaky provider echoing the system
+  // prompt back is transient; the backend rotates providers between calls.
+  const messages = _buildClassifyMessages(englishText, conversationContext);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const { text, provider } = await ask(messages, {
+        maxTokens: 5,
+        temperature: 0.1,
+        timeoutMs: 12000,
+      });
+
+      if (text) {
+        const trimmed = text.trim();
+        const match = trimmed.match(NUMBER_RE);
+        if (match) {
+          const intent = parseInt(match[1], 10);
+          const info = INTENTS[intent];
+          logger.info('[Classify] Force-prompt result', {
+            intent, intentName: info.name, provider, text: trimmed,
+            inputPreview: englishText.substring(0, 60),
+            ...(attempt > 1 ? { attempt } : {}),
+          });
+          return { intent, intentName: info.name, confidence: 0.92, source: attempt > 1 ? 'force_prompt_retry' : 'force_prompt' };
+        }
+        // LLM returned something but not a clean number — try to extract.
+        // Only trust a SINGLE distinct digit: providers sometimes echo a
+        // numbered intent list or emit enumeration prose, where the first
+        // digit is almost always 0 (handoff) — the most expensive misroute.
+        // Multiple distinct digits = untrustworthy → retry → keyword fallback.
+        const digitHits = trimmed.match(/\d/g) || [];
+        const uniqueDigits = [...new Set(digitHits)];
+        if (uniqueDigits.length === 1 && trimmed.length <= 60) {
+          const intent = parseInt(uniqueDigits[0], 10);
+          const info = INTENTS[intent];
+          if (info) {
+            logger.info('[Classify] Force-prompt (extracted)', {
+              intent, intentName: info.name, provider, raw: trimmed,
+            });
+            return { intent, intentName: info.name, confidence: 0.75, source: 'force_prompt_extracted' };
+          }
+        }
+        logger.warn('[Classify] Force-prompt returned unparseable response', { raw: trimmed, provider, attempt });
+        // A confident keyword hit beats a second 12s provider call — the LLM
+        // already flaked once; degraded-mode routing now beats a slow lottery.
+        if (keywordHit) return _adoptKeyword('llm_unparseable');
+        continue;
+      }
+      // Empty text — backend down; keyword hit still beats a blind retry.
+      if (keywordHit) return _adoptKeyword('llm_empty');
+      break;
+    } catch (err) {
+      logger.warn('[Classify] Force-prompt error', { error: err.message, attempt });
+      if (keywordHit) return _adoptKeyword('llm_error');
+      break;
+    }
   }
 
   // ── Fallback: default to handoff (safe) ──────────────────────────────────────
-  // When the LLM fails, default to handoff — the main stategraph can handle
-  // anything (including chitchat — it would just answer directly). Don't run
-  // a regex classifier that can misclassify commands as chitchat.
+  // When the LLM fails and no keyword matched, default to handoff — the main
+  // stategraph can handle anything (including chitchat — it would just answer
+  // directly).
   logger.info('[Classify] LLM failed — defaulting to handoff (safe)');
   return { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'default_handoff' };
 }

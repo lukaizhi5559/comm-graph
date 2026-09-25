@@ -188,6 +188,40 @@ function _detectSemanticAttribute(englishText) {
   return null;
 }
 
+// Deterministic profile-attribute vocabulary — the closed set in
+// ATTRIBUTE_PROFILE_KEYS expressed as "my <attr>" question phrasings.
+// memory_quick is the fast path: it must not spend an LLM round-trip (which
+// can time out under provider pressure) to recognize "what's my name".
+// The LLM detector stays as the fallback for unusual phrasing.
+const PROFILE_ATTRIBUTE_PATTERNS = [
+  ['name',      /\bmy\s+(?:full\s+|first\s+|last\s+|real\s+|nick)?name\b/],
+  ['email',     /\bmy\s+e-?mail(?:\s+address)?\b/],
+  ['phone',     /\bmy\s+(?:phone|phone\s+number|cell|mobile|number)\b/],
+  ['birthday',  /\bmy\s+birthday\b|\bwhen\s+(?:was|am)\s+i\s+born\b/],
+  ['location',  /\bmy\s+(?:location|city|town)\b|\bwhere\s+do\s+i\s+live\b/],
+  ['timezone',  /\bmy\s+time\s*zone\b|\bwhat\s+time\s*zone\s+(?:am|is)\s+i\b|\bwhat\s+time\s*zone\s+am\s+i\s+in\b/],
+  ['company',   /\bmy\s+company\b|\bwhere\s+do\s+i\s+work\b/],
+  ['occupation',/\bmy\s+(?:occupation|profession)\b|\bwhat\s+do\s+i\s+do\b/],
+  ['github',    /\bmy\s+github\b/],
+  ['username',  /\bmy\s+user\s*name\b/],
+  ['address',   /\bmy\s+(?:home\s+|work\s+)?address\b/],
+  ['language',  /\bmy\s+(?:preferred\s+|primary\s+)?language\b|\bwhat\s+language\s+do\s+i\b/],
+];
+
+/**
+ * Deterministic detection of profile-attribute questions over the
+ * ATTRIBUTE_PROFILE_KEYS vocabulary. Runs before the LLM detector.
+ * @param {string} englishText
+ * @returns {string|null} attribute name or null
+ */
+function _detectProfileAttribute(englishText) {
+  const q = englishText.toLowerCase();
+  for (const [attr, re] of PROFILE_ATTRIBUTE_PATTERNS) {
+    if (re.test(q)) return attr;
+  }
+  return null;
+}
+
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 /**
  * Query user-memory-service for a profile fact.
@@ -376,7 +410,16 @@ async function execute(englishText, systemPrompt, conversationContext) {
   let attribute = semanticAttr;
   let useSemanticOnly = !!semanticAttr;
 
-  // If not a semantic-only attribute, use LLM detection
+  // Deterministic profile-attribute vocabulary match — no LLM round-trip for
+  // the common "what's my <attr>" shape.
+  if (!attribute) {
+    attribute = _detectProfileAttribute(englishText);
+    if (attribute) {
+      logger.info('[MemoryQuick] Deterministic attribute match', { attribute });
+    }
+  }
+
+  // If still nothing, use LLM detection for unusual phrasing
   if (!attribute) {
     attribute = await _llmDetectAttribute(englishText);
   }

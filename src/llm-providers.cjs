@@ -24,6 +24,14 @@ const DEFAULT_MAX_TOKENS  = 150;
 const DEFAULT_TEMPERATURE = 0.7;
 const DEFAULT_TIMEOUT_MS  = 12000;
 
+// The backend's LLMRouter already fans out across providers per request, but
+// "All providers failed" responses still occur during short provider flaps
+// (rate limits, cold starts). One bounded retry absorbs those windows; the
+// alternative is quick intents instantly escalating into doomed handoffs.
+const MAX_ATTEMPTS   = 2;
+const RETRY_DELAY_MS = 2000;
+const _sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 // ── Backend URL ────────────────────────────────────────────────────────────────
 const BACKEND_BASE = (process.env.BACKEND_LLM_URL || 'http://localhost:4000/api/llm').replace(/\/$/, '');
 const BACKEND_HOST = BACKEND_BASE.replace(/^https?:\/\//, '').split(':')[0] || 'localhost';
@@ -210,10 +218,16 @@ async function ask(messages, opts = {}) {
     },
   };
 
-  const result = await _postLLM(body, resolvedOpts.timeoutMs);
-  if (result && result.text) {
-    logger.info('[LLM] Backend response', { provider: result.provider, chars: result.text.length, ms: result.time });
-    return { text: result.text, provider: result.provider };
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const result = await _postLLM(body, resolvedOpts.timeoutMs);
+    if (result && result.text) {
+      logger.info('[LLM] Backend response', { provider: result.provider, chars: result.text.length, ms: result.time });
+      return { text: result.text, provider: result.provider };
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      logger.warn('[LLM] Backend call empty/failed — retrying after delay', { attempt });
+      await _sleep(RETRY_DELAY_MS);
+    }
   }
 
   logger.error('[LLM] Backend call failed — no response');
@@ -251,25 +265,36 @@ async function askEarly(messages, opts = {}) {
   let accumulated = '';
   let firstSentence = '';
   let earlyResolved = false;
+  let result = { fullText: '', provider: 'none' };
 
-  const checkEarly = () => {
-    if (earlyResolved) return;
-    // First "real" sentence boundary: ≥5 chars, terminator followed by
-    // whitespace + a non-lowercase char (lowercase continuation = mid-sentence,
-    // e.g. "e.g. you..."), and not preceded by a short title-case word
-    // (Mr./Dr./Jr./Jan.-style abbreviations). Mid-token dots ("Three.js",
-    // "v1.2", "3.14") and chunk boundaries ending in "." are skipped.
-    const match = accumulated.match(/^[\s\S]{5,}?(?<![A-Z][a-z]{1,3})[.?!](?=\s+[^a-z])/);
-    if (match && match[0].trim().length > 4) {
-      firstSentence = match[0].trim();
-      earlyResolved = true;
-    }
-  };
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    accumulated = '';
+    firstSentence = '';
+    earlyResolved = false;
 
-  const result = await _streamLLM(body, resolvedOpts.timeoutMs, (chunk) => {
-    accumulated += chunk;
-    checkEarly();
-  });
+    const checkEarly = () => {
+      if (earlyResolved) return;
+      // First "real" sentence boundary: ≥5 chars, terminator followed by
+      // whitespace + a non-lowercase char (lowercase continuation = mid-sentence,
+      // e.g. "e.g. you..."), and not preceded by a short title-case word
+      // (Mr./Dr./Jr./Jan.-style abbreviations). Mid-token dots ("Three.js",
+      // "v1.2", "3.14") and chunk boundaries ending in "." are skipped.
+      const match = accumulated.match(/^[\s\S]{5,}?(?<![A-Z][a-z]{1,3})[.?!](?=\s+[^a-z])/);
+      if (match && match[0].trim().length > 4) {
+        firstSentence = match[0].trim();
+        earlyResolved = true;
+      }
+    };
+
+    result = await _streamLLM(body, resolvedOpts.timeoutMs, (chunk) => {
+      accumulated += chunk;
+      checkEarly();
+    });
+
+    if (result.fullText || attempt === MAX_ATTEMPTS) break;
+    logger.warn('[LLM] Backend stream returned no text — retrying after delay', { attempt });
+    await _sleep(RETRY_DELAY_MS);
+  }
 
   // Re-check with full text — end-of-string also counts as a boundary here
   const fullText = result.fullText;

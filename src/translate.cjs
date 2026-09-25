@@ -57,9 +57,16 @@ const FULL_NAME_TO_ISO1 = {
   indonesian: 'id', malay: 'ms', ukrainian: 'uk',
 };
 
+// Language tags that mean "unknown / not detected" rather than a real language.
+// 'auto' arrives from the text path (renderer sends no language), 'und' from STT.
+// They must never be used as a translation source/target — resolve to 'en' and
+// let detectScriptLanguage upgrade to a concrete language when the script is clear.
+const UNKNOWN_LANGUAGE_TAGS = new Set(['auto', 'und', 'unknown', '']);
+
 function normalizeLanguage(langCode) {
   if (!langCode) return 'en';
   const base = langCode.toLowerCase().split('-')[0];
+  if (UNKNOWN_LANGUAGE_TAGS.has(base)) return 'en';
   if (ISO3_TO_ISO1[base]) return ISO3_TO_ISO1[base];
   if (FULL_NAME_TO_ISO1[base]) return FULL_NAME_TO_ISO1[base];
   if (base === 'zh') return 'zh';

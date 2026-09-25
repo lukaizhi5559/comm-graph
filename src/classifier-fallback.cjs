@@ -114,8 +114,13 @@ function _keywordClassify(text) {
     return { intent: 4, confidence: 0.7 };
   }
 
-  // Status checks
-  if (/\b(how\s+is|how's|status|progress|done\s+yet|still\s+running|how\s+far|coming\s+along)\b/i.test(lower)) {
+  // Status checks — asking about the system's own in-flight work.
+  // Covers "how is it going", "status", "still running", plus interrogatives
+  // like "what's running right now" and "did my task finish" — the class of
+  // questions whose subject is the task journal, not the outside world.
+  if (/\b(how\s+is|how's|status|progress|done\s+yet|still\s+running|how\s+far|coming\s+along)\b/i.test(lower)
+      || /\b(did|has|is|are|was|were)\b[^?]{0,40}\b(task|job|it|that|this|anything|something)\b[^?]{0,25}\b(finish|finished|done|complete|completed|running|working|going)\b/i.test(lower)
+      || /\bwhat'?s?\s+(still\s+)?(running|going\s+on|happening|in\s+progress|pending|queued)\b/i.test(lower)) {
     return { intent: 3, confidence: 0.7 };
   }
 
@@ -130,14 +135,32 @@ function _keywordClassify(text) {
     return { intent: 2, confidence: 0.75 };
   }
 
-  // Memory store — general memory/note/appointment (NOT personal profile fact)
-  if (/\b(remember\s+i\s+have|i\s+have\s+an?\s+\w+\s+(appt|appointment|meeting|event|flight|call)|note\s*[:)]|just\s+noting|i\s+need\s+to\s+remember)\b/i.test(lower)) {
+  // Memory store — general memory/note/appointment (NOT personal profile fact).
+  // NOTE: no trailing \b on the group — 'note:' ends in a non-word char so a
+  // shared boundary can never match; and the "i have a(n) X event" pattern
+  // allows zero middle words ("i have a flight") or one ("a dentist appt").
+  if (/\b(remember\s+i\s+have|i\s+need\s+to\s+remember|just\s+noting|note\s*[:)]|i\s+have\s+an?\s+(?:\w+\s+){0,2}(appt|appointment|meeting|event|flight|call|reminder|deadline))/i.test(lower)) {
     return { intent: 5, confidence: 0.7 };
   }
 
   // Handoff — action verbs + targets
   if (/\b(go\s+to|open|close|search|look\s+up|find|browse|navigate|download|send|schedule|screenshot|what\s+was\s+i\s+doing|list\s+my)\b/i.test(lower)) {
     return { intent: 0, confidence: 0.65 };
+  }
+
+  // General quick — greetings, pleasantries, opinions, simple knowledge.
+  // Mirrors GENERAL_QUICK_SEEDS vocabulary: short prompts with greeting or
+  // question-word markers and no action/recall content. Fires above the 0.5
+  // residual so the wiring threshold (conf > 0.5) accepts it — otherwise
+  // "good morning" falls through to handoff and pays a full graph run.
+  // "what is/what's" knowledge questions count too — but anything referencing
+  // the system surface (screen/app/task/memory/history) is excluded: those
+  // need the real graph (screen_intelligence / status / deep memory), and the
+  // tiers above that wanted them have already had their shot.
+  const _hasSystemRef = /\b(screen|app|window|task|memory|conversation|history|running|process)\b/i.test(lower);
+  if (lower.split(/\s+/).length <= 15 && !_hasSystemRef &&
+      /\b(hello|hi|hey|howdy|greetings|good\s+(morning|afternoon|evening|night|day)|how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|thank(s|\s+you)|you'?re\s+welcome|bye|goodbye|see\s+you|joke|who\s+are\s+you|what'?s\s+your\s+name|are\s+you\s+(there|awake|alive)|can\s+you\s+hear\s+me|what\s+do\s+you\s+think|explain|tell\s+me\s+(a\s+|about\s+|why|how)|why\s+(is|are|does|do|did)|who\s+(is|was|were|wrote|invented)|when\s+(is|was|did)|where\s+(is|was)|how\s+(many|much|long|old|far)|is\s+(it|there|this|that)|do\s+you|what\s+(is|are|was|were)|what'?s)\b/i.test(lower)) {
+    return { intent: 1, confidence: 0.65 };
   }
 
   // Default: general quick
@@ -159,4 +182,4 @@ async function classify(text) {
   return result;
 }
 
-module.exports = { classify };
+module.exports = { classify, _keywordClassify };
