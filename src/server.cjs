@@ -683,6 +683,13 @@ const server = http.createServer(async (req, res) => {
     return _send(res, 200, { tasks: taskJournal.getAllTasks() });
   }
 
+  // ── Clear the journal (test harness) — drops queued/running entries so a
+  // restarted corpus run can't replay stale tasks via agent-lock release.
+  if (req.url === '/tasks/reset' && req.method === 'POST') {
+    taskJournal.clearAll();
+    return _send(res, 200, { ok: true });
+  }
+
   // ── Get agent lock state (for UI) ─────────────────────────────────────────────
   if (req.url === '/locks' && req.method === 'GET') {
     return _send(res, 200, agentLock.getLockState());

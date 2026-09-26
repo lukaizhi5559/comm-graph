@@ -323,6 +323,7 @@ module.exports = {
   updateProgress,
   setResult,
   deleteTask,
+  clearAll: function clearAll() { _tasks.clear(); _save(); },
   getTask,
   getActiveTasks,
   getRecentTasks,
