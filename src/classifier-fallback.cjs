@@ -12,6 +12,7 @@
  */
 
 const logger = require('./logger.cjs');
+const { DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE } = require('../../shared/text-patterns.cjs');
 
 // ── Seed examples per intent ──────────────────────────────────────────────────
 const HANDOFF_SEEDS = [
@@ -179,7 +180,16 @@ function _keywordClassify(text) {
   // memory graph, not a blind quick answer. Mirrors the recall tier above;
   // a keyword hit here can veto an LLM handoff so the exclusion is load-bearing.
   const _isSelfRecall = /\b(when\s+did\s+i|what\s+did\s+i|did\s+i\s+(mention|say|tell|ask|talk)|have\s+i\s+(told|said|mentioned|shared)|did\s+we|have\s+we|i\s+(last\s+)?(mentioned|told|said|asked)|last\s+time\s+i|what\s+was\s+i|was\s+i\s+(doing|working|watching|looking))\b/i.test(lower);
-  if (lower.split(/\s+/).length <= 15 && !_hasSystemRef && !_needsLiveData && !_isSelfRecall &&
+  // Bare-deictic continuations ("when was that", "tell me more about that")
+  // carry their referent entirely in a pronoun — only the conversation
+  // transcript can resolve it. The quick tier sees no transcript and
+  // hallucinates (observed: "when was that" → invented a date). A keyword
+  // hit here can veto an LLM handoff, so the exclusion is load-bearing.
+  const _isDeicticContinuation = DEICTIC_CONTINUATION_RE.test(lower);
+  // Device-state questions (battery/disk/wifi/uptime) need OS tools — a quick
+  // text answer can only invent telemetry.
+  const _isDeviceState = DEVICE_STATE_RE.test(lower);
+  if (lower.split(/\s+/).length <= 15 && !_hasSystemRef && !_needsLiveData && !_isSelfRecall && !_isDeicticContinuation && !_isDeviceState &&
       /\b(hello|hi|hey|howdy|greetings|good\s+(morning|afternoon|evening|night|day)|how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|thank(s|\s+you)|you'?re\s+welcome|bye|goodbye|see\s+you|joke|who\s+are\s+you|what'?s\s+your\s+name|are\s+you\s+(there|awake|alive)|can\s+you\s+hear\s+me|what\s+do\s+you\s+think|explain|tell\s+me\s+(a\s+|about\s+|why|how)|why\s+(is|are|does|do|did)|who\s+(is|was|were|wrote|invented)|when\s+(is|was|did)|where\s+(is|was)|how\s+(many|much|long|old|far)|is\s+(it|there|this|that)|do\s+you|what\s+(is|are|was|were)|what'?s)\b/i.test(lower)) {
     return { intent: 1, confidence: 0.65 };
   }

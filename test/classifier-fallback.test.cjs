@@ -56,6 +56,16 @@ const CASES = [
   ['hey', 1, 'bare greeting → general_quick'],
 ];
 
+// Bare-deictic continuations must NOT be claimed by any keyword tier — the
+// referent lives in the transcript and the quick tier hallucinates without
+// it (observed: "when was that" vetoed an LLM handoff → invented a date).
+// Assert conf <= 0.5 so the wiring treats it as no-match → handoff.
+const DEICTIC_CASES = [
+  ['when was that', 'deictic time question'],
+  ['tell me more about that', 'deictic continuation'],
+  ['what about that', 'deictic what-about'],
+];
+
 (async () => {
   for (const [prompt, want, label] of CASES) {
     const r = await fallback.classify(prompt);
@@ -64,6 +74,12 @@ const CASES = [
     const note = want === 1 ? ` (conf ${r.confidence} — wiring requires >0.5 to adopt, else handoff)` : ` (conf ${r.confidence})`;
     if (ok) { console.log(`  PASS: ${label}${note}`); passed++; }
     else { console.error(`  FAIL: ${label} — got intent ${r.intent}${note}`); failed++; }
+  }
+  for (const [prompt, label] of DEICTIC_CASES) {
+    const r = await fallback.classify(prompt);
+    const ok = r.confidence <= 0.5;
+    if (ok) { console.log(`  PASS: ${label} — conf ${r.confidence} ≤ 0.5 (no keyword veto)`); passed++; }
+    else { console.error(`  FAIL: ${label} — conf ${r.confidence} would veto handoff (intent ${r.intent})`); failed++; }
   }
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

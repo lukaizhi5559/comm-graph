@@ -115,6 +115,57 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
       r.intent === 1);
   });
 
+  // Bare-deictic continuations — the referent lives in the transcript;
+  // general_quick hallucinates a referent it can't see. Hand off even when
+  // the LLM would happily quick-answer (observed: "when was that" → a
+  // keyword hit vetoed the LLM's handoff and invented a date).
+  await withAsk(async () => ({ text: '1', provider: 'mock' }), async () => {
+    const r = await classify('when was that');
+    check('deictic "when was that" → handoff (beats LLM general_quick)',
+      r.intent === 0 && r.source === 'deictic_continuation_guard');
+  });
+
+  await withAsk(async () => { throw new Error('LLM must not be called'); }, async () => {
+    const r = await classify('tell me more about that');
+    check('deictic "tell me more about that" → handoff (pre-LLM guard)',
+      r.intent === 0 && r.source === 'deictic_continuation_guard');
+  });
+
+  await withAsk(async () => { throw new Error('LLM must not be called'); }, async () => {
+    const r = await classify('what about that');
+    check('deictic "what about that" → handoff',
+      r.intent === 0 && r.source === 'deictic_continuation_guard');
+  });
+
+  // ── Action veto (deterministic guesser vs quick-tier flake) ────────────────
+  // Regression: "post a tweet saying hello world" drew general_quick — comms
+  // answered "tweet going live" and nothing ran. Quick tiers emit text only;
+  // a deterministic guesser hit for a graph-only intent must veto them.
+
+  await withAsk(async () => ({ text: '1', provider: 'mock' }), async () => {
+    const r = await classify('post a tweet saying hello world');
+    check('tweet prompt: guesser command_automate vetoes LLM general_quick → handoff',
+      r.intent === 0 && r.source === 'action_veto');
+  });
+
+  await withAsk(async () => ({ text: '1', provider: 'mock' }), async () => {
+    const r = await classify('send an email to Sarah about the meeting');
+    check('send-email phrasing → action veto → handoff',
+      r.intent === 0 && r.source === 'action_veto');
+  });
+
+  await withAsk(async () => ({ text: '1', provider: 'mock' }), async () => {
+    const r = await classify('remind me to call mom tomorrow at 5');
+    check('scheduling phrasing → action veto → handoff',
+      r.intent === 0 && r.source === 'action_veto');
+  });
+
+  await withAsk(async () => ({ text: '1', provider: 'mock' }), async () => {
+    const r = await classify('tell me a joke');
+    check('pure knowledge: guesser general_knowledge → no veto, LLM quick stands',
+      r.intent === 1 && r.intentName === 'general_quick');
+  });
+
   console.log(`\n${passed}/${tests} passed`);
   process.exit(passed === tests ? 0 : 1);
 })().catch(e => { console.error(e); process.exit(1); });

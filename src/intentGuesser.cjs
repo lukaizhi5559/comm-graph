@@ -31,6 +31,9 @@ const {
   NAMED_APP_RE: _NAMED_APP_RE,
   ACTION_VERB_RE: _ACTION_VERB_RE,
   SCREEN_OBSERVATION_RE,
+  DEICTIC_CONTINUATION_RE,
+  DEVICE_STATE_RE: _DEVICE_STATE_RE,
+  FILE_PATH_RE: _FILE_PATH_RE,
 } = require('../../shared/text-patterns.cjs');
 
 // ── Intent patterns (ordered by specificity — first match wins) ──────────────
@@ -51,6 +54,10 @@ const INTENT_PATTERNS = [
   {
     intent: 'memory_retrieve',
     test: (text) => {
+      // Bare-deictic continuations ("tell me more about that", "when was
+      // that") — the referent lives in the transcript, not the ambient
+      // screen/file context classifyTask would conflate it with.
+      if (DEICTIC_CONTINUATION_RE.test(text)) return true;
       // Conversation recall — canonical pattern (shared/text-patterns.cjs)
       if (CONVERSATION_RECALL_RE.test(text)) return true;
       // Recall-flavored phrasings the canonical recall regex doesn't cover
@@ -117,6 +124,13 @@ const INTENT_PATTERNS = [
       if (/\b(create|make|new|add|delete|rename|move|copy|find|locate|open|show)\s+(a\s+|an\s+|the\s+|my\s+)?[\w\s]{0,25}?\s*(file|folder|document|doc|note|page|spreadsheet|sheet|presentation|slide|playlist)\b/i.test(text)) return true;
       // New personal items: "new reminder", "add a contact", "create a calendar event"
       if (/\b(create|make|new|add|set\s+up)\s+(a\s+|an\s+)?(note|event|calendar\s+event|reminder|contact|playlist|album|board|task|to-?do|appointment|meeting)\b/i.test(text)) return true;
+      // Mutations of scheduled artifacts: "cancel my stretch reminder",
+      // "delete the 3pm meeting" — an action on a stored artifact, NOT a
+      // task-control signal (comms control_signal can't delete a reminder).
+      if (/\b(cancel|delete|remove|change|reschedule|move|edit)\s+(the\s+|my\s+|this\s+|that\s+)?[\w\s]{0,25}?\s*(reminder|alarm|timer|meeting|event|appointment|calendar\s+event|to-?do)\b/i.test(text)) return true;
+      // File-path ops: mutation/read verb + a literal POSIX path —
+      // "rename /tmp/a.txt to /tmp/b.txt" has no "file" noun but is a file op.
+      if (/\b(rename|move|copy|delete|remove|create|write|append|edit|read|open|show|list|find|locate|cat|display|print)\b/i.test(text) && _FILE_PATH_RE.test(text)) return true;
       // System controls: "turn off wifi", "toggle dark mode", "set volume to 50"
       if (/\b(turn|toggle|switch|enable|disable|activate|deactivate)\s+(on|off|up|down)?\s*(the\s+|my\s+)?(wi-?fi|bluetooth|volume|brightness|dark\s*mode|light\s*mode|do\s*not\s*disturb|dnd|airplane(\s*mode)?|night\s*shift|true\s*tone|hotspot|vpn|microphone|mic|camera|location|notifications?|flashlight|low\s*power\s*mode)\b/i.test(text)) return true;
       if (/\b(set|adjust|change|increase|decrease|raise|lower|turn\s+(up|down)|mute|unmute)\s+(the\s+|my\s+)?(volume|brightness|resolution|wallpaper|font\s*size|screen\s*time|keyboard|mouse|trackpad|display|backlight)\b/i.test(text)) return true;
@@ -127,6 +141,9 @@ const INTENT_PATTERNS = [
       if (/\b(take|capture|grab|snap)\s+(a\s+|an\s+)?(screenshot|screen\s*shot|screen\s*(recording|capture|grab)|photo\s+of\s+(my|the)\s+screen|picture\s+of\s+(my|the)\s+screen)\b|\bscreenshot\s+(this|my|the)\b|\bscreen\s*record/i.test(text)) return true;
       // Inbox/calendar checks that require opening an app: "check my email"
       if (/\b(check|read|open|show|pull\s+up|look\s+at)\s+(my\s+)?(email|e-?mail|inbox|gmail|messages|texts|dms|calendar|schedule|notifications?|voicemail|slack|teams)\b/i.test(text)) return true;
+      // Device telemetry: "what's my battery percentage", "check disk space",
+      // "is my wifi on" — these need an OS probe; there is no text answer.
+      if (_DEVICE_STATE_RE.test(text)) return true;
       // Browser automation keywords
       if (/\b(click|type\s+into|fill\s+(out|in)|submit|press\s+(the\s+)?(button|key|enter))\b/i.test(text)) return true;
       return false;
