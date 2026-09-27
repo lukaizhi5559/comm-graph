@@ -103,8 +103,11 @@ const INTENT_PATTERNS = [
     intent: 'command_automate',
     test: (text) => {
       // Episodic/recall phrasing is never automation — let memory_retrieve win
-      // even when a named app + action verb are both present.
-      if (_EPISODIC_RE.test(text)) return false;
+      // even when a named app + action verb are both present. Exception:
+      // reminder/scheduling verbs stay actions even with a past-time word —
+      // "remind me yesterday at 5pm" is a scheduling request (the graph
+      // resolves the odd time), not an episodic recall.
+      if (_EPISODIC_RE.test(text) && !/\b(remind|reminder|alarm|timer|schedule)\b/i.test(text)) return false;
       // Named app with an action verb → command_automate
       if (_NAMED_APP_RE.test(text) && _ACTION_VERB_RE.test(text)) return true;
       // Action verb + specific site (e.g. "go to amazon.com")
@@ -112,7 +115,11 @@ const INTENT_PATTERNS = [
       // Scheduling/reminders — ACTION phrasing only ("remind me to/at/in"),
       // never recall ("remind me what we…" is memory_retrieve, checked above).
       if (/\b(schedule|set\s+(up\s+)?(a\s+|an\s+)?(reminder|alarm|timer|meeting|event|appointment)|alarm|timer|cron)\b/i.test(text)) return true;
-      if (/\bremind\s+me\s+(to|at|in|on|tomorrow|today|tonight)\b/i.test(text)) return true;
+      if (/\bremind\s+me\s+(to|at|in|on|tomorrow|today|tonight|yesterday|next|this|every)\b/i.test(text)) return true;
+      // Bare / odd-time reminders ("remind me", "remind me yesterday at 5pm")
+      // are still scheduling ACTIONS — the graph resolves or asks. Only
+      // recall phrasing stays out (handled by memory_retrieve above).
+      if (/\bremind\s+me\b/i.test(text) && !/\bremind\s+me\s+(what|about\s+what|how|when|where|who|which|why|if|whether)\b/i.test(text)) return true;
       // Messaging without a named app: "send an email to Bob", "text Sarah", "call my mom"
       if (/\b(send|compose|reply\s+to|forward|write|draft)\s+(an?\s+|the\s+)?(email|e-?mail|message|msg|text|dm|note|letter|invite|invitation)\b/i.test(text)) return true;
       if (/\b(email|e-mail|text|dm|message|call|phone|facetime)\s+(my\s+|me\s+)?(mom|dad|wife|husband|boss|team|him|her|them|back|[a-z]{2,})\b/i.test(text)) return true;
