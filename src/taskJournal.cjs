@@ -189,7 +189,14 @@ function updateProgress(id, progress) {
   if (!task) return;
   // First progress ping marks the task as actually running — without this a
   // dispatched task reads as 'queued' forever (startedAt never set).
-  const status = (task.status === 'queued' || task.status === 'waiting-for-agent') ? 'running' : task.status;
+  // 'awaiting-approval' flips to running only on real step events: a resumed
+  // plan still reads as pending approval while its steps execute, making
+  // pollers re-fire approvals. 'step_*' types only emit during execution —
+  // 'plan_ready'/'plan:step_revealed' pings (which carry stepIndex too) fire
+  // pre-approval, so a parked task can't be flipped early by a late ping.
+  const isStepEvent = /^step_(start|done|failed)$/.test(String(progress.type || ''));
+  const status = (task.status === 'queued' || task.status === 'waiting-for-agent' ||
+    (task.status === 'awaiting-approval' && isStepEvent)) ? 'running' : task.status;
   const startedAt = status === 'running' && !task.startedAt ? Date.now() : task.startedAt;
   _tasks.set(id, { ...task, status, startedAt, progress: { ...task.progress, ...progress } });
   _broadcast();
