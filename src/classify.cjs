@@ -21,7 +21,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('./logger.cjs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE } = require('../../shared/text-patterns.cjs');
+const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE } = require('../../shared/text-patterns.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
@@ -171,6 +171,29 @@ async function classify(englishText, conversationContext) {
     return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'screen_observation_guard' };
   }
 
+  // Bare-deictic continuations ("when was that", "tell me more about that")
+  // carry their referent entirely in a pronoun — only the graph's transcript
+  // access resolves them. general_quick either can't see the prior turns or
+  // hallucinates a referent (observed: "when was that" → invented a date).
+  if (DEICTIC_CONTINUATION_RE.test(englishText)) {
+    logger.info('[Classify] Deictic-continuation guard → handoff', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'deictic_continuation_guard' };
+  }
+
+  // Device-state questions ("what's my battery", "how much disk space",
+  // "is my wifi on") only exist behind OS tools — any text tier answers by
+  // hallucinating telemetry (observed: "what's my battery percentage" →
+  // general_quick → "I can't see your device's battery level"). Same class
+  // as the live-data exclusion: freshness requires a tool, not a guess.
+  if (DEVICE_STATE_RE.test(englishText)) {
+    logger.info('[Classify] Device-state guard → handoff', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'device_state_guard' };
+  }
+
   // ── Pre-compute the keyword fallback (synchronous, free) ─────────────────────
   // It only fires when the LLM path fails or returns garbage — but computing it
   // up front lets a confident keyword hit short-circuit a failed LLM attempt
@@ -185,13 +208,32 @@ async function classify(englishText, conversationContext) {
     }
   } catch (_) { /* fallback unavailable — LLM path proceeds normally */ }
 
+  // Action veto (mirror of the residual-bucket veto below): quick tiers
+  // answer with text only — they cannot execute. When the deterministic
+  // intentGuesser claims a graph-only intent, a quick pick is a flake.
+  // Observed: "post a tweet saying hello world" drew general_quick and comms
+  // answered "tweet going live" — nothing ever ran.
+  const _GRAPH_ONLY_INTENTS = new Set(['command_automate', 'screen_analysis', 'web_search', 'memory_retrieve']);
+  let _guessedIntent = null;
+  try { _guessedIntent = require('./intentGuesser.cjs').guess(englishText).guessedIntent; } catch (_) {}
+  const _vetoQuick = (result) => {
+    if ((result.intent === 1 || result.intent === 2 || result.intent === 4 || result.intent === 5) && _GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
+      logger.info('[Classify] Action veto — quick tier cannot serve graph-only intent', {
+        llmIntent: result.intent, guessedIntent: _guessedIntent,
+        inputPreview: englishText.substring(0, 60),
+      });
+      return { intent: 0, intentName: 'handoff', confidence: 0.85, source: 'action_veto' };
+    }
+    return result;
+  };
+
   const _adoptKeyword = (reason) => {
     logger.info('[Classify] Keyword fallback result', {
       intent: keywordHit.intent, intentName: keywordHit.intentName,
       confidence: keywordHit.confidence, reason,
       inputPreview: englishText.substring(0, 60),
     });
-    return { ...keywordHit, source: 'keyword_fallback' };
+    return _vetoQuick({ ...keywordHit, source: 'keyword_fallback' });
   };
 
   // ── Try force-prompt classification (primary) ────────────────────────────────
@@ -204,6 +246,7 @@ async function classify(englishText, conversationContext) {
         maxTokens: 5,
         temperature: 0.1,
         timeoutMs: 12000,
+        taskType: 'classification',
       });
 
       if (text) {
@@ -225,7 +268,7 @@ async function classify(englishText, conversationContext) {
             inputPreview: englishText.substring(0, 60),
             ...(attempt > 1 ? { attempt } : {}),
           });
-          return { intent, intentName: info.name, confidence: 0.92, source: attempt > 1 ? 'force_prompt_retry' : 'force_prompt' };
+          return _vetoQuick({ intent, intentName: info.name, confidence: 0.92, source: attempt > 1 ? 'force_prompt_retry' : 'force_prompt' });
         }
         // LLM returned something but not a clean number — try to extract.
         // Only trust a SINGLE distinct digit: providers sometimes echo a
@@ -242,7 +285,7 @@ async function classify(englishText, conversationContext) {
             logger.info('[Classify] Force-prompt (extracted)', {
               intent, intentName: info.name, provider, raw: trimmed,
             });
-            return { intent, intentName: info.name, confidence: 0.75, source: 'force_prompt_extracted' };
+            return _vetoQuick({ intent, intentName: info.name, confidence: 0.75, source: 'force_prompt_extracted' });
           }
         }
         logger.warn('[Classify] Force-prompt returned unparseable response', { raw: trimmed, provider, attempt });
