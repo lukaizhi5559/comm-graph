@@ -56,7 +56,7 @@ const SEMANTIC_ONLY_ATTRIBUTES = new Set([
 const FACT_STORE_PATTERNS = [
   { pattern: /\bmy\s+name\s+is\s+([^\.\,!?]+)/i, key: 'self:name', label: 'name' },
   { pattern: /\bmy\s+favorite\s+color\s+is\s+([^\.\,!?]+)/i, key: 'favorite_color', label: 'favorite color' },
-  { pattern: /\bmy\s+(email|e-mail)\s+is\s+([^\.\,!?]+)/i, key: 'self:email', label: 'email' },
+  { pattern: /\bmy\s+(email|e-mail)\s+is\s+([\w.+-]+@[\w.-]+\.\w+|\S+)/i, key: 'self:email', label: 'email' },
   { pattern: /\bmy\s+(phone\s+number|number)\s+is\s+([^\.\,!?]+)/i, key: 'self:phone', label: 'phone number' },
   { pattern: /\bmy\s+(job|occupation|profession)\s+is\s+([^\.\,!?]+)/i, key: 'self:occupation', label: 'job' },
   { pattern: /\bmy\s+birthday\s+is\s+([^\.\,!?]+)/i, key: 'self:birthday', label: 'birthday' },
@@ -435,6 +435,18 @@ async function execute(englishText, systemPrompt, conversationContext) {
     attribute = _detectProfileAttribute(englishText);
     if (attribute) {
       logger.info('[MemoryQuick] Deterministic attribute match', { attribute });
+    }
+  }
+
+  // Generic "my <attr>" questions — "what is my wife named", "what's my dog
+  // called", "what's my team". Extracts the attribute noun so arbitrary
+  // attributes resolve via semantic search instead of the LLM guessing the
+  // nearest canonical one ("named" → name, wrong).
+  if (!attribute) {
+    const gm = /\bmy\s+([a-z][a-z\s]{0,24}?)\s*(?:named\b|called\b|\?|$)/i.exec(englishText);
+    if (gm && gm[1].trim()) {
+      attribute = gm[1].trim().toLowerCase().replace(/\s+/g, '_');
+      logger.info('[MemoryQuick] Generic attribute match', { attribute });
     }
   }
 
