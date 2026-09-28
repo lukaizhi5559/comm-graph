@@ -217,7 +217,12 @@ async function classify(englishText, conversationContext) {
   let _guessedIntent = null;
   try { _guessedIntent = require('./intentGuesser.cjs').guess(englishText).guessedIntent; } catch (_) {}
   const _vetoQuick = (result) => {
-    if ((result.intent === 1 || result.intent === 2 || result.intent === 4 || result.intent === 5) && _GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
+    // memory_retrieve and memory_quick share the memory domain — the guesser's
+    // "what's my X" recall patterns overlap the quick tier's profile-fact
+    // surface. When the LLM picked memory_quick, trust its depth judgment over
+    // a regex that can't tell shallow fact recall from deep transcript search.
+    const _sameMemoryDomain = result.intent === 2 && _guessedIntent === 'memory_retrieve';
+    if (!_sameMemoryDomain && (result.intent === 1 || result.intent === 2 || result.intent === 4 || result.intent === 5) && _GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
       logger.info('[Classify] Action veto — quick tier cannot serve graph-only intent', {
         llmIntent: result.intent, guessedIntent: _guessedIntent,
         inputPreview: englishText.substring(0, 60),
@@ -286,6 +291,25 @@ async function classify(englishText, conversationContext) {
               intent, intentName: info.name, provider, raw: trimmed,
             });
             return _vetoQuick({ intent, intentName: info.name, confidence: 0.75, source: 'force_prompt_extracted' });
+          }
+        }
+        // CoT-leaking providers (gemini-free) reason at length but end with the
+        // answer ("...Intent: 2." / "...single number.2"). Multi-digit responses
+        // are untrustworthy as a whole, but a trailing digit or an explicit
+        // "intent: N" phrase is a deliberate final answer — extract it rather
+        // than paying a second flaky 12s call that ends in blind handoff.
+        const tailMatch = trimmed.match(/([0-5])\s*[.!)]*\s*$/)
+          || trimmed.match(/intent\s*(?:is|:|=|->|of)?\s*([0-5])\s*[.!)]*\s*$/i);
+        if (tailMatch) {
+          const intent = parseInt(tailMatch[1], 10);
+          const info = INTENTS[intent];
+          if (info) {
+            if (intent === 0 && keywordHit) return _adoptKeyword('veto_llm_handoff');
+            logger.info('[Classify] Force-prompt (tail-extracted)', {
+              intent, intentName: info.name, provider,
+              rawTail: trimmed.slice(-80),
+            });
+            return _vetoQuick({ intent, intentName: info.name, confidence: 0.7, source: 'force_prompt_tail' });
           }
         }
         logger.warn('[Classify] Force-prompt returned unparseable response', { raw: trimmed, provider, attempt });

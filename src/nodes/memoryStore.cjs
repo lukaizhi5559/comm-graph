@@ -90,4 +90,4 @@ async function execute(englishText, systemPrompt, conversationContext) {
   };
 }
 
-module.exports = { execute };
+module.exports = { execute, _storeGeneralMemory };

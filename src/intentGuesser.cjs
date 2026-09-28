@@ -122,7 +122,11 @@ const INTENT_PATTERNS = [
       if (/\bremind\s+me\b/i.test(text) && !/\bremind\s+me\s+(what|about\s+what|how|when|where|who|which|why|if|whether)\b/i.test(text)) return true;
       // Messaging without a named app: "send an email to Bob", "text Sarah", "call my mom"
       if (/\b(send|compose|reply\s+to|forward|write|draft)\s+(an?\s+|the\s+)?(email|e-?mail|message|msg|text|dm|note|letter|invite|invitation)\b/i.test(text)) return true;
-      if (/\b(email|e-mail|text|dm|message|call|phone|facetime)\s+(my\s+|me\s+)?(mom|dad|wife|husband|boss|team|him|her|them|back|[a-z]{2,})\b/i.test(text)) return true;
+      if (/\b(email|e-mail|text|dm|message|call|phone|facetime)\s+(my\s+|me\s+)?(mom|dad|wife|husband|boss|team|him|her|them|back|up|again)\b/i.test(text)) return true;
+      // "<comm-noun> <person>" — but never "email is X" / "text was Y" (fact
+      // statements, not messaging verbs): require a name-like capitalized or
+      // verb-free token, excluding determiners/copulas.
+      if (/\b(email|e-mail|text|dm|message|call|phone|facetime)\s+(my\s+|me\s+)?(?!is\b|are\b|was\b|were\b|a\b|an\b|the\b|my\b|at\b|in\b|on\b|number\b|address\b|code\b)[a-z]{2,}\b/i.test(text)) return true;
       // Post/share/upload to a platform: "post this on social media", "share to twitter"
       if (/\b(post|tweet|share|upload|publish|comment)\b.{0,30}\b(on|to)\s+(my\s+)?\w+/i.test(text)) return true;
       // App/window/file ops without a named app: "open my downloads folder", "quit the app"

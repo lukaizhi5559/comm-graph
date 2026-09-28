@@ -14,6 +14,9 @@
 
 const http = require('http');
 const logger = require('../logger.cjs');
+const { _storeGeneralMemory } = (() => {
+  try { return require('./memoryStore.cjs'); } catch (_) { return {}; }
+})();
 const { ask, buildMessages } = require('../llm-providers.cjs');
 
 const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
@@ -58,7 +61,16 @@ const FACT_STORE_PATTERNS = [
   { pattern: /\bmy\s+(job|occupation|profession)\s+is\s+([^\.\,!?]+)/i, key: 'self:occupation', label: 'job' },
   { pattern: /\bmy\s+birthday\s+is\s+([^\.\,!?]+)/i, key: 'self:birthday', label: 'birthday' },
   { pattern: /\bi\s+(live|work)\s+in\s+([^\.\,!?]+)/i, key: 'self:location', label: 'location' },
+  { pattern: /\bi\s+work\s+as\s+(?:an?\s+)?([^\.\,!?]+)/i, key: 'self:occupation', label: 'job' },
+  { pattern: /\bi\s+am\s+(\d{1,3})\s+years?\s+old\b/i, key: 'age', label: 'age' },
+  { pattern: /\bi\s+study\s+([^\.\,!?]+)/i, key: 'field_of_study', label: 'field of study' },
+  { pattern: /\bi\s+speak\s+([a-z]+)\b/i, key: 'self:language', label: 'language' },
   { pattern: /\bremember\s+(?:that\s+)?my\s+([a-z\s]+?)\s+is\s+([^\.\,!?]+)/i, key: null, label: null },
+  // Generic "my <attr> is/named/called <value>" — catches wife/dog/hobby/team/
+  // band/etc. not in the canonical vocabulary. Only reached when the classifier
+  // already decided this is a personal-fact statement (memory_quick), so the
+  // broad match is safe here.
+  { pattern: /\bmy\s+([a-z][a-z\s]{0,24}?)\s+(?:is|are|was)\s+(?:named\s+|called\s+)?([^\.\,!?]+)/i, key: null, label: null },
 ];
 
 /**
@@ -384,6 +396,13 @@ async function execute(englishText, systemPrompt, conversationContext) {
   if (store) {
     logger.info('[MemoryQuick] Storing fact', { key: store.key, valuePreview: store.value.substring(0, 40) });
     const ok = await _storeMemory(store.key, store.value);
+    // Non-canonical attributes (wife, dog, hobby, favorite_team, age, …) are
+    // retrieved via semantic memory.search, not profile.get — dual-write so
+    // the fact is findable on both paths. Canonical self: keys skip this.
+    const _canonicalKeys = new Set(Object.values(ATTRIBUTE_PROFILE_KEYS).flat());
+    if (!_canonicalKeys.has(store.key)) {
+      _storeGeneralMemory(`The user's ${store.label} is ${store.value}.`);
+    }
     if (ok) {
       const response = `Got it — I'll remember your ${store.label} is ${store.value}. ✅`;
       logger.info('[MemoryQuick] Stored', { key: store.key });
@@ -425,6 +444,21 @@ async function execute(englishText, systemPrompt, conversationContext) {
   }
 
   if (!attribute) {
+    // No canonical attribute — generic facts (wife, dog, team, band…) live in
+    // semantic memory via the dual-write store path. Search before giving up.
+    const semanticHit = await _semanticMemorySearch(englishText);
+    if (semanticHit) {
+      const natPrompt = `The user asked: "${englishText}"\nRelevant stored fact: ${semanticHit}\nRespond naturally in 1-2 sentences as ThinkDrop. No markdown. Be conversational, not robotic.`;
+      const msgs = buildMessages(natPrompt, systemPrompt, conversationContext);
+      const { text: nat } = await ask(msgs, { maxTokens: 100, temperature: 0.7, timeoutMs: 5000 });
+      const resp = nat || semanticHit;
+      logger.info('[MemoryQuick] Generic semantic hit', { valuePreview: String(semanticHit).substring(0, 40) });
+      return {
+        text: resp,
+        fullText: resp,
+        metadata: { source: 'memory_quick_semantic', intent: 2, factValue: semanticHit },
+      };
+    }
     // Not a recognizable quick fact — handoff
     logger.info('[MemoryQuick] No attribute detected, falling back', { text: englishText.substring(0, 60) });
     return {

@@ -189,8 +189,18 @@ function _keywordClassify(text) {
   // Device-state questions (battery/disk/wifi/uptime) need OS tools — a quick
   // text answer can only invent telemetry.
   const _isDeviceState = DEVICE_STATE_RE.test(lower);
+  // Broad personal-fact tier — "my <attr> is X" statements and "<q-word> my
+  // <attr>" questions beyond the fixed vocabulary (wife, dog, favorite team).
+  // Fires only when nothing above claimed it and no system/live-data refs.
+  if (!_hasSystemRef && !_needsLiveData && !_isSelfRecall && !_isDeicticContinuation && !_isDeviceState &&
+      (/\bmy\s+\w+[\w\s]{0,20}\s+(?:is|are|was|were)\b/i.test(lower)
+        || /\b(?:what|whats|what'?s|who|when|where|which|how)\b[^?]{0,25}\bmy\s+\w+/i.test(lower)
+        || /\bi\s+(?:live|work|study|speak|drive)\s+\w/i.test(lower)
+        || /\bi\s+am\s+\d{1,3}\s+years?\s+old\b/i.test(lower))) {
+    return { intent: 2, confidence: 0.65 };
+  }
   if (lower.split(/\s+/).length <= 15 && !_hasSystemRef && !_needsLiveData && !_isSelfRecall && !_isDeicticContinuation && !_isDeviceState &&
-      /\b(hello|hi|hey|howdy|greetings|good\s+(morning|afternoon|evening|night|day)|how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|thank(s|\s+you)|you'?re\s+welcome|bye|goodbye|see\s+you|joke|who\s+are\s+you|what'?s\s+your\s+name|are\s+you\s+(there|awake|alive)|can\s+you\s+hear\s+me|what\s+do\s+you\s+think|explain|tell\s+me\s+(a\s+|about\s+|why|how)|why\s+(is|are|does|do|did)|who\s+(is|was|were|wrote|invented)|when\s+(is|was|did)|where\s+(is|was)|how\s+(many|much|long|old|far)|is\s+(it|there|this|that)|do\s+you|what\s+(is|are|was|were)|what'?s)\b/i.test(lower)) {
+      /\b(hello|hi|hey|howdy|greetings|good\s+(morning|afternoon|evening|night|day)|how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|thank(s|\s+you)|you'?re\s+welcome|bye|goodbye|see\s+you|joke|who\s+are\s+you|what'?s\s+your\s+name|are\s+you\s+(there|awake|alive)|can\s+you\s+hear\s+me|what\s+do\s+you\s+think|explain|tell\s+me\s+(a\s+|about\s+|why|how)|why\s+(is|are|does|do|did)|who\s+(is|was|were|wrote|invented)|when\s+(is|was|did)|where\s+(is|was)|how\s+(many|much|long|old|far)|is\s+(it|there|this|that)|do\s+you|which\s+(?:\w+\s+){0,3}(?:is|are|was|were|does|do)|what\s+(is|are|was|were)|what'?s)\b/i.test(lower)) {
     return { intent: 1, confidence: 0.65 };
   }
 

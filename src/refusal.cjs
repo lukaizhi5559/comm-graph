@@ -136,9 +136,16 @@ function isPromptEcho(response, systemPrompt) {
     .split(/[.\n!?]+/)
     .map(strip)
     .filter(l => l.length >= 12);
+  // Short single-line replies ("Hi! How can I help you today?") contain the
+  // same assistant boilerplate the persona prompt itself uses — a 12-char
+  // substring match flags them as echoes and spuriously hands them off. Only
+  // the multi-line path is reliable; a lone line must be long AND not generic
+  // boilerplate to count as an echo.
   if (lines.length < 2) {
     const whole = strip(response);
-    return whole.length >= 12 && sys.includes(whole);
+    if (whole.length < 60) return false;
+    const BOILERPLATE = /\b(how can i (help|assist)|how may i (help|assist)|what can i do|let me know|anything else|how are you|nice to (meet|see))\b/;
+    return !BOILERPLATE.test(whole) && sys.includes(whole);
   }
   const hits = lines.filter(l => sys.includes(l)).length;
   return hits >= 2 && hits >= Math.ceil(lines.length / 2);
