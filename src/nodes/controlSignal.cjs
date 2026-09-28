@@ -94,11 +94,26 @@ async function execute(englishText, systemPrompt) {
 
   const active = getActiveTasks();
   if (active.length === 0) {
-    const response = signalType === 'cancel'
-      ? "Nothing is running at the moment. The slate is clean."
-      : signalType === 'pause'
-      ? "There's nothing to pause right now."
-      : "Nothing to resume — the slate is clean.";
+    const pools = {
+      cancel: [
+        "Nothing is running at the moment — nothing to cancel.",
+        "All quiet — there's no active task to cancel.",
+        "Nothing to cancel, sir. The slate is clean.",
+        "No task is in flight right now, so there's nothing to stop.",
+      ],
+      pause: [
+        "There's nothing to pause right now.",
+        "No task is running at the moment to pause.",
+        "Nothing in flight — nothing to hold.",
+      ],
+      resume: [
+        "Nothing to resume — the slate is clean.",
+        "No paused task on record — nothing to resume.",
+        "There's nothing waiting to continue right now.",
+      ],
+    };
+    const pool = pools[signalType] || pools.cancel;
+    const response = pool[Math.floor(Math.random() * pool.length)];
     return {
       text: response,
       fullText: response,

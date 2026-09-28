@@ -146,7 +146,10 @@ const INTENT_PATTERNS = [
       if (/\b(turn|toggle|switch|enable|disable|activate|deactivate)\s+(on|off|up|down)?\s*(the\s+|my\s+)?(wi-?fi|bluetooth|volume|brightness|dark\s*mode|light\s*mode|do\s*not\s*disturb|dnd|airplane(\s*mode)?|night\s*shift|true\s*tone|hotspot|vpn|microphone|mic|camera|location|notifications?|flashlight|low\s*power\s*mode)\b/i.test(text)) return true;
       if (/\b(set|adjust|change|increase|decrease|raise|lower|turn\s+(up|down)|mute|unmute)\s+(the\s+|my\s+)?(volume|brightness|resolution|wallpaper|font\s*size|screen\s*time|keyboard|mouse|trackpad|display|backlight)\b/i.test(text)) return true;
       // Media transport: "play some music", "skip this track", "next episode"
-      if (/\b(play|pause|resume|stop|skip|rewind|fast\s*forward)\s+(the\s+|my\s+|some\s+|this\s+)?(song|music|track|video|movie|show|episode|podcast|playlist|album|audio|it|this)\b/i.test(text)) return true;
+      // NB: bare pronouns (it/this) are excluded — "pause it" is deictic task
+      // control (control_signal), not media control. Requiring a media noun
+      // keeps "pause the music" while letting "pause it" reach the task layer.
+      if (/\b(play|pause|resume|stop|skip|rewind|fast\s*forward)\s+(the\s+|my\s+|some\s+|this\s+)?(song|music|track|video|movie|show|episode|podcast|playlist|album|audio)\b/i.test(text)) return true;
       if (/\b(next|previous|prev|skip)\s+(track|song|episode|video|chapter)\b/i.test(text)) return true;
       // Screenshots & screen recording
       if (/\b(take|capture|grab|snap)\s+(a\s+|an\s+)?(screenshot|screen\s*shot|screen\s*(recording|capture|grab)|photo\s+of\s+(my|the)\s+screen|picture\s+of\s+(my|the)\s+screen)\b|\bscreenshot\s+(this|my|the)\b|\bscreen\s*record/i.test(text)) return true;

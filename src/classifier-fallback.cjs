@@ -110,8 +110,11 @@ const ALL_SEEDS = {
 function _keywordClassify(text) {
   const lower = text.toLowerCase().trim();
 
-  // Control signals
-  if (/\b(cancel|stop|abort|pause|resume|never\s*mind|forget\s*it)\b/i.test(lower)) {
+  // Control signals — cancel/pause/resume vocabulary, incl. idiomatic forms
+  // ("hold up", "carry on", "pick it back up") that the classify LLM flakes on
+  // under provider degradation.
+  if (/\b(cancel|stop|abort|pause|unpause|resume|never\s*mind|nevermind|forget\s*it|forget\s+that|hold\s+(?:on|up)|keep\s+(?:going|it\s+going)|carry\s+on|proceed|pick\s+it\s+(?:back\s+)?up|(?:quit|end|terminate|suspend|finish)\s+(?:the\s+|this\s+|that\s+|it\s+|my\s+)(?:task|job|request|work|now)|wait\b)/i.test(lower)
+      && !/\b(can't|cannot|wont|won't|doesn't|don't)\s+(stop|wait|hold)\b/i.test(lower)) {
     return { intent: 4, confidence: 0.7 };
   }
 

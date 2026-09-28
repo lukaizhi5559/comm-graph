@@ -48,10 +48,19 @@ async function execute(englishText, systemPrompt) {
   });
 
   if (summary === 'Nothing is currently running. The slate is clean.') {
-    // No active tasks — respond directly
+    // No active tasks — respond directly, rotating phrasing so repeated
+    // checks don't read as a stuck loop.
+    const variants = [
+      summary,
+      'All clear — nothing in flight right now.',
+      'No active tasks at the moment. Standing by.',
+      'Nothing on the board — idle and ready.',
+      'All tasks are done. Nothing is running.',
+    ];
+    const response = variants[Math.floor(Math.random() * variants.length)];
     return {
-      text: summary,
-      fullText: summary,
+      text: response,
+      fullText: response,
       metadata: { source: 'status_check_empty', intent: 3 },
     };
   }
