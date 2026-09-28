@@ -177,7 +177,10 @@ function _keywordClassify(text) {
   // Live-data questions (news/prices/weather/scores/schedule) need tools —
   // a blind general_quick answer would hallucinate freshness. A keyword hit
   // here can veto an LLM handoff, so this exclusion is load-bearing.
-  const _needsLiveData = /\b(news|latest|breaking|trending|headlines?|currently?|recent(?:ly)?|right\s+now|today|tonight|this\s+(week|morning|afternoon|evening)|prices?|stocks?|weather|forecast|scores?|who\s+won|happening|updates?)\b/i.test(lower);
+  const _needsLiveData = /\b(news|latest|breaking|trending|headlines?|currently?|recent(?:ly)?|right\s+now|today|tonight|this\s+(week|morning|afternoon|evening)|prices?|stocks?|weather|forecast|scores?|who\s+won|happening|updates?|costs?|how\s+much|worth|flight\s+status|status\s+of\s+(?:a\s+|the\s+)?flight|flights?\b|president|prime\s+minister|ceo\s+of|mayor|governor|population)\b/i.test(lower)
+      // Current office-holders — "who is the president of X" is live data even
+      // without a time word. Past-tense "who was the first president" is stable.
+      || /\bwho\s+(?:is|'?s)\s+the\s+(?:current\s+|new\s+)?(?:president|prime\s*minister|ceo|cfo|cto|governor|mayor|pope|king|queen|leader|champion|owner|captain|manager|speaker|senator)\b/i.test(lower);
   // First-person past-tense recall — "when did I mention X", "did I say Y",
   // "what did I do" — asks about the user's own history, which needs the
   // memory graph, not a blind quick answer. Mirrors the recall tier above;

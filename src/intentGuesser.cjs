@@ -188,6 +188,9 @@ const INTENT_PATTERNS = [
       if (/\b(latest|current|today'?s|this\s+week'?s|recent\s+news|what\s+happened\s+today|right\s+now|as\s+of\s+(now|today)|news|headlines|breaking\s+news|weather)\b/i.test(text)) return true;
       // Prices, reviews, comparisons
       if (/\b(price|prices|pricing|cost|costs|cheapest|deals?|discounts?|sales?|reviews?|ratings?)\s+(of|for|on|to)\b/i.test(text)) return true;
+      // Trailing-price phrasings the of/for pattern misses: "what does a PS5
+      // cost", "how much is an iPhone", "what's it worth", "$X stock".
+      if (/\bhow\s+much\b/i.test(text) || /\b(cost|price|worth|charge)s?\s*(\?|for\b|$)/i.test(text)) return true;
       if (/\b(vs\.?|versus|compare|comparison|difference\s+between|better\s+than)\b/i.test(text)) return true;
       // Current office-holders / live data
       if (/\b(who\s+is\s+the\s+current|who\s+is\s+the\s+\w+\s+right\s+now|what\s+is\s+the\s+latest|price\s+of|stock\s+price)\b/i.test(text)) return true;

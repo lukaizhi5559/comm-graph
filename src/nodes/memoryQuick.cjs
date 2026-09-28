@@ -443,7 +443,12 @@ async function execute(englishText, systemPrompt, conversationContext) {
   // attributes resolve via semantic search instead of the LLM guessing the
   // nearest canonical one ("named" → name, wrong).
   if (!attribute) {
-    const gm = /\bmy\s+([a-z][a-z\s]{0,24}?)\s*(?:named\b|called\b|\?|$)/i.exec(englishText);
+    // Only treat "my <attr>" as a fact query when the text is question-shaped —
+    // imperatives like "reset my router" are not memory lookups.
+    const isQuestion = /^(what|who|whos|whose|whats|what's|when|where|which|do you|can you|tell me|did i|have i|am i|is my|are my)/i.test(englishText)
+      || /\b(remember|recall|remind me|do you know|do you remember)\b/i.test(englishText)
+      || /\b(named|called)\b/i.test(englishText);
+    const gm = isQuestion && /\bmy\s+([a-z][a-z\s]{0,24}?)\s*(?:named\b|called\b|\?|$)/i.exec(englishText);
     if (gm && gm[1].trim()) {
       attribute = gm[1].trim().toLowerCase().replace(/\s+/g, '_');
       logger.info('[MemoryQuick] Generic attribute match', { attribute });
