@@ -122,6 +122,10 @@ const INTENT_PATTERNS = [
       if (/\bremind\s+me\b/i.test(text) && !/\bremind\s+me\s+(what|about\s+what|how|when|where|who|which|why|if|whether)\b/i.test(text)) return true;
       // Messaging without a named app: "send an email to Bob", "text Sarah", "call my mom"
       if (/\b(send|compose|reply\s+to|forward|write|draft)\s+(an?\s+|the\s+)?(email|e-?mail|message|msg|text|dm|note|letter|invite|invitation)\b/i.test(text)) return true;
+      // "send <something> to <address>" — the recipient is an email handle, so
+      // it's a messaging action even when the payload isn't a comm noun
+      // ("send my resume to hr@example.com", "send the file to bob@x.com").
+      if (/\b(send|forward|email|e-?mail|share)\b[^?]{0,60}[\w.+-]+@[\w-]+\.[\w.]+/i.test(text)) return true;
       if (/\b(email|e-mail|text|dm|message|call|phone|facetime)\s+(my\s+|me\s+)?(mom|dad|wife|husband|boss|team|him|her|them|back|up|again)\b/i.test(text)) return true;
       // "<comm-noun> <person>" — but never "email is X" / "text was Y" (fact
       // statements, not messaging verbs): require a name-like capitalized or
@@ -129,6 +133,21 @@ const INTENT_PATTERNS = [
       if (/\b(email|e-mail|text|dm|message|call|phone|facetime)\s+(my\s+|me\s+)?(?!is\b|are\b|was\b|were\b|a\b|an\b|the\b|my\b|at\b|in\b|on\b|number\b|address\b|code\b)[a-z]{2,}\b/i.test(text)) return true;
       // Post/share/upload to a platform: "post this on social media", "share to twitter"
       if (/\b(post|tweet|share|upload|publish|comment)\b.{0,30}\b(on|to)\s+(my\s+)?\w+/i.test(text)) return true;
+      // Platform-free social/action verbs: "tweet hello world", "dm sarah",
+      // "post that picture" — still action requests even without a named app.
+      // Recall forms ("tweet about X", "the tweet is…") are excluded.
+      if (/\b(tweet|retweet|post|dm|snap)\s+(that|this|saying|hello|hi\b|a\b|an\b|the\b|my\b|["'\w])/i.test(text)
+          && !/\b(tweet|post|dm)\s+(about|from|by|is|are|was|were)\b/i.test(text)) return true;
+      // Transactions/bookings: "order a pizza", "buy phone charger", "book a table",
+      // "subscribe to X", "rsvp yes", "pay my electric bill" — all side-effecting.
+      if (/\b(order|purchase|buy)\s+(a\s+|an\s+|the\s+|some\s+|me\s+|my\s+)?\w+/i.test(text)) return true;
+      if (/\bbook\s+(a\s+|an\s+|the\s+)?(table|flight|hotel|uber|lyft|ride|appointment|ticket|room|reservation)\b/i.test(text)) return true;
+      if (/\b(subscribe\s+to|rsvp\b|unsubscribe\s+from)\b/i.test(text)) return true;
+      if (/\bpay\s+(my\s+|the\s+|for\s+|a\s+|an\s+)?\w*\s*(bill|bills|rent|invoice|tab|fine|ticket|debt|loan)\b/i.test(text)) return true;
+      // Phone actions without a named app: "call my dentist office" —
+      // "call <person/org>" is an action; line 125/129 already cover named
+      // contacts; this catches org/office targets.
+      if (/\b(call|phone|facetime|ring)\s+(my\s+|the\s+)?[\w\s]{0,30}?(office|clinic|dentist|doctor|restaurant|store|company|bank|school|plumber|landlord)\b/i.test(text)) return true;
       // App/window/file ops without a named app: "open my downloads folder", "quit the app"
       if (/\b(open|launch|start|close|quit|restart|minimize|maximize|hide|show)\s+(the\s+|my\s+|this\s+|that\s+|a\s+|an\s+)?[\w\s]{0,25}?\s*(app|application|program|folder|window|tab|browser|terminal|settings|preferences)\b/i.test(text)) return true;
       // Local file ops: "create a file", "find my downloads folder", "delete this document"
