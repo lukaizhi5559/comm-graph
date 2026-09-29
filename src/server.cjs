@@ -439,6 +439,17 @@ async function processMessage(args) {
     intentName = 'handoff';
   }
 
+  // ── Live-page referent → always handoff ─────────────────────────────────
+  // "how many products on this page" needs the open browser page via
+  // app.agent scan_page — general_quick/web_search can only guess from prior
+  // context (right by accident, stale by design). Handoff lets classifyTask
+  // resolve the referent against the live activeDocContext.
+  if (intent !== 0 && /\b(?:this|the|current|open)\s+(?:page|tab|site|website)\b|\bon\s+this\s+(?:page|site|website)\b/i.test(englishText)) {
+    logger.info('[Process] live-page referent — forcing handoff', { was: intentName });
+    intent = 0;
+    intentName = 'handoff';
+  }
+
   logger.info('[Process] Classified', {
     intent, intentName, confidence, classifySource,
   });
@@ -751,7 +762,7 @@ const server = http.createServer(async (req, res) => {
       return _send(res, 400, { error: 'taskId is required' });
     }
     if (body.sessionId) _lastSessionId = body.sessionId;
-    handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items, body.sessionId || null, body.planFile || null);
+    handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items, body.sessionId || null, body.planFile || null, body.trace || null);
     return _send(res, 200, { ok: true });
   }
 

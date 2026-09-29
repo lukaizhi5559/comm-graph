@@ -158,8 +158,8 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent, s
  *                channel?, sourceUrl? }
  * @param {string|null} [sessionId] - Conversation session the run resolved into
  */
-function complete(taskId, agentId, status, result, items, sessionId = null, planFile = null) {
-  updateTask(taskId, status, { result: result || null, items: items || null, sessionId, ...(planFile ? { planFile } : {}) });
+function complete(taskId, agentId, status, result, items, sessionId = null, planFile = null, trace = null) {
+  updateTask(taskId, status, { result: result || null, items: items || null, sessionId, ...(planFile ? { planFile } : {}), ...(trace ? { trace } : {}) });
   if (agentId) {
     const nextTaskId = release(agentId, taskId);
     if (nextTaskId) {
