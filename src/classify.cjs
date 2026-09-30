@@ -11,7 +11,7 @@
  *   1 - general_quick        → chitchat, opinions, known facts → direct LLM respond
  *   2 - memory_quick         → quick profile/fact recall (name, favorite color) → user-memory lookup
  *   3 - status_check         → "how is my task going?" → read task journal
- *   4 - control_signal       → cancel/pause/resume → write to journal
+ *   4 - control_signal       → cancel/stop → abort via journal + main.js
  *
  * Falls back to embedding-based classification (classifier-fallback.cjs) if LLM
  * returns an unparseable response.
@@ -29,7 +29,10 @@ const INTENTS = {
   1: { name: 'general_quick',    description: 'Chitchat, greetings, opinions, simple knowledge questions the LLM can answer directly without tools' },
   2: { name: 'memory_quick',      description: 'Quick personal fact recall — name, favorite color, email, job, age. Also handles explicit profile fact storage ("my name is X"). NOT deep temporal history or complex queries' },
   3: { name: 'status_check',      description: 'Asking about the status/progress of a running or recently completed task' },
-  4: { name: 'control_signal',    description: 'Cancel, pause, resume, or stop a running task' },
+  // pause/resume are intentionally absent — those signals are unimplemented
+  // (main.js aborts on 'cancel' only); advertising them here routes utterances
+  // to a node that can't serve them.
+  4: { name: 'control_signal',    description: 'Cancel, stop, or abort a running task' },
   5: { name: 'memory_store',      description: 'Storing a general memory, note, appointment, or event — NOT a personal profile fact. E.g., "i have a dentist appt next week", "remember I have a meeting at 3pm", "note: buy milk tomorrow"' },
 };
 

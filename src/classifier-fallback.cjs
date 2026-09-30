@@ -107,17 +107,31 @@ const ALL_SEEDS = {
 // It's less accurate than the model-based approach but works with zero
 // dependencies and zero startup time. The force-prompt is the primary
 // classifier; this only fires when the LLM is completely unavailable.
-function _keywordClassify(text) {
-  const lower = text.toLowerCase().trim();
+// Renderer-injected context tags ([File: path], [Folder: …], [Context: …],
+// [Thought: …], [Highlighted: …]) are metadata, not user prose — a path like
+// ".../resume/resume.pdf" must not feed intent keywords (observed: "resume" in
+// the path vetoed an LLM handoff → the prompt was silently dropped as a
+// control_signal). Strip them before any keyword tier runs.
+const _CONTEXT_TAG_RE = /\[(?:File|Folder|Highlighted|Context|Thought):[^\]]*\]/gi;
 
-  // Control signals — cancel/pause/resume vocabulary, incl. idiomatic forms
-  // ("hold up", "carry on", "pick it back up") that the classify LLM flakes on
-  // under provider degradation.
-  if (/\b(cancel|stop|abort|pause|unpause|resume|never\s*mind|nevermind|forget\s*it|forget\s+that|hold\s+(?:on|up)|keep\s+(?:going|it\s+going)|carry\s+on|proceed|pick\s+it\s+(?:back\s+)?up|(?:quit|end|terminate|suspend|finish)\s+(?:the\s+|this\s+|that\s+|it\s+|my\s+)(?:task|job|request|work|now)|wait\b)/i.test(lower)
+function _keywordClassify(text) {
+  const lower = String(text || '').replace(_CONTEXT_TAG_RE, ' ').toLowerCase().trim();
+
+  // Control signals — cancel-family ONLY. The pause/resume vocabulary was
+  // removed: those signals are unimplemented (main.js's /comms.signal handler
+  // only aborts on 'cancel'; pause/resume journaled + spoke a confirmation but
+  // the task kept running), and their words ("resume", "wait", "proceed",
+  // "carry on") false-positive'd on everyday prose and file names. A keyword
+  // hit here can veto an LLM handoff in classify.cjs, so every word must map
+  // to a capability that exists.
+  if (lower.split(/\s+/).length <= 8
+      && /\b(cancel|stop|abort|kill|never\s*mind|nevermind|forget\s*it|forget\s+that|(?:quit|end|terminate|suspend|finish)\s+(?:the\s+|this\s+|that\s+|it\s+|my\s+)(?:task|job|request|work|now))\b/i.test(lower)
       && !/\b(can't|cannot|wont|won't|doesn't|don't)\s+(stop|wait|hold)\b/i.test(lower)
-      // "resume" as a noun (CV document) — "send my resume to hr@x.com" is an
-      // external action, not a control signal.
-      && !/\b(my|the|a|your|his|her|our)\s+resume\b|\bresume\s+(to|for|as|attachment|\w+@|\.\w{2,4}\b)/i.test(lower)) {
+      // Artifact-mutation cancels are real task requests (command_automate can
+      // delete a reminder), not task control — "cancel my dentist appointment"
+      // must not abort a running task. Media transport is likewise an action
+      // on media, not on the task journal ("stop the music").
+      && !/\b(flights?|trips?|meetings?|appointments?|appts?|reminders?|alarms?|timers?|events?|reservations?|bookings?|orders?|subscriptions?|subs|payments?|plans?|dates?|visits?|classes?|sessions?|interviews?|dentist|doctor|hotels?|restaurants?|tables?|songs?|music|tracks?|videos?|movies?|shows?|episodes?|podcasts?|playlists?|albums?|audio|playback|recordings?|downloads?|uploads?)\b/i.test(lower)) {
     return { intent: 4, confidence: 0.7 };
   }
 

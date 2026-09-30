@@ -27,6 +27,12 @@ describe('intentGuesser — screen_analysis hints', () => {
     expect('read the text visible on my screen', 'screen_analysis');
     expect('describe what I\u2019m looking at', 'screen_analysis');
     expect('is there an error dialog visible on my screen', 'screen_analysis');
+    // Second-person sight + STT locatives (observed miss: "what do you see now"
+    // hinted general_knowledge → no action-veto rescue → canned non-answer)
+    expect('what do you see now', 'screen_analysis');
+    expect('what are you seeing', 'screen_analysis');
+    expect('can you see my screen', 'screen_analysis');
+    expect('what this about on the screen', 'screen_analysis');
   });
   it('does not fire on imperative screen actions', () => {
     // "click the button on my screen" is automation, not observation

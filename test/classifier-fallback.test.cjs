@@ -17,6 +17,7 @@ const CASES = [
   ['cancel that', 4, 'cancel → control_signal'],
   ['stop the current task', 4, 'stop → control_signal'],
   ['never mind, forget it', 4, 'nevermind → control_signal'],
+  ['kill it', 4, 'kill → control_signal'],
 
   ['how is that task going', 3, 'how is it going → status_check'],
   ["what's running right now", 3, 'whats running → status_check'],
@@ -66,6 +67,21 @@ const DEICTIC_CASES = [
   ['what about that', 'deictic what-about'],
 ];
 
+// These must NEVER classify as control_signal — the intent silently drops the
+// request and replies "nothing to cancel". Observed false positives:
+// "resume" inside an attached file path vetoed an LLM handoff → the prompt
+// died as a no-op control signal.
+const NON_CONTROL_CASES = [
+  ['[File: /Users/x/Desktop/resume/resume.pdf]\nbase upon the info you know about me update it', 'resume in [File:] path'],
+  ['[File: /Users/x/Desktop/resume/resume.pdf]\nI need you to update it', 'file-attached resume prompt'],
+  ['update resume.pdf', 'hand-typed filename'],
+  ['resume the task', 'pause/resume are unimplemented — not a control verb'],
+  ['cancel my dentist appointment', 'artifact-mutation cancel → real task request'],
+  ['cancel my flight tomorrow', 'cancel + scheduled artifact'],
+  ['stop the music', 'media transport, not task control'],
+  ['can you please cancel the thing you started for me earlier today', 'long cancel request → not bare control'],
+];
+
 (async () => {
   for (const [prompt, want, label] of CASES) {
     const r = await fallback.classify(prompt);
@@ -80,6 +96,12 @@ const DEICTIC_CASES = [
     const ok = r.confidence <= 0.5;
     if (ok) { console.log(`  PASS: ${label} — conf ${r.confidence} ≤ 0.5 (no keyword veto)`); passed++; }
     else { console.error(`  FAIL: ${label} — conf ${r.confidence} would veto handoff (intent ${r.intent})`); failed++; }
+  }
+  for (const [prompt, label] of NON_CONTROL_CASES) {
+    const r = await fallback.classify(prompt);
+    const ok = r.intent !== 4;
+    if (ok) { console.log(`  PASS: ${label} — intent ${r.intent} (not control_signal)`); passed++; }
+    else { console.error(`  FAIL: ${label} — got control_signal`); failed++; }
   }
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

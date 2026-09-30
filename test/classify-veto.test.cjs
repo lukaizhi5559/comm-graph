@@ -74,6 +74,28 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
       r.intent === 4 && r.source === 'keyword_fallback');
   });
 
+  // ── control_signal false positives must NOT veto (observed drops) ──────────
+  // "resume" inside an attached file path vetoed an LLM handoff → the prompt
+  // died as a no-op control signal replying "nothing waiting to continue".
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify('[File: /Users/x/Desktop/resume/resume.pdf]\nbase upon the info you know about me update it');
+    check('[File: resume.pdf] prompt is never control_signal',
+      r.intent !== 4);
+  });
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify('resume the task');
+    check('"resume the task": pause/resume unimplemented → LLM handoff stands',
+      r.intent === 0);
+  });
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify('cancel my dentist appointment');
+    check('artifact-mutation cancel → LLM handoff stands (real task request)',
+      r.intent === 0);
+  });
+
   // ── Screen-observation guard (deterministic, pre-LLM) ──────────────────────
   // Regression: "describe what I'm looking at" classified general_quick by
   // cerebras in run3 (confident-but-wrong — no veto applies to non-zero).
@@ -107,6 +129,24 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
     const r = await classify('what app am I in');
     check('no literal "screen" words → observation guard specifically',
       r.intent === 0 && r.source === 'screen_observation_guard');
+  });
+
+  await withAsk(async () => { throw new Error('LLM must not be called'); }, async () => {
+    const r = await classify('what do you see now');
+    check('"what do you see now" → handoff (observed: vetoed to general_quick non-answer)',
+      r.intent === 0 && r.source === 'screen_observation_guard');
+  });
+
+  await withAsk(async () => { throw new Error('LLM must not be called'); }, async () => {
+    const r = await classify('can you see my screen');
+    check('"can you see my screen" → handoff',
+      r.intent === 0 && r.source === 'screen_observation_guard');
+  });
+
+  await withAsk(async () => { throw new Error('LLM must not be called'); }, async () => {
+    const r = await classify('what this about on the screen');
+    check('STT "what this about on the screen" → handoff (either screen guard)',
+      r.intent === 0 && r.source.startsWith('screen_'));
   });
 
   await withAsk(async () => ({ text: '1', provider: 'mock' }), async () => {

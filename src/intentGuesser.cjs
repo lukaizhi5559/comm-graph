@@ -94,6 +94,10 @@ const INTENT_PATTERNS = [
     intent: 'memory_store',
     test: (text) => {
       if (/\b(remember\s+(that|this|it)|note\s+(that|this|down)|take\s+a\s+note|write\s+(this|that|it)\s+down|jot\s+(this|that|it)\s+down|keep\s+(this|that|it)\s+in\s+mind|add\s+(this|that|it)\s+to\s+(your\s+)?(memory|notes|records))\b/i.test(text)) return true;
+      // "note: buy milk tomorrow" — colon form needs its own check: a shared
+      // trailing \b can never match after the non-word ':' (same gotcha as
+      // classifier-fallback's memory_store tier).
+      if (/\bnote\s*:/i.test(text)) return true;
       return false;
     },
   },
