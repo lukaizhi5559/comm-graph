@@ -228,6 +228,12 @@ const INTENT_PATTERNS = [
   {
     intent: 'general_knowledge',
     test: (text) => {
+      // Local-machine probes are never "stable facts" — "how many files are
+      // on my desktop", "git status" require a shell command. Question-word
+      // patterns below would otherwise claim them (observed: a hint emitted
+      // here vetoed a correct local_system classification downstream and the
+      // task answered with Quora instructions instead of running `ls`).
+      if (/\b(?:my|the\s+user'?s|user'?s)\s+(?:desktop|downloads|documents|folder|directory|drive|clipboard)\b|\bfiles?\s+(?:on|in|inside|within)\s+(?:my|the)\b|\bgit\s+(?:status|diff|log|commit|push|pull|branch|stash)\b|\b(?:commit|push|pull|merge|rebase|stash)\s+(?:my|the|this|all)\s+(?:work|changes|code|repo)\b|~\/|\blistening\s+on\s+port\b/i.test(text)) return false;
       // Question words — contracted AND expanded forms ("what's", "what is")
       if (/\b(what('?s|\s+is|\s+are|\s+was|\s+were|\s+does|\s+do|\s+did)|who('?s|\s+is|\s+was|\s+were|\s+wrote|\s+invented|\s+discovered|\s+created|\s+made)|when\s+(was|were|did|is|will)|where\s+(is|was|were|are|did)|why\s+(is|are|does|do|did|was|were)|how\s+(does|do|did|many|much|long|old|far|tall|big)|which\s+(is|are|was|were))\b/i.test(text)) return true;
       if (/\b(explain|define|tell\s+me\s+(about|what|who|why|how)|meaning\s+of|capital\s+of|population\s+of|what\s+(time|day|date)(\s+is|\s+of)?)\b/i.test(text)) return true;
