@@ -225,7 +225,11 @@ async function classify(englishText, conversationContext) {
     // surface. When the LLM picked memory_quick, trust its depth judgment over
     // a regex that can't tell shallow fact recall from deep transcript search.
     const _sameMemoryDomain = result.intent === 2 && _guessedIntent === 'memory_retrieve';
-    if (!_sameMemoryDomain && (result.intent === 1 || result.intent === 2 || result.intent === 4 || result.intent === 5) && _GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
+    // status_check (3) is non-executable too — it only reads the task journal.
+    // Observed: "…explain the status for each repo… commit it" — the status
+    // keyword vetoed the LLM's handoff and the prompt died as a canned
+    // journal summary while intentGuesser saw command_automate.
+    if (!_sameMemoryDomain && (result.intent === 1 || result.intent === 2 || result.intent === 3 || result.intent === 4 || result.intent === 5) && _GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
       logger.info('[Classify] Action veto — quick tier cannot serve graph-only intent', {
         llmIntent: result.intent, guessedIntent: _guessedIntent,
         inputPreview: englishText.substring(0, 60),

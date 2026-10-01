@@ -206,6 +206,30 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
       r.intent === 1 && r.intentName === 'general_quick');
   });
 
+  // ── status_check is non-executable — joins the action-veto set ─────────────
+  // Regression: "Examine the folder … explain the status for each repo …
+  // commit it" — the bare "status" keyword hit vetoed the LLM's correct
+  // handoff(0) and the prompt died as a canned journal summary
+  // ("Nothing is currently running") while intentGuesser saw command_automate.
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify('[Folder: /Users/x/Desktop/projects/thinkdrop]\n\nExamine the folder and find all uncommitted work explain the status for each repo see what work was done and then commit it and push to the proper repo under ThinkDrop project. Ok? Let me know if you have questions');
+    check('"status for each repo … commit it" → handoff, never status_check',
+      r.intent === 0 && r.intentName === 'handoff');
+  });
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify('tweet the status update');
+    check('status keyword + command_automate guess → action veto → handoff',
+      r.intent === 0 && r.source === 'action_veto');
+  });
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify('what is the status');
+    check('bare status question still → status_check (no artifact subject)',
+      r.intent === 3 && r.intentName === 'status_check');
+  });
+
   console.log(`\n${passed}/${tests} passed`);
   process.exit(passed === tests ? 0 : 1);
 })().catch(e => { console.error(e); process.exit(1); });

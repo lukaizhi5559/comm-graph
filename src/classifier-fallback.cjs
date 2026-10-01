@@ -139,7 +139,15 @@ function _keywordClassify(text) {
   // Covers "how is it going", "status", "still running", plus interrogatives
   // like "what's running right now" and "did my task finish" — the class of
   // questions whose subject is the task journal, not the outside world.
-  if (/\b(how\s+is|how's|status|progress|done\s+yet|still\s+running|how\s+far|coming\s+along)\b/i.test(lower)
+  // Exclusion: when status/progress co-occurs with a dev-artifact noun, the
+  // subject is the artifact, not the journal — "explain the status for each
+  // repo … commit it" is an action request, and a keyword hit here can veto
+  // an LLM handoff in classify.cjs (observed: the prompt died as a canned
+  // "Nothing is currently running" journal summary). Load-bearing.
+  const _statusAboutArtifact = /\b(status|progress)\b/i.test(lower)
+      && /\b(repos?|repositor(?:y|ies)|folders?|files?|projects?|commits?|branch(?:es)?|pull\s+requests?|worktrees?|codebases?|diffs?|merges?)\b/i.test(lower);
+  if (!_statusAboutArtifact
+      && /\b(how\s+is|how's|status|progress|done\s+yet|still\s+running|how\s+far|coming\s+along)\b/i.test(lower)
       || /\b(did|has|is|are|was|were)\b[^?]{0,40}\b(task|job|it|that|this|anything|something)\b[^?]{0,25}\b(finish|finished|done|complete|completed|running|working|going)\b/i.test(lower)
       || /\bwhat'?s?\s+(still\s+)?(running|going\s+on|happening|in\s+progress|pending|queued)\b/i.test(lower)) {
     return { intent: 3, confidence: 0.7 };
