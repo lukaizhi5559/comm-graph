@@ -762,8 +762,22 @@ const server = http.createServer(async (req, res) => {
       return _send(res, 400, { error: 'taskId is required' });
     }
     if (body.sessionId) _lastSessionId = body.sessionId;
-    handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items, body.sessionId || null, body.planFile || null, body.trace || null);
+    handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items, body.sessionId || null, body.planFile || null, body.trace || null, body.artifacts || null);
     return _send(res, 200, { ok: true });
+  }
+
+  // ── Artifact patch (from main.js) — post-completion updates to a task's ──
+  // persisted artifacts, e.g. draft applied flags. Not a status change, so it
+  // legitimately works on terminal tasks.
+  if (req.url === '/comms.artifacts' && req.method === 'POST') {
+    const body = await _readBody(req);
+    if (!body.taskId) {
+      return _send(res, 400, { error: 'taskId is required' });
+    }
+    const ok = taskJournal.patchArtifacts(body.taskId, {
+      appliedDraftPaths: body.appliedDraftPaths,
+    });
+    return _send(res, ok ? 200 : 404, { ok });
   }
 
   // ── Task progress update (from main.js) ───────────────────────────────────────

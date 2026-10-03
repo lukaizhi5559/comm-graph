@@ -215,6 +215,28 @@ function setResult(id, result) {
 }
 
 /**
+ * Patch non-status artifact fields on a task (e.g. mark a draft applied).
+ * Unlike updateTask this is not a status transition, so it legitimately works
+ * on terminal tasks — the terminal guard stays on status updates only.
+ * @param {string} id
+ * @param {Object} patch - { appliedDraftPaths?: string[] }
+ * @returns {boolean}
+ */
+function patchArtifacts(id, patch = {}) {
+  const task = _tasks.get(id);
+  if (!task || !task.artifacts) return false;
+  const artifacts = { ...task.artifacts };
+  const applied = new Set(Array.isArray(patch.appliedDraftPaths) ? patch.appliedDraftPaths : []);
+  if (applied.size > 0 && Array.isArray(artifacts.drafts)) {
+    artifacts.drafts = artifacts.drafts.map(d =>
+      d && applied.has(d.draftPath) ? { ...d, applied: true } : d);
+  }
+  _tasks.set(id, { ...task, artifacts });
+  _save();
+  return true;
+}
+
+/**
  * Delete a task from the journal.
  * @param {string} id
  * @returns {boolean}
@@ -329,6 +351,7 @@ module.exports = {
   updateTask,
   updateProgress,
   setResult,
+  patchArtifacts,
   deleteTask,
   clearAll: function clearAll() { _tasks.clear(); _save(); },
   getTask,

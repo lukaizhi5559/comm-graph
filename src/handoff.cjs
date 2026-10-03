@@ -157,9 +157,11 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent, s
  *                mediaType?, videoUrl?, embedUrl?, posterUrl?, duration?,
  *                channel?, sourceUrl? }
  * @param {string|null} [sessionId] - Conversation session the run resolved into
+ * @param {object|null} [artifacts] - Run artifacts { steps, savedFilePaths, drafts }
+ *   persisted on the task so queue cards re-expand to real outputs after restart.
  */
-function complete(taskId, agentId, status, result, items, sessionId = null, planFile = null, trace = null) {
-  updateTask(taskId, status, { result: result || null, items: items || null, sessionId, ...(planFile ? { planFile } : {}), ...(trace ? { trace } : {}) });
+function complete(taskId, agentId, status, result, items, sessionId = null, planFile = null, trace = null, artifacts = null) {
+  updateTask(taskId, status, { result: result || null, items: items || null, sessionId, ...(planFile ? { planFile } : {}), ...(trace ? { trace } : {}), ...(artifacts ? { artifacts } : {}) });
   if (agentId) {
     const nextTaskId = release(agentId, taskId);
     if (nextTaskId) {
