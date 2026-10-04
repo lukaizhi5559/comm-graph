@@ -59,6 +59,34 @@ handles those) — then respond with EXACTLY: 0
 Nothing else. Just the number 0. No explanation, no handoff phrase.
 ═══════════════════════════════════════════════`;
 
+// ── Selection variant ────────────────────────────────────────────────────────
+// Used when the prompt carries [Highlighted:] text — the user pointed at text
+// and asked about it. Same rules, but the answer deserves real depth (the
+// chitchat 1-2-sentence cap is too thin for "explain this").
+const SELECTION_ANSWER_DIRECTIVE = `
+
+═══════════════════════════════════════════════
+DIRECT ANSWER MODE — ACTIVE NOW
+═══════════════════════════════════════════════
+You are in DIRECT ANSWER mode. The user's message includes a [Highlighted:]
+block — text they selected on screen. Their question is about THAT text.
+
+Answer the question about the highlighted text fully but concisely — up to ~4
+sentences, more structure only if the text genuinely warrants it.
+Do NOT use any handoff or routing phrases like "Routing that to ThinkDrop",
+"Let me check on that", "Passing that along", or "Let me look that up".
+Do NOT promise to look something up — either answer now, or signal that you cannot.
+
+If you cannot answer because:
+- The question asks for an ACTION (search, open, save, send, run, edit a file…),
+  not an answer about the text
+- You lack real-time or live data, web/browser/file access, or device context
+- The question asks about PAST CONVERSATIONS or chat history beyond what is shown
+
+...then respond with EXACTLY: 0
+Nothing else. Just the number 0. No explanation, no handoff phrase.
+═══════════════════════════════════════════════`;
+
 // Questions asking about ThinkDrop/the assistant itself — a persona echo is
 // the CORRECT answer for these, never a sentinel.
 const SELF_REFERENTIAL_RE = /\bthinkdrop\b|\bwho are you\b|\bwhat can you do\b|\byour (?:capabilit\w*|features?|tools?|skills?|limits?)\b|\babout yourself\b/i;
@@ -67,15 +95,17 @@ const SELF_REFERENTIAL_RE = /\bthinkdrop\b|\bwho are you\b|\bwhat can you do\b|\
  * @param {string} englishText  - English user message
  * @param {string} systemPrompt - Full system prompt (persona + personality overlay + language)
  * @param {string} [conversationContext] - Recent conversation turns for context awareness
+ * @param {Object} [opts] - { hasSelectionContext } — swap in the selection-aware directive
  * @returns {Promise<{ text: string, fullText: string, metadata: Object }>}
  */
-async function execute(englishText, systemPrompt, conversationContext) {
+async function execute(englishText, systemPrompt, conversationContext, opts = {}) {
   try {
     // Append direct-answer directive to override the persona's routing instructions
-    const directPrompt = systemPrompt + DIRECT_ANSWER_DIRECTIVE;
+    const directPrompt = systemPrompt +
+      (opts.hasSelectionContext ? SELECTION_ANSWER_DIRECTIVE : DIRECT_ANSWER_DIRECTIVE);
     const messages = buildMessages(englishText, directPrompt, conversationContext);
     const { firstSentence, fullText, provider } = await askEarly(messages, {
-      maxTokens: 150,
+      maxTokens: opts.hasSelectionContext ? 400 : 150,
       temperature: 0.7,
     });
 

@@ -53,11 +53,13 @@ const INTENT_PATTERNS = [
   // ("what was I watching on Netflix" → recall, not automation).
   {
     intent: 'memory_retrieve',
-    test: (text) => {
+    test: (text, opts) => {
       // Bare-deictic continuations ("tell me more about that", "when was
       // that") — the referent lives in the transcript, not the ambient
       // screen/file context classifyTask would conflate it with.
-      if (DEICTIC_CONTINUATION_RE.test(text)) return true;
+      // Exception: a captured text selection rides in the payload and IS the
+      // referent — "what is this" + highlight is self-contained, not recall.
+      if (!opts?.hasSelectionContext && DEICTIC_CONTINUATION_RE.test(text)) return true;
       // Conversation recall — canonical pattern (shared/text-patterns.cjs)
       if (CONVERSATION_RECALL_RE.test(text)) return true;
       // Recall-flavored phrasings the canonical recall regex doesn't cover
@@ -254,9 +256,11 @@ const INTENT_PATTERNS = [
  * Returns the guessed intent name, or null if no pattern matches.
  *
  * @param {string} englishText - English translation of user prompt
+ * @param {Object} [opts] - { hasSelectionContext: bool } — a captured text
+ *   selection rides in the payload and resolves deictic referents itself.
  * @returns {{ guessedIntent: string|null, confidence: number }}
  */
-function guess(englishText) {
+function guess(englishText, opts = {}) {
   if (!englishText || !englishText.trim()) {
     return { guessedIntent: null, confidence: 0 };
   }
@@ -267,7 +271,7 @@ function guess(englishText) {
 
   for (const { intent, test } of INTENT_PATTERNS) {
     try {
-      if (test(text)) {
+      if (test(text, opts)) {
         logger.info('[IntentGuesser] Matched', {
           intent,
           textPreview: englishText.substring(0, 60),

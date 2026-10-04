@@ -117,10 +117,11 @@ function _lastAssistantTurn(conversationContext) {
 // CONVERSATION_RECALL_RE is canonical in shared/text-patterns.cjs (tolerant
 // multi-alternative version — STT stems "chatt"/"talkin" handled there).
 
-async function classify(englishText, conversationContext) {
+async function classify(englishText, conversationContext, opts = {}) {
   if (!englishText || !englishText.trim()) {
     return { intent: 1, intentName: 'general_quick', confidence: 0.5, source: 'empty_input' };
   }
+  const hasSelectionContext = !!opts.hasSelectionContext;
 
   const normalized = englishText.toLowerCase().trim()
     .replaceAll('?', '').replaceAll('!', '').replaceAll('.', '').trim();
@@ -178,7 +179,9 @@ async function classify(englishText, conversationContext) {
   // carry their referent entirely in a pronoun — only the graph's transcript
   // access resolves them. general_quick either can't see the prior turns or
   // hallucinates a referent (observed: "when was that" → invented a date).
-  if (DEICTIC_CONTINUATION_RE.test(englishText)) {
+  // Exception: a captured text selection rides in the payload and IS the
+  // referent — "what does this word mean" + highlight is self-contained.
+  if (!hasSelectionContext && DEICTIC_CONTINUATION_RE.test(englishText)) {
     logger.info('[Classify] Deictic-continuation guard → handoff', {
       inputPreview: englishText.substring(0, 60),
     });
@@ -218,7 +221,7 @@ async function classify(englishText, conversationContext) {
   // answered "tweet going live" — nothing ever ran.
   const _GRAPH_ONLY_INTENTS = new Set(['command_automate', 'screen_analysis', 'web_search', 'memory_retrieve']);
   let _guessedIntent = null;
-  try { _guessedIntent = require('./intentGuesser.cjs').guess(englishText).guessedIntent; } catch (_) {}
+  try { _guessedIntent = require('./intentGuesser.cjs').guess(englishText, { hasSelectionContext }).guessedIntent; } catch (_) {}
   const _vetoQuick = (result) => {
     // memory_retrieve and memory_quick share the memory domain — the guesser's
     // "what's my X" recall patterns overlap the quick tier's profile-fact

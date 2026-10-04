@@ -374,7 +374,7 @@ async function _generateHandoffPhrase(englishText, detectedLanguage, conversatio
  */
 async function processMessage(args) {
   const startTime = Date.now();
-  const { text, language, source = 'text', speakerProfile, isResemble, thoughtContext = null } = args;
+  const { text, language, source = 'text', speakerProfile, isResemble, thoughtContext = null, selectedText = null } = args;
 
   if (!text || !text.trim()) {
     return {
@@ -388,6 +388,7 @@ async function processMessage(args) {
   logger.info('[Process] Start', {
     source, language: language || 'auto',
     textPreview: text.substring(0, 80),
+    hasSelection: !!(selectedText && selectedText.trim()),
   });
 
   // ── Step 1: Translate to English (deterministic, no LLM for language check) ──
@@ -423,8 +424,37 @@ async function processMessage(args) {
   // Strip canned-refusal Assistant lines left over from pre-fix sessions so
   // models don't mimic the refusal voice (heals already-poisoned history).
   const context = sanitizeContext(convHistory || _formatContext());
-  let { intent, intentName, confidence, source: classifySource } =
-    await classify(englishText, context);
+  // Highlighted-context tags ("[Highlighted: …]") ride inside the prompt. Strip
+  // them for intent classification/guessing — a code- or command-looking blob
+  // would otherwise bias the intent toward handoff. They stay in englishText
+  // so the answering nodes (and any handoff payload) still see the selection.
+  // Exact-string removal via selectedText — a `]` inside the blob would
+  // truncate a non-greedy tag regex (observed: captured log lines like "[0]").
+  const hasSelectionContext = !!(selectedText && String(selectedText).trim());
+  let classifyText = englishText;
+  if (hasSelectionContext) {
+    for (const chunk of String(selectedText).split('\n').map(s => s.trim()).filter(s => s.length > 2)) {
+      classifyText = classifyText.split(chunk).join(' ');
+    }
+  }
+  classifyText = classifyText
+    .replace(/\[Highlighted:\s*[^\]]*\]/g, ' ')  // leftover wrappers are whitespace-only
+    .replace(/\s{2,}/g, ' ')
+    .trim() || englishText;
+  // ── Selection fast lane ───────────────────────────────────────────────────
+  // A [Highlighted:] blob carries its own referent — the prompt is self-contained
+  // QA. Skip classify + the context-blind guards entirely; generalQuick's
+  // 0-sentinel self-corrects to shouldHandoff when tools are genuinely needed.
+  let intent, intentName, confidence, classifySource;
+  if (hasSelectionContext) {
+    intent = 1;
+    intentName = 'general_quick';
+    confidence = 0.9;
+    classifySource = 'selection_fastlane';
+  } else {
+    ({ intent, intentName, confidence, source: classifySource } =
+      await classify(classifyText, context, { hasSelectionContext }));
+  }
 
   // ── Proactive-card reply → always handoff ────────────────────────────────────
   // A prompt carrying thoughtContext is a reply to a proactive card. Quick
@@ -444,7 +474,10 @@ async function processMessage(args) {
   // app.agent scan_page — general_quick/web_search can only guess from prior
   // context (right by accident, stale by design). Handoff lets classifyTask
   // resolve the referent against the live activeDocContext.
-  if (intent !== 0 && /\b(?:this|the|current|open)\s+(?:page|tab|site|website)\b|\bon\s+this\s+(?:page|site|website)\b/i.test(englishText)) {
+  // Skipped when a selection supplies the referent — "this on the page" then
+  // points at the highlighted text, not the live DOM (generalQuick may still
+  // sentinel→handoff if it really needs the page).
+  if (intent !== 0 && !hasSelectionContext && /\b(?:this|the|current|open)\s+(?:page|tab|site|website)\b|\bon\s+this\s+(?:page|site|website)\b/i.test(classifyText)) {
     logger.info('[Process] live-page referent — forcing handoff', { was: intentName });
     intent = 0;
     intentName = 'handoff';
@@ -459,7 +492,7 @@ async function processMessage(args) {
   // thoughtId so the engine doesn't re-ingest its own card as a candidate.
   const _replyOnlyText = thoughtContext?.tag
     ? englishText.replace(thoughtContext.tag, '').trim()
-    : englishText;
+    : classifyText;
   _notifyThoughtEngine('prompt', {
     text: _replyOnlyText || englishText,
     sessionId: routedSessionId,
@@ -474,7 +507,7 @@ async function processMessage(args) {
     case 0: { // handoff
       // Compute guessedIntent BEFORE handoff() so it's available for task:created
       // (intentGuesser.guess is a pure synchronous regex — ~1ms, no LLM/async)
-      const { guessedIntent: _gi0 } = intentGuesser.guess(englishText);
+      const { guessedIntent: _gi0 } = intentGuesser.guess(classifyText, { hasSelectionContext });
       const handoffResult = await handoff({
         englishPrompt: englishText,
         source,
@@ -508,10 +541,10 @@ async function processMessage(args) {
     }
 
     case 1: { // general_quick
-      result = await generalQuick(englishText, systemPrompt, context);
+      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext });
       // If generalQuick couldn't answer (LLM failed), handoff to main state graph
       if (result.metadata.shouldHandoff) {
-        const { guessedIntent: _gi1 } = intentGuesser.guess(englishText);
+        const { guessedIntent: _gi1 } = intentGuesser.guess(classifyText, { hasSelectionContext });
         const handoffResult = await handoff({
           englishPrompt: englishText,
           source,
@@ -545,7 +578,7 @@ async function processMessage(args) {
       result = await memoryQuick(englishText, systemPrompt, context);
       // If memory_quick couldn't find a match, handoff instead
       if (result.metadata.shouldHandoff) {
-        const { guessedIntent: _gi2 } = intentGuesser.guess(englishText);
+        const { guessedIntent: _gi2 } = intentGuesser.guess(classifyText, { hasSelectionContext });
         const handoffResult = await handoff({
           englishPrompt: englishText,
           source,
@@ -587,7 +620,7 @@ async function processMessage(args) {
       result = await memoryStore(englishText, systemPrompt, context);
       // If memory_store failed, handoff to main state graph
       if (result.metadata.shouldHandoff) {
-        const { guessedIntent: _gi5 } = intentGuesser.guess(englishText);
+        const { guessedIntent: _gi5 } = intentGuesser.guess(classifyText, { hasSelectionContext });
         const handoffResult = await handoff({
           englishPrompt: englishText,
           source,
@@ -618,7 +651,7 @@ async function processMessage(args) {
 
     default: {
       // Unknown intent — default to general_quick
-      result = await generalQuick(englishText, systemPrompt, context);
+      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext });
     }
   }
 
