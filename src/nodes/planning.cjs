@@ -255,8 +255,10 @@ async function _generateTaskSteps(task) {
     if (!valid) return null;
     // One normalization rule shared with planRunner's dispatch path:
     // url steps → owning service agent; session-bound steps → task's lane.
-    const norm = require('../../../shared/plan-steps.cjs')
-      .normalizeTaskSteps({ ...task, steps });
+    // Async variant — unknown step hosts get one bounded live discovery
+    // (redirect-follow → web.search), then persist to learned_domains.
+    const norm = await require('../../../shared/plan-steps.cjs')
+      .normalizeTaskStepsAsync({ ...task, steps });
     task._normalized = norm; // {steps, agents, services} — consumed by _scheduleStepGen
     return norm.steps;
   } catch (err) {
