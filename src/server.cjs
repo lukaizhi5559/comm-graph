@@ -41,6 +41,7 @@ const { sanitizeContext } = require('./refusal.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
 const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
+const planningNode = require('./nodes/planning.cjs');
 const { execute: statusCheck } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const { execute: handoff, complete: handoffComplete, remove: handoffRemove } = require('./handoff.cjs');
@@ -374,7 +375,7 @@ async function _generateHandoffPhrase(englishText, detectedLanguage, conversatio
  */
 async function processMessage(args) {
   const startTime = Date.now();
-  const { text, language, source = 'text', speakerProfile, isResemble, thoughtContext = null, selectedText = null } = args;
+  const { text, language, source = 'text', speakerProfile, isResemble, thoughtContext = null, selectedText = null, planning = null } = args;
 
   if (!text || !text.trim()) {
     return {
@@ -446,7 +447,14 @@ async function processMessage(args) {
   // QA. Skip classify + the context-blind guards entirely; generalQuick's
   // 0-sentinel self-corrects to shouldHandoff when tools are genuinely needed.
   let intent, intentName, confidence, classifySource;
-  if (hasSelectionContext) {
+  if (planning && planning.active === true) {
+    // Planning mode pinned by the UI (toggle / continue-plan) — bypass the
+    // classifier entirely so "yes", edits, and questions stay in the lane.
+    intent = 6;
+    intentName = 'planning';
+    confidence = 1.0;
+    classifySource = 'planning_pinned';
+  } else if (hasSelectionContext) {
     intent = 1;
     intentName = 'general_quick';
     confidence = 0.9;
@@ -461,7 +469,7 @@ async function processMessage(args) {
   // intents (general_quick et al.) lack the context machinery to resolve it —
   // and "yes" once produced a chatty ack with NO task dispatched. Route it to
   // stategraph where classifyTask can weigh the card against conversation turns.
-  if (thoughtContext && intent !== 0) {
+  if (thoughtContext && intent !== 0 && intent !== 6) {
     logger.info('[Process] thoughtContext present — forcing handoff', {
       was: intentName, thoughtId: thoughtContext.id || null,
     });
@@ -477,7 +485,7 @@ async function processMessage(args) {
   // Skipped when a selection supplies the referent — "this on the page" then
   // points at the highlighted text, not the live DOM (generalQuick may still
   // sentinel→handoff if it really needs the page).
-  if (intent !== 0 && !hasSelectionContext && /\b(?:this|the|current|open)\s+(?:page|tab|site|website)\b|\bon\s+this\s+(?:page|site|website)\b/i.test(classifyText)) {
+  if (intent !== 0 && intent !== 6 && !hasSelectionContext && /\b(?:this|the|current|open)\s+(?:page|tab|site|website)\b|\bon\s+this\s+(?:page|site|website)\b/i.test(classifyText)) {
     logger.info('[Process] live-page referent — forcing handoff', { was: intentName });
     intent = 0;
     intentName = 'handoff';
@@ -616,6 +624,29 @@ async function processMessage(args) {
       break;
     }
 
+    case 6: { // planning — conversational plan-drafting lane
+      result = await planningNode.execute({
+        englishText,
+        systemPrompt,
+        sessionId: routedSessionId,
+        planning: {
+          active: true,
+          planId: planning?.planId || null,
+          name: planning?.name || null,
+          startedExplicit: planning?.startedExplicit === true || classifySource === 'planning_pinned',
+        },
+        source,
+      });
+      // Auto-entered planning (phrase guard / complexity / intent-6 LLM) —
+      // surface WHY so the UI shows "moved to planning" rather than silently
+      // rerouting the prompt.
+      if (classifySource !== 'planning_pinned' && result?.metadata) {
+        result.metadata.movedToPlanning = true;
+        result.metadata.planningReason = classifySource; // planning_phrase_guard | complexity_guard | force_prompt
+      }
+      break;
+    }
+
     case 5: { // memory_store
       result = await memoryStore(englishText, systemPrompt, context);
       // If memory_store failed, handoff to main state graph
@@ -674,7 +705,7 @@ async function processMessage(args) {
   // ── Record conversation turn ──────────────────────────────────────────────────
   _addTurn(englishText, finalText, intent);
   // Log to conversation-service for quick intents (handoff is logged by stategraph)
-  if (intent === 1 || intent === 2 || intent === 5) {
+  if (intent === 1 || intent === 2 || intent === 5 || intent === 6) {
     _logConversationTurn(englishText, finalText, intentName, routedSessionId);
   }
 
@@ -772,6 +803,14 @@ const server = http.createServer(async (req, res) => {
         sessionId: body.sessionId || null,
         // Brain-approved thoughts skip the second Queue approval gate.
         userApproved: body.userApproved === true,
+        // Plan-runner dispatches — carry the plan identity + short-circuit
+        // flags so the stategraph executes this task without re-planning.
+        planId: body.planId || null,
+        planTaskNum: body.planTaskNum || null,
+        planTask: body.planTask === true,
+        preflightAuthBypass: body.preflightAuthBypass || null,
+        // Plan-runner pins the canonical agent — lock key = shared session.
+        agentId: body.agentId || null,
       });
       logger.info('[Server] Proactive dispatch', { taskId: result.taskId, thoughtId: body.thoughtId });
       return _send(res, 200, { ok: true, ...result });

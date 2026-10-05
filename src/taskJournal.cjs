@@ -116,7 +116,7 @@ function setOnTerminal(fn) {
  * @param {string|null} [opts.sessionId] - Conversation session the task belongs to (for recall)
  * @returns {string} task id
  */
-function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null, userApproved = false, thoughtContext = null }) {
+function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null, userApproved = false, thoughtContext = null, planMeta = null }) {
   const id = _uid();
   /** @type {TaskEntry} */
   const task = {
@@ -140,6 +140,9 @@ function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text
     // Proactive-card context when the prompt is a reply to a Thought —
     // retained on the record so parked/queued replays keep it.
     thoughtContext: thoughtContext || null,
+    // Plan-runner dispatch context — { planId, planTaskNum, planTask,
+    // preflightAuthBypass } — persisted so parked/queued replays keep it.
+    planMeta: planMeta || null,
   };
   _tasks.set(id, task);
   _save();

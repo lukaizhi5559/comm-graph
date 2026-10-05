@@ -19,6 +19,8 @@ CLASSIFICATION RULES:
 11. If the message asks to FIND/SHOW/PULL UP IMAGES, photos, pictures, or pics of something → classify as 0 (handoff — needs a real search/fetch action that general_quick cannot perform). Do NOT deflect with "I can't display images" from general_quick. Pattern: "show me pics of X", "find photos of Y", "pull up pictures of Z".
 12. If the message asks what is ON the user's screen, to read/describe/identify visible screen content, or which app/window is currently active → classify as 0 (handoff — needs a live screen capture that general_quick cannot perform). Pattern: "what's on my screen", "read the text on my screen", "what app am I in", "describe what I'm looking at", "is there an error dialog visible".
 
+21. If the message asks for MULTIPLE DISTINCT DELIVERABLES or services in one request — different apps/accounts that each need their own work — OR explicitly asks to plan/brainstorm/organize an approach → classify as 6 (planning — a plan gets drafted and approved before anything executes). This differs from rule 1: a single multi-step task in one app stays 0; several independent deliverables or an explicit plan request is 6. Pattern: "create a doc, then a calendar event, and a spreadsheet", "add to my amazon cart and email me when done", "let's plan a trip to Denver", "help me brainstorm X", "I need to do X, then after do Y and also Z".
+
 IMPORTANT BOUNDARIES:
 - "What time is it?" → 0 (handoff — needs real-time device clock)
 - "What's today's date?" → 0 (handoff — needs real-time device clock)
@@ -73,6 +75,13 @@ IMPORTANT BOUNDARIES:
 - "Why can't you help with X?" → 1 (general_quick — asks about the refusal/answer, not requesting X itself)
 - "Show me pics of baby clothes" → 0 (handoff — image request needs a real search/fetch, not a deflection)
 - "Find photos of Y" → 0 (handoff — image request)
+- "Create a Google Doc, then add a calendar event and a spreadsheet" → 6 (planning — 3 distinct deliverables)
+- "Add this to my Amazon cart and send me an email when done" → 6 (planning — two services, dependent steps)
+- "Let's plan my trip to Denver" → 6 (planning — explicit plan request)
+- "I need to brainstorm startup ideas" → 6 (planning — brainstorm = plan-shaped conversation)
+- "Help me come up with a plan to organize my repos" → 6 (planning)
+- "Post a tweet saying hello world" → 0 (handoff — single action, single service)
+- "Open YouTube and search for cats" → 0 (handoff — single service, one flow)
 
 DISAMBIGUATION — "remember" is ambiguous:
 - "Remember I have a meeting at 3pm" → 5 (memory_store — storing a fact)
@@ -82,4 +91,4 @@ DISAMBIGUATION — "remember" is ambiguous:
 - If the message contains an action verb (add, download, create, find, copy, save, put, send, open, close) AND "remember" → 0 (handoff — "remember" is a conversational reference, not a storage command)
 - If the message is a CORRECTION or CLARIFICATION of a previous task ("not from X but from Y", "I meant Z", "actually W") → 0 (handoff — it's a task instruction, not memory storage)
 
-Return ONLY a single number (0, 1, 2, 3, 4, or 5). No words, no explanation, no punctuation — just the number.
+Return ONLY a single number (0, 1, 2, 3, 4, 5, or 6). No words, no explanation, no punctuation — just the number.

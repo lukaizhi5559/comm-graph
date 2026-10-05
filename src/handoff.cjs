@@ -67,7 +67,7 @@ function detectAgent(englishPrompt) {
  * @param {object|null} [thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<boolean>} true if notification was sent
  */
-function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null) {
+function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planMeta = null) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       taskId,
@@ -79,6 +79,10 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
       sessionId: sessionId || null,
       userApproved: userApproved === true,
       thoughtContext: thoughtContext || null,
+      ...(planMeta && planMeta.planId ? { planId: planMeta.planId } : {}),
+      ...(planMeta && planMeta.planTaskNum ? { planTaskNum: planMeta.planTaskNum } : {}),
+      ...(planMeta && planMeta.planTask ? { planTask: true } : {}),
+      ...(planMeta && planMeta.preflightAuthBypass?.length ? { preflightAuthBypass: planMeta.preflightAuthBypass } : {}),
     });
     const req = http.request({
       hostname: '127.0.0.1',
@@ -110,8 +114,11 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
  * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null }) {
-  const agentId = detectAgent(englishPrompt);
+async function execute({ englishPrompt, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null }) {
+  // Plan-dispatched tasks carry the task's canonical agentId so the lock key
+  // is the shared session (google_*.agent → google.agent), not prompt text.
+  const agentId = pinnedAgentId || detectAgent(englishPrompt);
+  const planMeta = planId ? { planId, planTaskNum, planTask, preflightAuthBypass } : null;
 
   // Create task in journal
   const taskId = createTask({
@@ -122,6 +129,7 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent, s
     sessionId,
     userApproved,
     thoughtContext,
+    planMeta,
   });
 
   // Try to acquire agent lock
@@ -130,7 +138,7 @@ async function execute({ englishPrompt, source, originalPrompt, guessedIntent, s
   if (acquired) {
     // Lock acquired — notify main.js to spawn stategraph run
     updateTask(taskId, 'queued');
-    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext);
+    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext, planMeta);
     if (!notified) {
       logger.warn('[Handoff] Failed to notify main.js — task will be picked up on retry', { taskId });
     }
@@ -171,7 +179,7 @@ function complete(taskId, agentId, status, result, items, sessionId = null, plan
       const task = require('./taskJournal.cjs').getTask(nextTaskId);
       if (task) {
         const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
-        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null)
+        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null)
           .catch(() => {});
       }
     }
@@ -195,7 +203,7 @@ function remove(taskId) {
       const nextTask = require('./taskJournal.cjs').getTask(nextTaskId);
       if (nextTask) {
         const guessedIntent = require('./intentGuesser.cjs').guess(nextTask.prompt).guessedIntent;
-        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, guessedIntent, nextTask.sessionId, nextTask.userApproved === true, nextTask.thoughtContext || null)
+        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, guessedIntent, nextTask.sessionId, nextTask.userApproved === true, nextTask.thoughtContext || null, nextTask.planMeta || null)
           .catch(() => {});
       }
     }

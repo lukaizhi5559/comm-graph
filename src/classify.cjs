@@ -12,6 +12,7 @@
  *   2 - memory_quick         → quick profile/fact recall (name, favorite color) → user-memory lookup
  *   3 - status_check         → "how is my task going?" → read task journal
  *   4 - control_signal       → cancel/stop → abort via journal + main.js
+ *   6 - planning             → multi-deliverable/multi-service request → planning lane
  *
  * Falls back to embedding-based classification (classifier-fallback.cjs) if LLM
  * returns an unparseable response.
@@ -34,6 +35,7 @@ const INTENTS = {
   // to a node that can't serve them.
   4: { name: 'control_signal',    description: 'Cancel, stop, or abort a running task' },
   5: { name: 'memory_store',      description: 'Storing a general memory, note, appointment, or event — NOT a personal profile fact. E.g., "i have a dentist appt next week", "remember I have a meeting at 3pm", "note: buy milk tomorrow"' },
+  6: { name: 'planning',          description: 'Requests that need a multi-task plan drafted BEFORE execution — brainstorming, "let\'s plan X", or multiple distinct deliverables/services in one request (e.g. doc + calendar + sheet, add to cart then email me). NOT single quick actions.' },
 };
 
 // ── Load classification prompt ─────────────────────────────────────────────────
@@ -117,11 +119,47 @@ function _lastAssistantTurn(conversationContext) {
 // CONVERSATION_RECALL_RE is canonical in shared/text-patterns.cjs (tolerant
 // multi-alternative version — STT stems "chatt"/"talkin" handled there).
 
+// ── Planning-detection guards ────────────────────────────────────────────────
+// Explicit "let's plan / brainstorm / come up with a plan" phrasing → planning
+// lane deterministically (the LLM slips these to general_quick or handoff).
+const PLANNING_PHRASE_RE = /\b(?:let'?s|lets|help me|i want to|i need to|we need to|can we|wanna)\s+(?:make|create|build|come up with|work out|draft|do|start)\s+(?:a\s+|an\s+|the\s+|some\s+|up\s+a\s+)?plan\b|\bcome up with a plan\b|\bplan (?:out|for|to)\b|\bmake a plan\b|\bcreate a plan\b|\bdraft a plan\b|\bplanning mode\b|\bbrainstorm\b|\bwork out a plan\b|\bplanning session\b/i;
+
+// Multi-deliverable complexity scorer — catches prompts that never SAY "plan"
+// but describe several services × several actions (the "Doc + Calendar +
+// Sheet" case). Counts distinct service signals and distinct action verbs;
+// ≥2 of each is strong evidence for a plan-first route.
+const _SERVICE_SIGNALS = /\b(amazon|gmail|google docs?|google sheets?|google calendar|google drive|youtube|twitter|x\.com|reddit|github|notion|slack|spotify|netflix|chatgpt|claude|perplexity|grok|jira|trello|figma|linkedin|facebook|instagram|calendar|spreadsheet|sheet\b|doc(?:ument)?\b|email|e-mail|terminal|shell|cli\b|file|folder|browser)\b/gi;
+const _ACTION_SIGNALS = /\b(create|add|send|write|update|delete|post|schedule|build|make|generate|draft|open|download|upload|rename|move|copy|organize|set up|setup|fill|submit|order|buy|purchase|email|message|notify|remind|save|edit)\b/gi;
+const _SEQUENCE_SIGNALS = /\b(then|after(?:wards?)?|next|and also|as well as|followed by|once (?:done|finished|complete)|when (?:done|finished|complete))\b/i;
+
+function _complexityPlanningScore(text) {
+  const services = new Set((String(text || '').match(_SERVICE_SIGNALS) || []).map(s => s.toLowerCase()));
+  const actions = new Set((String(text || '').match(_ACTION_SIGNALS) || []).map(s => s.toLowerCase()));
+  const sequenced = _SEQUENCE_SIGNALS.test(text || '');
+  const words = String(text || '').trim().split(/\s+/).length;
+  // ≥2 services AND ≥2 actions → multi-deliverable. Sequencing language or a
+  // long prompt (>35 words) with 2+ actions also qualifies — long multi-step
+  // asks benefit from a drafted plan even inside one service.
+  const multiDeliverable = services.size >= 2 && actions.size >= 2;
+  const longSequential = (sequenced && actions.size >= 3) || (words > 35 && actions.size >= 3 && services.size >= 1);
+  return { score: (multiDeliverable || longSequential) ? 1 : 0, services: services.size, actions: actions.size, sequenced, words };
+}
+
 async function classify(englishText, conversationContext, opts = {}) {
   if (!englishText || !englishText.trim()) {
     return { intent: 1, intentName: 'general_quick', confidence: 0.5, source: 'empty_input' };
   }
   const hasSelectionContext = !!opts.hasSelectionContext;
+
+  // Explicit planning request — deterministic, runs before every other guard.
+  // ("plan" inside a bigger automation prompt like "follow this plan" is NOT
+  // matched — the phrases above require intent-to-draft framing.)
+  if (PLANNING_PHRASE_RE.test(englishText)) {
+    logger.info('[Classify] Planning phrase guard → planning', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 6, intentName: 'planning', confidence: 0.95, source: 'planning_phrase_guard' };
+  }
 
   const normalized = englishText.toLowerCase().trim()
     .replaceAll('?', '').replaceAll('!', '').replaceAll('.', '').trim();
@@ -239,6 +277,20 @@ async function classify(englishText, conversationContext, opts = {}) {
       });
       return { intent: 0, intentName: 'handoff', confidence: 0.85, source: 'action_veto' };
     }
+    // Multi-deliverable upgrade: LLM routes a many-service/many-action prompt to
+    // handoff (or even general_quick) — the complexity scorer catches the shape
+    // the LLM missed and moves it to the planning lane instead of one fused run.
+    if (result.intent === 0 || result.intent === 1) {
+      const cx = _complexityPlanningScore(englishText);
+      if (cx.score >= 1) {
+        logger.info('[Classify] Complexity guard → planning', {
+          was: result.intentName, services: cx.services, actions: cx.actions,
+          sequenced: cx.sequenced, words: cx.words,
+          inputPreview: englishText.substring(0, 60),
+        });
+        return { intent: 6, intentName: 'planning', confidence: 0.8, source: 'complexity_guard' };
+      }
+    }
     return result;
   };
 
@@ -308,8 +360,8 @@ async function classify(englishText, conversationContext, opts = {}) {
         // are untrustworthy as a whole, but a trailing digit or an explicit
         // "intent: N" phrase is a deliberate final answer — extract it rather
         // than paying a second flaky 12s call that ends in blind handoff.
-        const tailMatch = trimmed.match(/([0-5])\s*[.!)]*\s*$/)
-          || trimmed.match(/intent\s*(?:is|:|=|->|of)?\s*([0-5])\s*[.!)]*\s*$/i);
+        const tailMatch = trimmed.match(/([0-6])\s*[.!)]*\s*$/)
+          || trimmed.match(/intent\s*(?:is|:|=|->|of)?\s*([0-6])\s*[.!)]*\s*$/i);
         if (tailMatch) {
           const intent = parseInt(tailMatch[1], 10);
           const info = INTENTS[intent];
