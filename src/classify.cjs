@@ -132,15 +132,36 @@ const _SERVICE_SIGNALS = /\b(amazon|gmail|google docs?|google sheets?|google cal
 const _ACTION_SIGNALS = /\b(create|add|send|write|update|delete|post|schedule|build|make|generate|draft|open|download|upload|rename|move|copy|organize|set up|setup|fill|submit|order|buy|purchase|email|message|notify|remind|save|edit)\b/gi;
 const _SEQUENCE_SIGNALS = /\b(then|after(?:wards?)?|next|and also|as well as|followed by|once (?:done|finished|complete)|when (?:done|finished|complete))\b/i;
 
+// Canonical service families — raw keyword hits collapse to one service id so
+// aliases can't inflate the count ("send an email via gmail" = ONE service,
+// "a doc and a spreadsheet" = two). Anything unmapped keeps its own spelling.
+const _SERVICE_CANON = {
+  'gmail': 'mail', 'email': 'mail', 'e-mail': 'mail',
+  'doc': 'docs', 'document': 'docs', 'google doc': 'docs', 'google docs': 'docs',
+  'sheet': 'sheets', 'spreadsheet': 'sheets', 'google sheet': 'sheets', 'google sheets': 'sheets',
+  'calendar': 'calendar', 'google calendar': 'calendar',
+  'google drive': 'drive',
+  'x.com': 'twitter',
+  'terminal': 'shell', 'shell': 'shell', 'cli': 'shell',
+  'file': 'files', 'folder': 'files',
+};
+
 function _complexityPlanningScore(text) {
-  const services = new Set((String(text || '').match(_SERVICE_SIGNALS) || []).map(s => s.toLowerCase()));
-  const actions = new Set((String(text || '').match(_ACTION_SIGNALS) || []).map(s => s.toLowerCase()));
+  // Value payloads are arguments, not service references — a recipient like
+  // "randallakers.work@gmail.com" must not count "gmail" as a second service.
+  const scrubbed = String(text || '')
+    .replace(/\S+@\S+/g, ' ')
+    .replace(/https?:\/\/\S+/gi, ' ');
+  const services = new Set((scrubbed.match(_SERVICE_SIGNALS) || [])
+    .map(s => _SERVICE_CANON[s.toLowerCase()] || s.toLowerCase()));
+  const actions = new Set((scrubbed.match(_ACTION_SIGNALS) || []).map(s => s.toLowerCase()));
   const sequenced = _SEQUENCE_SIGNALS.test(text || '');
   const words = String(text || '').trim().split(/\s+/).length;
-  // ≥2 services AND ≥2 actions → multi-deliverable. Sequencing language or a
-  // long prompt (>35 words) with 2+ actions also qualifies — long multi-step
-  // asks benefit from a drafted plan even inside one service.
-  const multiDeliverable = services.size >= 2 && actions.size >= 2;
+  // ≥2 distinct canonical services → multi-deliverable (the verb count doesn't
+  // matter — "create a doc, then a calendar event and a spreadsheet" is three
+  // deliverables under one verb). One service with many sequenced actions, or
+  // a long multi-step ask (>35 words, 3+ actions), also benefits from a draft.
+  const multiDeliverable = services.size >= 2;
   const longSequential = (sequenced && actions.size >= 3) || (words > 35 && actions.size >= 3 && services.size >= 1);
   return { score: (multiDeliverable || longSequential) ? 1 : 0, services: services.size, actions: actions.size, sequenced, words };
 }
@@ -398,4 +419,4 @@ async function classify(englishText, conversationContext, opts = {}) {
   return { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'default_handoff' };
 }
 
-module.exports = { classify, INTENTS };
+module.exports = { classify, INTENTS, _complexityPlanningScore };

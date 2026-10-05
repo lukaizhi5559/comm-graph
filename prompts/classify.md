@@ -82,6 +82,7 @@ IMPORTANT BOUNDARIES:
 - "Help me come up with a plan to organize my repos" → 6 (planning)
 - "Post a tweet saying hello world" → 0 (handoff — single action, single service)
 - "Open YouTube and search for cats" → 0 (handoff — single service, one flow)
+- "Send an email to a@b.com saying I'll be late" → 0 (handoff — one deliverable; its fields are not multiple actions)
 
 DISAMBIGUATION — "remember" is ambiguous:
 - "Remember I have a meeting at 3pm" → 5 (memory_store — storing a fact)
