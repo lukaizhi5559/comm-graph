@@ -906,6 +906,13 @@ const server = http.createServer(async (req, res) => {
     return _send(res, 200, { ok: true });
   }
 
+  // ── Plan step-generation retry (from main.js plan-check card) ────────────────
+  if (req.url === '/plan.retry-steps' && req.method === 'POST') {
+    const body = await _readBody(req);
+    const result = planningNode.retrySteps(body.planId, body.taskNum);
+    return _send(res, result.ok ? 200 : 400, result);
+  }
+
   // ── Task removal (from main.js) ────────────────────────────────────────────────
   if (req.url === '/comms.remove' && req.method === 'POST') {
     const body = await _readBody(req);

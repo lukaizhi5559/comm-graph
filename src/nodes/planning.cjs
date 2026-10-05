@@ -32,6 +32,7 @@ const { ask, askStream } = require('../llm-providers.cjs');
 const planFormat = require('../../../shared/plan-format.cjs');
 const { canonicalAgent } = require('../../../shared/agent-canonical.cjs');
 const skillIndex = require('../../../shared/skill-index.cjs');
+const serviceMap = require('../../../shared/service-map.cjs');
 
 // ── Paths / services ─────────────────────────────────────────────────────────
 
@@ -206,7 +207,9 @@ function _promptHash(prompt) {
   return h;
 }
 
-const _STEPGEN_PROMPT = `You are ThinkDrop's execution planner. Convert ONE task
+// Fallback contract used only when the canonical stategraph prompt files
+// can't be read (moved/renamed). Kept so step generation can never hard-fail.
+const _STEPGEN_FALLBACK = `You are ThinkDrop's execution planner. Convert ONE task
 into a concrete step list for the skill runtime. Reply with ONLY a fenced json
 block — an array of steps, each {"skill": "...", "args": {...}, "description": "..."}.
 
@@ -236,6 +239,55 @@ tasks gather via web.agent/web.crawl and write results to LOCAL files
 (edit.agent/shell.run) — a service (Doc/Sheet/email) only appears when the
 user named it as the deliverable. No commentary — ONLY the json fence.`;
 
+// ── Canonical stepgen prompt ─────────────────────────────────────────────────
+// planSkillsV2 and this lane share ONE canon: the stategraph prompt files.
+// Core rules + ONE domain appendix picked from the task's registered agent
+// type (service-map). The old hand-rolled list produced per-field dom.act
+// chains; the browser appendix carries the canonical bundled-goal + verify
+// pattern instead.
+const _SG_PROMPTS_DIR = path.join(__dirname, '..', '..', '..', 'stategraph-module', 'src', 'prompts');
+const _sgPromptCache = new Map();
+function _loadSgPrompt(name) {
+  if (_sgPromptCache.has(name)) return _sgPromptCache.get(name);
+  let text = null;
+  try { text = fs.readFileSync(path.join(_SG_PROMPTS_DIR, name), 'utf8'); }
+  catch (_) { logger.warn('[Planning] Stepgen canon file unreadable', { name }); }
+  _sgPromptCache.set(name, text);
+  return text;
+}
+
+function _pickStepgenAppendix(task) {
+  const agents = task.agents || [];
+  let hasBrowser = false;
+  let hasCli = false;
+  for (const a of agents) {
+    const meta = serviceMap.describeAgent(a);
+    if (!meta) continue;
+    if (meta.cliTool || meta.type === 'cli') hasCli = true;
+    else if (meta.type === 'browser' || meta.type === 'api') hasBrowser = true;
+  }
+  if (hasBrowser) return 'plan-skills-browser.md';
+  if (hasCli) return 'plan-skills-cli-first.md';
+  if (/[~\/][\w\-./]+\.(?:md|txt|json|csv|pdf|docx?|xlsx?|py|ts|js)\b/i.test(task.prompt || '')) {
+    return 'plan-skills-file.md';
+  }
+  return null;
+}
+
+function _stepgenSystemPrompt(task) {
+  const core = _loadSgPrompt('plan-skills-core.md');
+  if (!core) return _STEPGEN_FALLBACK;
+  const appendixName = _pickStepgenAppendix(task);
+  const appendix = appendixName ? _loadSgPrompt(appendixName) : null;
+  return [
+    "You are ThinkDrop's execution planner. Convert ONE task into a concrete step list for the skill runtime.",
+    core,
+    appendix || '',
+    '## Task scope\nYou are planning ONE task from a larger approved plan — emit ONLY the steps this task needs (the surrounding plan handles ordering and dependencies).',
+    '## Output contract\nReply with ONLY a fenced json block — an array of steps, each {"skill": "...", "args": {...}, "description": "..."}. Every step taking an agentId arg carries the exact TASK AGENTS value — never invent another agent id. synthesize is always last. No commentary — ONLY the json fence.',
+  ].filter(Boolean).join('\n\n');
+}
+
 async function _generateTaskSteps(task) {
   const agents = (task.agents || []).join(' | ') || 'auto';
   const userMsg =
@@ -245,14 +297,24 @@ async function _generateTaskSteps(task) {
     `\nEmit the step list now.`;
   try {
     const { text } = await ask([
-      { role: 'system', content: _STEPGEN_PROMPT },
+      { role: 'system', content: _stepgenSystemPrompt(task) },
       { role: 'user', content: userMsg },
     ], { maxTokens: 900, temperature: 0.2, timeoutMs: 45000, taskType: 'planning' });
     const m = String(text || '').match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-    const steps = m ? JSON.parse(m[1].trim()) : null;
-    if (!Array.isArray(steps) || !steps.length) return null;
+    let steps = null;
+    try { steps = m ? JSON.parse(m[1].trim()) : null; }
+    catch (e) {
+      logger.warn('[Planning] Step JSON parse failed', { taskNum: task.num, error: e.message });
+    }
+    if (!Array.isArray(steps) || !steps.length) {
+      logger.warn('[Planning] Step generation produced no steps', { taskNum: task.num, preview: String(text || '').slice(0, 120) });
+      return null;
+    }
     const valid = steps.every(s => s && typeof s.skill === 'string' && s.skill);
-    if (!valid) return null;
+    if (!valid) {
+      logger.warn('[Planning] Step list malformed (missing skill field)', { taskNum: task.num });
+      return null;
+    }
     // One normalization rule shared with planRunner's dispatch path:
     // url steps → owning service agent; session-bound steps → task's lane.
     // Async variant — unknown step hosts get one bounded live discovery
@@ -280,8 +342,28 @@ function _scheduleStepGen(sess) {
         if (Array.isArray(task.steps) && task.steps.length
             && task._stepsHash === _promptHash(task.prompt)) continue;
         const promptAtGen = task.prompt;
-        const steps = await _generateTaskSteps(task);
-        if (!steps) continue;
+        // Bounded retry — a single malformed/unfenced response used to leave
+        // the task pending forever. Two attempts, then mark it failed so the
+        // plan-check card can surface a retry action instead of hanging.
+        let steps = await _generateTaskSteps(task);
+        if (!steps) steps = await _generateTaskSteps(task);
+        if (!steps) {
+          try {
+            const onDisk = fs.readFileSync(sess.filePath, 'utf8');
+            const diskTask = planFormat.parseTasks(onDisk).find(t => t.num === task.num);
+            if (diskTask && diskTask.prompt === promptAtGen) {
+              fs.writeFileSync(sess.filePath,
+                planFormat.updateTaskStepsStatus(onDisk, task.num, 'failed'), 'utf8');
+              const live = sess.tasks.find(t => t.num === task.num);
+              if (live) live.stepsStatus = 'failed';
+              _notifyPlanUpdated(sess.planId);
+            }
+          } catch (err) {
+            logger.warn('[Planning] Step-fail status write failed', { taskNum: task.num, error: err.message });
+          }
+          logger.warn('[Planning] Steps generation exhausted retries', { planId: sess.planId, taskNum: task.num });
+          continue;
+        }
         // Patch the file IN PLACE — the user may have edited other fields (or
         // this task's prompt) while generation ran. Only write when the
         // on-disk prompt still matches what we generated for.
@@ -291,6 +373,7 @@ function _scheduleStepGen(sess) {
           if (diskTask && diskTask.prompt === promptAtGen) {
             const norm = task._normalized;
             let next = planFormat.updateTaskSteps(onDisk, task.num, steps);
+            next = planFormat.updateTaskStepsStatus(next, task.num, null);
             // Steps that resolved to a registry service agent (url → docs.new
             // → google.agent) upgrade the task's Agents line so the run lock
             // covers the signed-in session, and re-assess auth so a real
@@ -314,6 +397,7 @@ function _scheduleStepGen(sess) {
             const live = sess.tasks.find(t => t.num === task.num);
             if (live && live.prompt === promptAtGen) {
               live.steps = steps;
+              live.stepsStatus = null;
               live._stepsHash = _promptHash(promptAtGen);
             }
             _notifyPlanUpdated(sess.planId);
@@ -432,6 +516,7 @@ exact block format for every task:
 - **Agents**: names from REGISTERED AGENTS below | shell | edit.agent | none
 - **Depends on**: — | Task 1, Task 2
 - **Mode**: sequential | parallel
+- **Approval**: required  ← ONLY on tasks with real-world side effects
 - **Done when**: a checkable success criterion (optional)
 ## Task 2 — ...
 ...
@@ -451,6 +536,17 @@ RULES for tasks:
 - Content stored IN a service (a Doc, Sheet, event, email) is its own Task
   with that service's agent — never bury service URLs inside research or
   compile tasks; research gathers data into local files.
+- GATHER → REVIEW → COMMIT — never fuse searching and committing into one
+  task. Anything with a real-world side effect (book, buy, pay, reserve,
+  send, post, delete, submit a form that commits) is its OWN task carrying
+  "- **Approval**: required", depends on the gather task, and its Prompt says
+  "using the result of Task N". Research/search/compare tasks stay on
+  web.agent / web.crawl — do NOT spend a signed-in browser session on
+  read-only lookups (they hit bot walls and burn auth sessions).
+- ONE agent per task — never list alternates like "expedia.agent |
+  skyscanner.agent". If interchangeable services could serve the same
+  deliverable, emit a <choices> block first and let the user pick, then
+  write the task with the chosen agent.
 
 AGENTS — every Task's Agents line uses ONLY names from the REGISTERED AGENTS
 catalog injected below — never invent an agent id (e.g. "doc.agent" when the
@@ -474,15 +570,20 @@ agent, or a manual step the user does themselves).
 OTHER MARKERS (optional):
   <plan_name>dot.syntax.name</plan_name> — when the user names the plan
     (e.g. history.project.plan) or you propose one and they accept.
+  <plan_desc>one-sentence summary</plan_desc> — once the plan firms up (with
+    or after <plan_status>ready</plan_status>). One sentence capturing the
+    goal, key dates/constraints, and deliverables — NOT the user's literal
+    message. Shown under the plan title as the plan's description.
   <plan_status>ready</plan_status> — when the user confirms the plan is good
     to run AND every task is concrete. Do not mark ready while asking questions.
   <plan_run/> — when the user confirms they want to EXECUTE the plan now
     ("let's do it", "run it", "go ahead", "I'm ready"). Emitting this marker
-    is what actually starts the tasks — NEVER tell the user tasks are running
-    or queued unless you emitted it in the same reply. Only emit when the
-    plan has tasks; if you're still gathering info, keep asking instead.
-    If RUN GATE says BLOCKED, a run was refused — never tell the user tasks
-    are running; state which agent needs attention instead.
+    REQUESTS the run — the app then performs a readiness check and reports
+    the result back as its own message. NEVER say tasks are "running" or
+    "queued" — say you're starting the plan check. Only emit when the plan
+    has tasks; if you're still gathering info, keep asking instead.
+    If RUN GATE says BLOCKED, a run will be refused — never tell the user
+    tasks are running; state which agent needs attention instead.
 
 REPLY TEXT — everything outside the markers is spoken/shown to the user.
 Keep it short and conversational: acknowledge, ask your one question, or
@@ -505,7 +606,7 @@ function _extractTag(text, tag) {
 // Includes 'budget:token_budget' — a provider scaffolding artifact (model
 // echoes its context-window tag inside content). Not a lane marker; stripped
 // at the backend's ThinkStripper too — this is defense-in-depth.
-const _STREAM_MARKERS = new Set(['tool', 'plan_update', 'plan_name', 'plan_status', 'tool_results', 'choices', 'budget:token_budget']);
+const _STREAM_MARKERS = new Set(['tool', 'plan_update', 'plan_name', 'plan_status', 'plan_desc', 'tool_results', 'choices', 'budget:token_budget']);
 
 class _StreamFilter {
   constructor(onEmit) { this.onEmit = onEmit; this.buf = ''; this.sink = null; this.visible = 0; }
@@ -560,6 +661,7 @@ function _stripMarkers(text) {
     .replace(/<tool>[\s\S]*?<\/tool>/g, '')
     .replace(/<plan_update>[\s\S]*?<\/plan_update>/g, '')
     .replace(/<plan_name>[\s\S]*?<\/plan_name>/g, '')
+    .replace(/<plan_desc>[\s\S]*?<\/plan_desc>/g, '')
     .replace(/<plan_status>[\s\S]*?<\/plan_status>/g, '')
     .replace(/<plan_run\s*\/?\s*>/g, '')
     .replace(/<choices>[\s\S]*?<\/choices>/g, '')
@@ -599,6 +701,9 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       ? englishText : '');
   if (inlineName && planFormat.isValidDotName(inlineName)) {
     sess.name = inlineName;
+    // planChanged is declared below — a name-only turn still must persist,
+    // so flag the write on a sticky field the writer always consults.
+    sess._nameChanged = true;
   }
 
   const sysContent = (systemPrompt || '') + PLANNING_DIRECTIVE
@@ -709,6 +814,13 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     sess.name = nameTag;
     planChanged = true;
   }
+  // <plan_desc> — generated one-liner replaces the "Plan for:" echo of the
+  // original prompt once the plan has real content to summarize.
+  const descTag = _extractTag(replyText, 'plan_desc');
+  if (descTag && sess.tasks.length) {
+    sess.description = descTag.slice(0, 300);
+    planChanged = true;
+  }
   const statusTag = _extractTag(replyText, 'plan_status');
   if (statusTag === 'ready' && sess.tasks.length) {
     sess.status = 'ready';
@@ -742,7 +854,8 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     }
   }
 
-  if (planChanged || sess.status === 'drafting') {
+  if (planChanged || sess._nameChanged || sess.status === 'drafting') {
+    sess._nameChanged = false;
     _writePlanFile(sess);
   }
   // Background: generate execution steps for tasks that lack them — user can
@@ -834,4 +947,25 @@ function clearActivePlan() {
   _activePlanId = null;
 }
 
-module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan };
+/**
+ * Re-run step generation for one task after a failure. Clears the
+ * `Steps Status` marker on disk + the live task, then re-schedules.
+ */
+function retrySteps(planId, taskNum) {
+  const sess = getPlanSession(planId);
+  if (!sess) return { ok: false, error: 'no planning session for ' + planId };
+  const task = (sess.tasks || []).find(t => t.num === taskNum);
+  if (!task) return { ok: false, error: 'no task ' + taskNum };
+  try {
+    const onDisk = fs.readFileSync(sess.filePath, 'utf8');
+    fs.writeFileSync(sess.filePath,
+      planFormat.updateTaskStepsStatus(onDisk, taskNum, null), 'utf8');
+  } catch (_) {}
+  task.steps = null;
+  task.stepsStatus = null;
+  task._stepsHash = null;
+  _scheduleStepGen(sess);
+  return { ok: true };
+}
+
+module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, retrySteps };
