@@ -375,7 +375,7 @@ async function _generateHandoffPhrase(englishText, detectedLanguage, conversatio
  */
 async function processMessage(args) {
   const startTime = Date.now();
-  const { text, language, source = 'text', speakerProfile, isResemble, thoughtContext = null, selectedText = null, planning = null } = args;
+  const { text, language, source = 'text', speakerProfile, isResemble, thoughtContext = null, selectedText = null, planning = null, onReplyChunk = null } = args;
 
   if (!text || !text.trim()) {
     return {
@@ -639,6 +639,9 @@ async function processMessage(args) {
         // Planning entered mid-conversation — the routed session's recent
         // turns give the lane the context a fragment prompt is missing.
         conversationContext: convHistory || null,
+        // Stream reply prose (translate-back replaces English output, so
+        // streaming is disabled for non-English turns).
+        onReplyChunk: wasTranslated ? null : onReplyChunk,
       });
       // Auto-entered planning (phrase guard / complexity / intent-6 LLM) —
       // surface WHY so the UI shows "moved to planning" rather than silently
@@ -774,10 +777,35 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── Main entry: process a message ────────────────────────────────────────────
+  // stream:true → SSE: data:{type:'chunk',text} events as the reply generates,
+  // then data:{type:'done',data:{result}}. Otherwise plain JSON as before.
   if (req.url === '/comms.process' && req.method === 'POST') {
     const body = await _readBody(req);
     if (!body.text) {
       return _send(res, 400, { error: 'text is required' });
+    }
+    const sse = body.stream === true;
+    if (sse) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      const emit = (obj) => {
+        try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch (_) {}
+      };
+      try {
+        const result = await processMessage({
+          ...body,
+          onReplyChunk: (t) => emit({ type: 'chunk', text: t }),
+        });
+        emit({ type: 'done', data: { ok: true, data: result } });
+      } catch (err) {
+        logger.error('[Server] processMessage error', { error: err.message, stack: err.stack });
+        emit({ type: 'done', data: { ok: false, error: err.message } });
+      }
+      res.end();
+      return;
     }
     try {
       const result = await processMessage(body);

@@ -319,6 +319,59 @@ async function askEarly(messages, opts = {}) {
 }
 
 /**
+ * Ask the backend LLM with streaming; each text chunk is passed to onChunk as
+ * it arrives. Returns { text: fullText, provider } — same shape as ask().
+ * Retry only happens while nothing visible was emitted, so painted tokens
+ * are never duplicated.
+ * @param {Array} messages
+ * @param {Object} opts    - { maxTokens, temperature, timeoutMs, taskType }
+ * @param {Function} [onChunk] - (textChunk:string) => void
+ * @returns {Promise<{ text: string, provider: string }>}
+ */
+async function askStream(messages, opts = {}, onChunk = null) {
+  const resolvedOpts = {
+    maxTokens:   opts.maxTokens   || DEFAULT_MAX_TOKENS,
+    temperature: opts.temperature !== undefined ? opts.temperature : DEFAULT_TEMPERATURE,
+    timeoutMs:   opts.timeoutMs   || DEFAULT_TIMEOUT_MS,
+    taskType:    opts.taskType    || 'conversational',
+  };
+
+  const { systemPrompt, prompt } = _extractFromMessages(messages);
+  if (!prompt) return { text: '', provider: 'none' };
+
+  const body = {
+    prompt,
+    systemPrompt: systemPrompt || undefined,
+    options: {
+      maxTokens: resolvedOpts.maxTokens,
+      temperature: resolvedOpts.temperature,
+      taskType: resolvedOpts.taskType,
+    },
+  };
+
+  let emitted = 0;
+  let result = { fullText: '', provider: 'none', complete: false };
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    result = await _streamLLM(body, resolvedOpts.timeoutMs, (chunk) => {
+      if (onChunk) {
+        try {
+          // onChunk may return the count of *visible* chars (e.g. a marker
+          // filter) — retry gating reflects what actually painted.
+          const r = onChunk(chunk);
+          emitted = typeof r === 'number' ? r : emitted + chunk.length;
+        } catch (_) {}
+      }
+    });
+    if ((result.complete && result.fullText) || emitted > 0 || attempt === MAX_ATTEMPTS) break;
+    logger.warn(`[LLM] Backend stream ${result.fullText ? 'aborted mid-generation' : 'returned no text'} — retrying after delay`, { attempt });
+    await _sleep(RETRY_DELAY_MS);
+  }
+
+  logger.info('[LLM] askStream complete', { provider: result.provider, chars: result.fullText.length, streamed: emitted });
+  return { text: result.fullText, provider: result.provider };
+}
+
+/**
  * Convenience: build messages array from a simple prompt + system prompt.
  */
 function buildMessages(userText, systemPrompt, conversationContext) {
@@ -332,4 +385,4 @@ function buildMessages(userText, systemPrompt, conversationContext) {
   return msgs;
 }
 
-module.exports = { ask, askEarly, buildMessages };
+module.exports = { ask, askEarly, askStream, buildMessages };

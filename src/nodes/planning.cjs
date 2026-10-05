@@ -28,7 +28,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const logger = require('../logger.cjs');
-const { ask } = require('../llm-providers.cjs');
+const { ask, askStream } = require('../llm-providers.cjs');
 const planFormat = require('../../../shared/plan-format.cjs');
 const { canonicalAgent } = require('../../../shared/agent-canonical.cjs');
 const skillIndex = require('../../../shared/skill-index.cjs');
@@ -429,7 +429,7 @@ exact block format for every task:
 <plan_update>
 ## Task 1 — Short title
 - **Prompt**: A self-contained instruction a single automation run can execute
-- **Agents**: service.agent | cli.agent | shell | edit.agent | none
+- **Agents**: names from REGISTERED AGENTS below | shell | edit.agent | none
 - **Depends on**: — | Task 1, Task 2
 - **Mode**: sequential | parallel
 - **Done when**: a checkable success criterion (optional)
@@ -451,6 +451,25 @@ RULES for tasks:
 - Content stored IN a service (a Doc, Sheet, event, email) is its own Task
   with that service's agent — never bury service URLs inside research or
   compile tasks; research gathers data into local files.
+
+AGENTS — every Task's Agents line uses ONLY names from the REGISTERED AGENTS
+catalog injected below — never invent an agent id (e.g. "doc.agent" when the
+registry says "google_docs.agent"). Generic surfaces — browser.agent,
+web.agent, edit.agent, shell, cli.agent — are execution lanes, not services;
+a task whose deliverable lives on a registered service names that service's
+agent.
+
+CAPABILITY GAP — if a task needs something no registered agent covers (e.g.
+"send a text", a service nobody built an agent for), use
+<tool>web.search</tool> to find candidate services (a web app URL, a CLI
+tool, an API, or an MCP server), then emit ONE structured choice block and
+wait for the user to pick:
+  <choices>{"question": "Which service should I use for X?",
+    "options": [{"label": "...", "description": "...", "url": "..."},
+                {"label": "...", "description": "...", "cliTool": "..."},
+                {"label": "None of these", "description": "..."}]}</choices>
+If nothing viable exists, say so and offer alternatives (nearest registered
+agent, or a manual step the user does themselves).
 
 OTHER MARKERS (optional):
   <plan_name>dot.syntax.name</plan_name> — when the user names the plan
@@ -477,13 +496,73 @@ function _extractTag(text, tag) {
   return m ? m[1].trim() : null;
 }
 
-function _stripMarkers(text) {
+/**
+ * Incremental marker filter for streaming: emits prose while swallowing
+ * <tool>/<plan_update>/<plan_name>/<plan_status>/<plan_run>/<tool_results>
+ * blocks — even when a tag is split across chunk boundaries. Unknown tags
+ * pass through literally.
+ */
+// Includes 'budget:token_budget' — a provider scaffolding artifact (model
+// echoes its context-window tag inside content). Not a lane marker; stripped
+// at the backend's ThinkStripper too — this is defense-in-depth.
+const _STREAM_MARKERS = new Set(['tool', 'plan_update', 'plan_name', 'plan_status', 'tool_results', 'choices', 'budget:token_budget']);
+
+class _StreamFilter {
+  constructor(onEmit) { this.onEmit = onEmit; this.buf = ''; this.sink = null; this.visible = 0; }
+  push(chunk) { this.buf += chunk; this._drain(false); return this.visible; }
+  flush() { this._drain(true); return this.visible; }
+  _emit(s) { if (s) { this.visible += s.length; if (this.onEmit) { try { this.onEmit(s); } catch (_) {} } } }
+  _drain(end) {
+    for (;;) {
+      if (this.sink) {
+        const close = this.buf.indexOf(`</${this.sink}>`);
+        if (close === -1) { if (end) this.buf = ''; return; }
+        this.buf = this.buf.slice(close + this.sink.length + 3);
+        this.sink = null;
+        continue;
+      }
+      const lt = this.buf.indexOf('<');
+      if (lt === -1) { this._emit(this.buf); this.buf = ''; return; }
+      if (lt > 0) { this._emit(this.buf.slice(0, lt)); this.buf = this.buf.slice(lt); }
+      const gt = this.buf.indexOf('>');
+      if (gt === -1) { if (end) { this._emit(this.buf); this.buf = ''; } return; }
+      const tag = this.buf.slice(1, gt).trim();
+      const m = tag.match(/^([a-z_][a-z0-9_:]*)\s*(\/)?$/i);
+      if (m && (_STREAM_MARKERS.has(m[1]) || m[1] === 'plan_run')) {
+        if (m[1] === 'plan_run' || m[2]) { this.buf = this.buf.slice(gt + 1); continue; }
+        this.sink = m[1];
+        this.buf = this.buf.slice(gt + 1);
+        continue;
+      }
+      // Orphan closing tag for a known marker — drop it silently.
+      const cm = tag.match(/^\/([a-z_][a-z0-9_:]*)$/i);
+      if (cm && (_STREAM_MARKERS.has(cm[1]) || cm[1] === 'plan_run')) {
+        this.buf = this.buf.slice(gt + 1);
+        continue;
+      }
+      // Unknown tag (or a closing tag) — emit the '<' literally and rescan.
+      this._emit('<');
+      this.buf = this.buf.slice(1);
+    }
+  }
+}
+
+// Provider scaffolding artifact — strip the pair plus orphan closers so the
+// tag never reaches display text or stored conversation history.
+function _stripMetaTags(text) {
   return String(text || '')
+    .replace(/<budget:token_budget>[\s\S]*?<\/budget:token_budget>/gi, '')
+    .replace(/<\/?budget:token_budget\s*\/?\s*>/gi, '');
+}
+
+function _stripMarkers(text) {
+  return _stripMetaTags(String(text || ''))
     .replace(/<tool>[\s\S]*?<\/tool>/g, '')
     .replace(/<plan_update>[\s\S]*?<\/plan_update>/g, '')
     .replace(/<plan_name>[\s\S]*?<\/plan_name>/g, '')
     .replace(/<plan_status>[\s\S]*?<\/plan_status>/g, '')
     .replace(/<plan_run\s*\/?\s*>/g, '')
+    .replace(/<choices>[\s\S]*?<\/choices>/g, '')
     .replace(/<tool_results>[\s\S]*?<\/tool_results>/g, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -500,9 +579,11 @@ function _stripMarkers(text) {
  * @param {string} [args.sessionId]   - conversation session this turn routed into
  * @param {Object} [args.planning]    - { active:true, planId?, name? }
  * @param {string} [args.source]      - 'voice' | 'text'
+ * @param {Function} [args.onReplyChunk] - stream callback for reply prose
+ *   (marker blocks are filtered out before chunks reach this)
  * @returns {Promise<{text, fullText, metadata}>}
  */
-async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null }) {
+async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null }) {
   const startedExplicit = planning.startedExplicit === true;
   const sess = _getOrCreateSession({
     planId: planning.planId || _sessionToPlan.get(sessionId) || (planning.active ? _activePlanId : null),
@@ -521,6 +602,8 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   }
 
   const sysContent = (systemPrompt || '') + PLANNING_DIRECTIVE
+    + `\n\nREGISTERED AGENTS (the ONLY agent names allowed in Tasks):\n`
+    + _renderAgentCatalog()
     + `\n\nCURRENT PLAN STATE (planId ${sess.planId}, file already saved — update it with <plan_update> when it changes):\n`
     + _renderPlanState(sess)
     + (sess.contextSeed
@@ -537,14 +620,16 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   let toolNotes = null;
   const MAX_TOOL_ROUNDS = 2;
 
+  const streamFilter = onReplyChunk ? new _StreamFilter(onReplyChunk) : null;
+
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
     const messages = [{ role: 'system', content: sysContent }, ...sess.history];
-    const { text } = await ask(messages, {
+    const { text } = await askStream(messages, {
       maxTokens: 1200,
       temperature: 0.4,
       timeoutMs: 30000,
       taskType: 'planning',
-    });
+    }, streamFilter ? streamFilter.push.bind(streamFilter) : null);
 
     if (!text) {
       logger.warn('[Planning] LLM returned empty', { planId: sess.planId, round });
@@ -552,22 +637,28 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       break;
     }
 
-    const toolResults = await _runTools(text);
+    // Provider scaffolding artifacts (e.g. <budget:token_budget>) must not
+    // enter stored history — the model would imitate the markup next turn.
+    const cleanText = _stripMetaTags(text);
+
+    const toolResults = await _runTools(cleanText);
     if (toolResults && round < MAX_TOOL_ROUNDS) {
       // Record the assistant's tool-call turn, then feed results back.
-      sess.history.push({ role: 'assistant', content: text });
+      sess.history.push({ role: 'assistant', content: cleanText });
       sess.history.push({ role: 'user', content: `<tool_results>\n${toolResults}\n</tool_results>` });
       toolNotes = (toolNotes ? toolNotes + '\n' : '') + toolResults;
       continue;
     }
 
-    sess.history.push({ role: 'assistant', content: text });
-    replyText = text;
+    sess.history.push({ role: 'assistant', content: cleanText });
+    replyText = cleanText;
     break;
   }
+  if (streamFilter) streamFilter.flush();
 
   // ── Apply plan mutations ────────────────────────────────────────────────────
   let planChanged = false;
+  const unknownAgents = [];
   const update = _extractTag(replyText, 'plan_update');
   if (update) {
     const newTasks = planFormat.parseTasks(update);
@@ -577,6 +668,20 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       for (const t of newTasks) {
         t.agents = (t.agents || []).map(a => canonicalAgent(a) || a);
       }
+      // Phantom-agent detection — names that match no registry entry, no
+      // generic surface, and no local agent are flagged for the check card
+      // (with a "did you mean" suggestion when one is unambiguous).
+      try {
+        const svcMap = require('../../../shared/service-map.cjs');
+        const LOCAL = new Set(['shell', 'none', 'general_knowledge', 'synthesize']);
+        for (const t of newTasks) {
+          const bad = (t.agents || []).filter(a => {
+            const n = String(a).toLowerCase();
+            return n && !LOCAL.has(n) && !skillIndex.skillExists(n) && !svcMap.isServiceAgent(a);
+          });
+          if (bad.length) unknownAgents.push(...bad.map(a => ({ taskNum: t.num, agent: a, suggested: svcMap.suggestAgent(a) || null })));
+        }
+      } catch (_) {}
       // Preserve statuses/results for tasks that survive the edit, and carry
       // generated steps over when the task's prompt didn't change.
       for (const t of newTasks) {
@@ -646,6 +751,20 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   _activePlanId = sess.planId;
   if (sessionId) _sessionToPlan.set(sessionId, sess.planId);
 
+  // <choices> — capability-gap options for the renderer QuestionCard.
+  let choices = null;
+  const choicesRaw = _extractTag(replyText, 'choices');
+  if (choicesRaw) {
+    try {
+      const parsed = JSON.parse(choicesRaw);
+      if (parsed && typeof parsed.question === 'string' && Array.isArray(parsed.options)) {
+        choices = { question: parsed.question, options: parsed.options.slice(0, 6) };
+      }
+    } catch (err) {
+      logger.warn('[Planning] Malformed <choices> block ignored', { error: err.message });
+    }
+  }
+
   const spoken = _stripMarkers(replyText)
     || (sess.tasks.length ? 'I updated the plan — take a look.' : 'Working on the plan now.');
 
@@ -662,11 +781,28 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       planStatus: sess.status,
       taskCount: sess.tasks.length,
       authRequired,
+      unknownAgents,
+      choices,
       runPlan,
       startedExplicit,
       speakable: true,
     },
   };
+}
+
+/** Real registry catalog for the directive — the anti-phantom-agent list. */
+function _renderAgentCatalog() {
+  try {
+    const { listAgentNames } = require('../../../shared/service-map.cjs');
+    const list = listAgentNames();
+    if (!list.length) return '(empty registry — use generic surfaces only)';
+    return list.map(a =>
+      `- ${a.agentId} — service:${a.service} type:${a.type}` +
+      (a.cliTool ? ` cli:${a.cliTool}` : '') +
+      (a.secrets && a.secrets.length ? ` secrets:[${a.secrets.join(', ')}]` : '')
+    ).join('\n')
+      + '\nGeneric surfaces (execution lanes, not services): browser.agent | web.agent | web.crawl | edit.agent | shell | none';
+  } catch (_) { return '(registry unavailable — use generic surfaces only)'; }
 }
 
 function _renderPlanState(sess) {
