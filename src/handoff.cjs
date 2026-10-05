@@ -83,6 +83,8 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
       ...(planMeta && planMeta.planTaskNum ? { planTaskNum: planMeta.planTaskNum } : {}),
       ...(planMeta && planMeta.planTask ? { planTask: true } : {}),
       ...(planMeta && planMeta.preflightAuthBypass?.length ? { preflightAuthBypass: planMeta.preflightAuthBypass } : {}),
+      ...(planMeta && Array.isArray(planMeta.deterministicPlan) && planMeta.deterministicPlan.length
+        ? { deterministicPlan: planMeta.deterministicPlan } : {}),
     });
     const req = http.request({
       hostname: '127.0.0.1',
@@ -114,11 +116,11 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
  * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null }) {
+async function execute({ englishPrompt, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null }) {
   // Plan-dispatched tasks carry the task's canonical agentId so the lock key
   // is the shared session (google_*.agent → google.agent), not prompt text.
   const agentId = pinnedAgentId || detectAgent(englishPrompt);
-  const planMeta = planId ? { planId, planTaskNum, planTask, preflightAuthBypass } : null;
+  const planMeta = planId ? { planId, planTaskNum, planTask, preflightAuthBypass, deterministicPlan } : null;
 
   // Create task in journal
   const taskId = createTask({
@@ -177,7 +179,8 @@ function complete(taskId, agentId, status, result, items, sessionId = null, plan
       // Re-guess the intent so the resumed task:created carries it (the guess
       // is not stored in the journal — task.intent stays 'handoff').
       const task = require('./taskJournal.cjs').getTask(nextTaskId);
-      if (task) {
+      // Skip tasks cancelled while parked (plan cancel hits every taskId).
+      if (task && task.status !== 'cancelled') {
         const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
         _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, null, guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null)
           .catch(() => {});
@@ -201,7 +204,10 @@ function remove(taskId) {
     const nextTaskId = release(task.agentId, taskId);
     if (nextTaskId) {
       const nextTask = require('./taskJournal.cjs').getTask(nextTaskId);
-      if (nextTask) {
+      // Don't resurrect a task that was cancelled while parked (e.g. plan
+      // cancel hits every dispatched taskId — a release mid-loop must not
+      // spawn the ones we just cancelled).
+      if (nextTask && nextTask.status !== 'cancelled') {
         const guessedIntent = require('./intentGuesser.cjs').guess(nextTask.prompt).guessedIntent;
         _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, null, guessedIntent, nextTask.sessionId, nextTask.userApproved === true, nextTask.thoughtContext || null, nextTask.planMeta || null)
           .catch(() => {});

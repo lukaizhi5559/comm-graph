@@ -30,6 +30,8 @@ const path = require('path');
 const logger = require('../logger.cjs');
 const { ask } = require('../llm-providers.cjs');
 const planFormat = require('../../../shared/plan-format.cjs');
+const { canonicalAgent } = require('../../../shared/agent-canonical.cjs');
+const skillIndex = require('../../../shared/skill-index.cjs');
 
 // ── Paths / services ─────────────────────────────────────────────────────────
 
@@ -40,6 +42,7 @@ function _plansDir() {
 
 const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
+const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
 const MCP_API_KEY = process.env.MCP_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
 const WS_API_KEY = process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
 
@@ -64,7 +67,7 @@ function _planFileName(planId) {
   return `${planId}.md`;
 }
 
-function _getOrCreateSession({ planId, sessionId, originalPrompt }) {
+function _getOrCreateSession({ planId, sessionId, originalPrompt, conversationContext }) {
   if (planId && _planSessions.has(planId)) return _planSessions.get(planId);
 
   // Continue from disk when the UI names a plan we haven't seen this process.
@@ -75,7 +78,15 @@ function _getOrCreateSession({ planId, sessionId, originalPrompt }) {
 
   const id = planId || _newPlanId();
   const filePath = path.join(_plansDir(), _planFileName(id));
-  const title = _deriveTitle(originalPrompt);
+  // Fragmentary entry prompts ("school and all 46") make bad titles — prefer
+  // the last substantive user turn from the conversation seed.
+  const seedUser = (conversationContext || '')
+    .split('\n').filter(l => l.startsWith('User:')).pop();
+  const titleSource =
+    (String(originalPrompt || '').split(/\s+/).filter(Boolean).length < 6 && seedUser)
+      ? seedUser.replace(/^User:\s*/, '')
+      : originalPrompt;
+  const title = _deriveTitle(titleSource);
   const sess = {
     planId: id,
     filePath,
@@ -85,6 +96,9 @@ function _getOrCreateSession({ planId, sessionId, originalPrompt }) {
     risks: [],
     sessionId: sessionId || null,
     originalPrompt: originalPrompt || '',
+    // Planning often starts mid-conversation ("…and all 46") — the routed
+    // session's recent turns give the LLM the context the fragment lacks.
+    contextSeed: conversationContext || null,
     history: [],        // [{role, content}]
     status: 'drafting',
     name: null,
@@ -174,6 +188,143 @@ function _writePlanFile(sess) {
     logger.error('[Planning] Plan write failed', { planId: sess.planId, error: err.message });
     return false;
   }
+}
+
+// ── Background step generation ───────────────────────────────────────────────
+// After each plan_update, generate each task's execution steps in the
+// background and stream them into plan.md as `**Steps**` fenced JSON. At run
+// time planRunner hands them to stategraph as _deterministicPlan, so execution
+// skips the LLM planning pass entirely — and the user can read/edit the steps
+// before pressing Run.
+
+const _stepGenInFlight = new Set(); // planIds with a gen loop running
+
+function _promptHash(prompt) {
+  const s = String(prompt || '');
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return h;
+}
+
+const _STEPGEN_PROMPT = `You are ThinkDrop's execution planner. Convert ONE task
+into a concrete step list for the skill runtime. Reply with ONLY a fenced json
+block — an array of steps, each {"skill": "...", "args": {...}, "description": "..."}.
+
+Available skills:
+- url.first.agent: {url, agentId} — open a specific service/app URL. ONLY use
+  this when the task's deliverable lives on a named service AND the URL
+  belongs to the TASK AGENTS' service (e.g. task agent google.agent →
+  docs.new, sheets.new, calendar event-edit links). NEVER open a service URL
+  (docs.new, mail.google.com, amazon.com/...) on a generic browser/web agent
+  — it hits a sign-in wall. NEVER use it to "store" research output.
+- dom.act: {goal, agentId} — interact with the open page by intent ("set the
+  title to X", "click Save"). ANY step taking an agentId arg must carry the
+  exact TASK AGENTS value — never invent another agent id.
+- turn.loop.agent: {goal, agentId} — multi-step interactive browsing on PUBLIC
+  sites (login-free pages only).
+- web.agent: {query, agentId} — PRIMARY research tool: open-web
+  search/extraction, no sign-in. Use it to gather data, lists, facts, URLs.
+- browser.agent / web.crawl: browse/crawl public pages by goal (no sign-in).
+- synthesize: {} — final summary step (always last).
+- shell.run: {command} — local shell command.
+- fs.read: {path} — read a local file (writes go through edit.agent/shell.run).
+- edit.agent: {goal} — edit project files.
+- cli.agent: {tool, args} — a configured CLI.
+
+Rules: 2-8 steps. Deterministic, self-contained, ordered. Research/compile
+tasks gather via web.agent/web.crawl and write results to LOCAL files
+(edit.agent/shell.run) — a service (Doc/Sheet/email) only appears when the
+user named it as the deliverable. No commentary — ONLY the json fence.`;
+
+async function _generateTaskSteps(task) {
+  const agents = (task.agents || []).join(' | ') || 'auto';
+  const userMsg =
+    `TASK AGENTS: ${agents}\n` +
+    `TASK PROMPT: ${task.prompt || task.title}\n` +
+    (task.doneWhen ? `DONE WHEN: ${task.doneWhen}\n` : '') +
+    `\nEmit the step list now.`;
+  try {
+    const { text } = await ask([
+      { role: 'system', content: _STEPGEN_PROMPT },
+      { role: 'user', content: userMsg },
+    ], { maxTokens: 900, temperature: 0.2, timeoutMs: 45000, taskType: 'planning' });
+    const m = String(text || '').match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+    const steps = m ? JSON.parse(m[1].trim()) : null;
+    if (!Array.isArray(steps) || !steps.length) return null;
+    const valid = steps.every(s => s && typeof s.skill === 'string' && s.skill);
+    if (!valid) return null;
+    // One normalization rule shared with planRunner's dispatch path:
+    // url steps → owning service agent; session-bound steps → task's lane.
+    const norm = require('../../../shared/plan-steps.cjs')
+      .normalizeTaskSteps({ ...task, steps });
+    task._normalized = norm; // {steps, agents, services} — consumed by _scheduleStepGen
+    return norm.steps;
+  } catch (err) {
+    logger.warn('[Planning] Step generation failed', { taskNum: task.num, error: err.message });
+    return null;
+  }
+}
+
+function _notifyPlanUpdated(planId) {
+  _postJson(MAIN_PORT, '/plan.updated', { planId }, '', 3000);
+}
+
+function _scheduleStepGen(sess) {
+  if (!sess.tasks.length || _stepGenInFlight.has(sess.planId)) return;
+  _stepGenInFlight.add(sess.planId);
+  setImmediate(async () => {
+    try {
+      for (const task of sess.tasks) {
+        if (Array.isArray(task.steps) && task.steps.length
+            && task._stepsHash === _promptHash(task.prompt)) continue;
+        const promptAtGen = task.prompt;
+        const steps = await _generateTaskSteps(task);
+        if (!steps) continue;
+        // Patch the file IN PLACE — the user may have edited other fields (or
+        // this task's prompt) while generation ran. Only write when the
+        // on-disk prompt still matches what we generated for.
+        try {
+          const onDisk = fs.readFileSync(sess.filePath, 'utf8');
+          const diskTask = planFormat.parseTasks(onDisk).find(t => t.num === task.num);
+          if (diskTask && diskTask.prompt === promptAtGen) {
+            const norm = task._normalized;
+            let next = planFormat.updateTaskSteps(onDisk, task.num, steps);
+            // Steps that resolved to a registry service agent (url → docs.new
+            // → google.agent) upgrade the task's Agents line so the run lock
+            // covers the signed-in session, and re-assess auth so a real
+            // sign-in need is named at plan time — not discovered at run.
+            if (norm && norm.services.length) {
+              next = planFormat.updateTaskAgents(next, task.num, norm.agents);
+              try {
+                const { assessAgent } = require('../planPreflight.cjs');
+                let worst = diskTask.auth;
+                const rank = { 'none-required': 0, authed: 1, bypassed: 1, unknown: 2, 'needs sign-in': 3 };
+                for (const svc of norm.services) {
+                  const a = assessAgent(svc).auth;
+                  if ((rank[a] ?? 2) > (rank[worst] ?? 2)) worst = a;
+                }
+                if (worst !== diskTask.auth) next = planFormat.updateTaskAuth(next, task.num, worst);
+                const live0 = sess.tasks.find(t => t.num === task.num);
+                if (live0) { live0.agents = norm.agents; live0.auth = worst; }
+              } catch (_) {}
+            }
+            fs.writeFileSync(sess.filePath, next, 'utf8');
+            const live = sess.tasks.find(t => t.num === task.num);
+            if (live && live.prompt === promptAtGen) {
+              live.steps = steps;
+              live._stepsHash = _promptHash(promptAtGen);
+            }
+            _notifyPlanUpdated(sess.planId);
+            logger.info('[Planning] Steps generated', { planId: sess.planId, taskNum: task.num, count: steps.length });
+          }
+        } catch (err) {
+          logger.warn('[Planning] Step write-back failed', { planId: sess.planId, taskNum: task.num, error: err.message });
+        }
+      }
+    } finally {
+      _stepGenInFlight.delete(sess.planId);
+    }
+  });
 }
 
 // ── HTTP tool calls ───────────────────────────────────────────────────────────
@@ -295,6 +446,9 @@ RULES for tasks:
   Depends on and phrase it as "the result of the previous step".
 - Mode: parallel only for tasks with NO dependency and different services.
 - Keep task count honest — do not split trivially.
+- Content stored IN a service (a Doc, Sheet, event, email) is its own Task
+  with that service's agent — never bury service URLs inside research or
+  compile tasks; research gathers data into local files.
 
 OTHER MARKERS (optional):
   <plan_name>dot.syntax.name</plan_name> — when the user names the plan
@@ -306,6 +460,8 @@ OTHER MARKERS (optional):
     is what actually starts the tasks — NEVER tell the user tasks are running
     or queued unless you emitted it in the same reply. Only emit when the
     plan has tasks; if you're still gathering info, keep asking instead.
+    If RUN GATE says BLOCKED, a run was refused — never tell the user tasks
+    are running; state which agent needs attention instead.
 
 REPLY TEXT — everything outside the markers is spoken/shown to the user.
 Keep it short and conversational: acknowledge, ask your one question, or
@@ -344,12 +500,13 @@ function _stripMarkers(text) {
  * @param {string} [args.source]      - 'voice' | 'text'
  * @returns {Promise<{text, fullText, metadata}>}
  */
-async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text' }) {
+async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null }) {
   const startedExplicit = planning.startedExplicit === true;
   const sess = _getOrCreateSession({
     planId: planning.planId || _sessionToPlan.get(sessionId) || (planning.active ? _activePlanId : null),
     sessionId,
     originalPrompt: englishText,
+    conversationContext,
   });
   if (!sess.originalPrompt) sess.originalPrompt = englishText;
 
@@ -363,7 +520,10 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
 
   const sysContent = (systemPrompt || '') + PLANNING_DIRECTIVE
     + `\n\nCURRENT PLAN STATE (planId ${sess.planId}, file already saved — update it with <plan_update> when it changes):\n`
-    + _renderPlanState(sess);
+    + _renderPlanState(sess)
+    + (sess.contextSeed
+      ? `\n\nPRIOR CONVERSATION (context only — planning started mid-conversation; the user's latest message may refer to this):\n${sess.contextSeed}`
+      : '');
 
   // Seed the conversation: planning turns are their own thread — the caller's
   // general conversation context is intentionally NOT mixed in so the draft
@@ -410,12 +570,22 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   if (update) {
     const newTasks = planFormat.parseTasks(update);
     if (newTasks.length) {
-      // Preserve statuses/results for tasks that survive the edit.
+      // Canonicalize service aliases in the file itself — google_docs.agent →
+      // google.agent so preflight and the run lock share one identity.
+      for (const t of newTasks) {
+        t.agents = (t.agents || []).map(a => canonicalAgent(a) || a);
+      }
+      // Preserve statuses/results for tasks that survive the edit, and carry
+      // generated steps over when the task's prompt didn't change.
       for (const t of newTasks) {
         const prev = sess.tasks.find(p => p.num === t.num);
         if (prev && (prev.status !== planFormat.TASK_STATUS.PENDING || prev.result)) {
           t.status = prev.status;
           t.result = prev.result;
+        }
+        if (prev && prev.steps && prev.prompt === t.prompt) {
+          t.steps = prev.steps;
+          t._stepsHash = prev._stepsHash;
         }
       }
       sess.tasks = newTasks;
@@ -468,6 +638,9 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   if (planChanged || sess.status === 'drafting') {
     _writePlanFile(sess);
   }
+  // Background: generate execution steps for tasks that lack them — user can
+  // keep chatting/editing while steps stream into the plan file.
+  _scheduleStepGen(sess);
   _activePlanId = sess.planId;
   if (sessionId) _sessionToPlan.set(sessionId, sess.planId);
 
@@ -499,6 +672,14 @@ function _renderPlanState(sess) {
   const lines = sess.tasks.map(t =>
     `Task ${t.num} — ${t.title} | mode=${t.mode} | deps=[${t.dependsOn.join(',') || 'none'}] | auth=${t.auth} | status=${t.status}`);
   if (sess.risks.length) lines.push('Risks: ' + sess.risks.join('; '));
+  // Show the gate truth so the LLM never claims execution while blocked.
+  try {
+    const { assessRunGate } = require('../planPreflight.cjs');
+    const gate = assessRunGate(sess.tasks);
+    lines.push(gate.ok
+      ? 'RUN GATE: ready — all tasks clear to execute'
+      : `RUN GATE: BLOCKED — needs resolution: ${gate.blockers.map(b => `${b.agentId} (${b.state}, task ${b.taskNum})`).join(', ')}. Do NOT claim tasks are running; tell the user what is needed to unblock.`);
+  } catch (_) {}
   return lines.join('\n');
 }
 

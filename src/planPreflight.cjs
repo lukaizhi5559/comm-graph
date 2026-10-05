@@ -24,12 +24,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const logger = require('./logger.cjs');
+const skillIndex = require('../../shared/skill-index.cjs');
 
-// Agents that never need web sign-in — local execution surfaces.
+// Non-file names that never need web sign-in. Skill-file coverage is
+// automatic — every command-service skill (browser.agent, web.agent,
+// tab.map.agent, just.type.agent, …) is a generic execution surface.
 const LOCAL_AGENTS = new Set([
-  'shell', 'shell.run', 'cli.agent', 'edit.agent', 'app.agent',
-  'screen.agent', 'fs.read', 'fs.write', 'dom.act', 'browser.act',
-  'none', 'general_knowledge',
+  'shell', 'none', 'general_knowledge', 'synthesize',
 ]);
 
 function _authCacheFile() {
@@ -58,7 +59,9 @@ function _loadLedger() {
 function _canonAgent(agentId) {
   if (!agentId) return '';
   let a = String(agentId).trim().toLowerCase().replace(/\s+/g, '.');
-  if (!a.endsWith('.agent') && !LOCAL_AGENTS.has(a)) a += '.agent';
+  // Skill names that don't end in .agent (shell.run, fs.read, web.crawl, …)
+  // are already canonical — don't suffix them into phantom ids.
+  if (!a.endsWith('.agent') && !LOCAL_AGENTS.has(a) && !skillIndex.skillExists(a)) a += '.agent';
   return a;
 }
 
@@ -71,6 +74,10 @@ function assessAgent(agentId, bypassed = new Set()) {
   const a = _canonAgent(agentId);
   if (!a || a === 'none') return { agent: a, auth: 'none-required' };
   if (LOCAL_AGENTS.has(a)) return { agent: a, auth: 'none-required' };
+  // Generic execution surface — a command-service skill file. These never
+  // authenticate (browser_agent/web_agent are open-web profiles); per-site
+  // auth belongs to the registry service agents, which have no skill files.
+  if (skillIndex.skillExists(a)) return { agent: a, auth: 'none-required' };
   if (bypassed.has(a)) return { agent: a, auth: 'bypassed' };
 
   const entry = _loadLedger()[a] || _loadLedger()[a.replace(/\.agent$/, '')] || null;

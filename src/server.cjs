@@ -636,6 +636,9 @@ async function processMessage(args) {
           startedExplicit: planning?.startedExplicit === true || classifySource === 'planning_pinned',
         },
         source,
+        // Planning entered mid-conversation — the routed session's recent
+        // turns give the lane the context a fragment prompt is missing.
+        conversationContext: convHistory || null,
       });
       // Auto-entered planning (phrase guard / complexity / intent-6 LLM) —
       // surface WHY so the UI shows "moved to planning" rather than silently
@@ -809,6 +812,9 @@ const server = http.createServer(async (req, res) => {
         planTaskNum: body.planTaskNum || null,
         planTask: body.planTask === true,
         preflightAuthBypass: body.preflightAuthBypass || null,
+        // Pre-generated task steps — stategraph adopts them as
+        // _deterministicPlan and skips the LLM planning pass.
+        deterministicPlan: Array.isArray(body.deterministicPlan) ? body.deterministicPlan : null,
         // Plan-runner pins the canonical agent — lock key = shared session.
         agentId: body.agentId || null,
       });
@@ -885,17 +891,24 @@ const server = http.createServer(async (req, res) => {
   // ── Task cancel (from main.js) — mark task as cancelled in journal ───────────────
   if (req.url === '/comms.cancel' && req.method === 'POST') {
     const body = await _readBody(req);
-    if (!body.taskId) {
-      return _send(res, 400, { error: 'taskId is required' });
+    if (!body.taskId && !body.planId) {
+      return _send(res, 400, { error: 'taskId or planId is required' });
     }
-    const task = taskJournal.getTask(body.taskId);
-    if (!task) {
-      return _send(res, 404, { ok: false, error: 'task not found' });
+    // Plan-scoped cancel: mark EVERY task in the plan cancelled first, THEN
+    // remove each — removes can resume a parked sibling on lock release, and
+    // the resume path skips tasks already marked cancelled.
+    const taskIds = body.planId
+      ? taskJournal.getAllTasks()
+          .filter((t) => t.planMeta && t.planMeta.planId === body.planId)
+          .map((t) => t.id)
+      : [body.taskId];
+    for (const id of taskIds) {
+      taskJournal.updateTask(id, 'cancelled', { error: 'cancelled by user' });
     }
-    // Release agent lock if held, then mark cancelled
-    try { handoffRemove(body.taskId); } catch (_) {}
-    taskJournal.updateTask(body.taskId, 'cancelled', { error: 'cancelled by user' });
-    return _send(res, 200, { ok: true });
+    for (const id of taskIds) {
+      try { handoffRemove(id); } catch (_) {}
+    }
+    return _send(res, 200, { ok: true, cancelled: taskIds.length });
   }
 
   // ── 404 ────────────────────────────────────────────────────────────────────────
