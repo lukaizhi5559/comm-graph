@@ -45,7 +45,7 @@ const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
 const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
 const MCP_API_KEY = process.env.MCP_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
-const WS_API_KEY = process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
+const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
 
 // ── Plan session state ────────────────────────────────────────────────────────
 // In-memory index of plan drafting sessions. The plan.md file is the source of
@@ -456,19 +456,37 @@ async function _toolWebSearch(query) {
     requestId: 'cg_plan_ws_' + Date.now(),
     context: { userId: 'local_user' },
   }, WS_API_KEY, 8000);
+  if (res?.status === 'error' || res?.error) {
+    return `web.search failed: ${res?.error?.code || res?.error?.message || res?.message || 'unknown error'}`;
+  }
   const data = res?.data || res;
   const results = data?.results || data?.organic || [];
-  if (!Array.isArray(results) || !results.length) return 'No web results found.';
+  if (!Array.isArray(results) || !results.length) {
+    return `No web results found.${data?.fallbackReason ? ` (${data.fallbackReason})` : ''}`;
+  }
+  // URLs are first-class — the LLM can only offer links it was actually shown.
   return results.slice(0, 5)
-    .map(r => `- ${r.title || ''}: ${r.snippet || r.description || ''}`.trim())
+    .map(r => `- ${r.title || ''}\n  ${r.url || r.link || ''}\n  ${r.snippet || r.description || ''}`.trim())
     .filter(s => s.length > 2)
     .join('\n');
 }
 
-const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|capability\.search|capability\.probe|capability\.select)\s*\(\s*"([^"]+)"\s*\)\s*<\/tool>/g;
+const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|capability\.search|capability\.probe|capability\.select)\s*\(\s*"([^"]+)"\s*\)\s*<\/tool>/g;
 
 const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const COMMAND_API_KEY = process.env.MCP_COMMAND_API_KEY || process.env.MCP_API_KEY || '';
+
+async function _toolMediaResolve(query) {
+  const res = await _postJson(COMMAND_SERVICE_PORT, '/media.resolve', {
+    query,
+  }, COMMAND_API_KEY, 20000);
+  if (res?.ok === false) return `media.resolve failed: ${res.error || 'unknown'}`;
+  const results = res?.results || res?.data?.results || [];
+  if (!Array.isArray(results) || !results.length) return 'No media results found.';
+  return results.slice(0, 3)
+    .map(r => `- ${r.title || ''}\n  ${r.url || ''}`)
+    .join('\n');
+}
 
 async function _toolCapabilitySearch(query) {
   const res = await _postJson(COMMAND_SERVICE_PORT, '/capability.search', {
@@ -523,6 +541,7 @@ async function _runTools(text) {
     let out;
     if (call.tool === 'memory.search') out = await _toolMemorySearch(call.query);
     else if (call.tool === 'web.search') out = await _toolWebSearch(call.query);
+    else if (call.tool === 'media.resolve') out = await _toolMediaResolve(call.query);
     else if (call.tool === 'capability.search') out = await _toolCapabilitySearch(call.query);
     else if (call.tool === 'capability.probe') out = await _toolCapabilityProbe(call.query);
     else out = await _toolCapabilitySelect(call.query);
@@ -544,7 +563,12 @@ needed to make the plan correct, and (2) maintain the plan's Task list.
 
 TOOLS — when you need facts about the user or the world, emit ONE of:
   <tool>memory.search("query")</tool>       — the user's stored facts/preferences
-  <tool>web.search("query")</tool>          — live web research
+  <tool>web.search("query")</tool>          — live web research (results include URLs)
+  <tool>media.resolve("name")</tool>        — find a playable video/song by name via
+                                            YouTube search (yt-dlp). Returns real
+                                            watch URLs catt can cast. Prefer this
+                                            over web.search for "find X and cast/
+                                            play it" requests — it can't 404.
   <tool>capability.search("query")</tool>   — what can accomplish this: registered
                                             agents, CLIs, APIs, MCP servers, and
                                             built-in tools, ranked easiest-to-
@@ -652,6 +676,14 @@ directly in the Agents line. If it is a new CLI/API/MCP/local tool, emit
 draft agent descriptor and returns the agentId your Agents line must use.
 If nothing viable exists, say so and offer alternatives (nearest registered
 agent, or a manual step the user does themselves).
+
+NEVER FAKE A RESULT — do not claim you searched, found, downloaded, or sent
+anything unless a <tool_results> entry in this conversation actually contains
+it. If the task needs a URL/link/file path, quote the exact URL from the tool
+result inside the Task's Prompt — a task that says "the video found earlier"
+will fail because the run can't see this conversation. If a tool returns an
+error or empty results, try media.resolve or a different query before asking
+the user.
 
 CAPABILITY FIT — when the user names a target but not a clear action ("connect
 to my chromecast", "use the scanner", "talk to my printer"), or when a chosen
