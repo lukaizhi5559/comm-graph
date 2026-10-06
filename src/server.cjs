@@ -72,6 +72,35 @@ function _notifyThoughtEngine(type, info) {
   } catch (_) {}
 }
 
+// ── Capability-gap guard ──────────────────────────────────────────────────────
+// Cheap read-only call into command-service /capability.search. Decides whether
+// a handoff-bound prompt should pin a ready agent or divert to planning.
+const COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
+const SETUP_PHRASE_RE = /\b(connect|set ?up|link|sync|install|pair|integrate)\b[^.\n]{0,60}\b(to|with|my)\b/i;
+const AMBIGUOUS_CAST_RE = /\b(cast|mirror|stream)\b[^.\n]{0,40}\b(app|screen|window|desktop)\b/i;
+
+async function _capabilityGate(text) {
+  try {
+    // "cast/mirror <app|screen>" is ambiguous (media-cast vs window-mirror) —
+    // always clarify in planning even when a cast agent exists.
+    if (AMBIGUOUS_CAST_RE.test(text)) return { planning: 'capability_gap' };
+    const res = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: text, limit: 5 }),
+      signal: AbortSignal.timeout(2000),
+    });
+    const hits = (await res.json())?.results || [];
+    const ready = hits.find(h => /\.agent$/.test(h.id) && h.installed && h.friction <= 1);
+    if (ready) return { pin: ready.id };
+    if (hits.length) return { planning: 'capability_needs_setup' };
+    if (SETUP_PHRASE_RE.test(text)) return { planning: 'capability_gap' };
+    return null;
+  } catch (_) {
+    return null; // fail-open — never block a prompt on the gate
+  }
+}
+
 // ── HTTP helpers ────────────────────────────────────────────────────────────────
 function _readBody(req) {
   return new Promise((resolve) => {
@@ -491,6 +520,25 @@ async function processMessage(args) {
     intentName = 'handoff';
   }
 
+  // ── Capability-gap guard ──────────────────────────────────────────────────
+  // Before handing a prompt to the stategraph, consult the capability index:
+  // a ready registered agent gets pinned (deterministic resolution, skips the
+  // LLM picker); a goal whose capabilities all need setup — or a setup-flavored
+  // prompt with no match — routes to the planning lane so the user clarifies
+  // and approves setup BEFORE anything executes.
+  let _capPin = null;
+  if (intent === 0) {
+    const gate = await _capabilityGate(classifyText);
+    if (gate?.planning) {
+      logger.info('[Process] capability-gap → planning lane', { reason: gate.planning });
+      intent = 6; intentName = 'planning'; confidence = 0.9;
+      classifySource = 'capability_gap';
+    } else if (gate?.pin) {
+      logger.info('[Process] capability pin', { agentId: gate.pin });
+      _capPin = gate.pin;
+    }
+  }
+
   logger.info('[Process] Classified', {
     intent, intentName, confidence, classifySource,
   });
@@ -523,6 +571,7 @@ async function processMessage(args) {
         guessedIntent: _gi0,
         sessionId: routedSessionId,
         thoughtContext,
+        agentId: _capPin || undefined,
       });
 
       // Generate intent-aware handoff phrase (LLM for command_automate, static pool for others)
