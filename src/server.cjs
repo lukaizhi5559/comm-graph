@@ -47,6 +47,7 @@ const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const { execute: handoff, complete: handoffComplete, remove: handoffRemove } = require('./handoff.cjs');
 const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
 const intentGuesser = require('./intentGuesser.cjs');
+const { REFERENTIAL_RE, ACTION_VERB_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE } = require('../../shared/text-patterns.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
 
@@ -90,18 +91,83 @@ function _loadVerbFit() {
   return _verbFit;
 }
 
+const MEMORY_PORT = parseInt(process.env.USER_MEMORY_PORT || '3001', 10);
+const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.MCP_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
+
+// Same predicate ResolveReferencesV2 uses to decide a prompt needs ambient
+// screen context — the shared textPatterns keep gate and stategraph in sync.
+// ("this on my screen to send" = referential + artifact + action verb.)
+function _needsAmbientCtx(text) {
+  const t = text || '';
+  return (REFERENTIAL_RE.test(t) && AMBIENT_ARTIFACT_RE.test(t) && ACTION_VERB_RE.test(t))
+      || SCREEN_OBSERVATION_RE.test(t);
+}
+
+// Read-only screen context for the gate: recent OCR capture + active app.
+// Bounded (1.5s each) and fail-open — worst case we enrich nothing.
+async function _memoryCall(action, payload = {}) {
+  const res = await fetch(`http://127.0.0.1:${MEMORY_PORT}/${action}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(MEM_API_KEY ? { Authorization: `Bearer ${MEM_API_KEY}` } : {}),
+    },
+    body: JSON.stringify({
+      version: 'mcp.v1', service: 'user-memory', action,
+      payload, requestId: `cg_gate_${Date.now()}`,
+      context: { userId: 'local_user' },
+    }),
+    signal: AbortSignal.timeout(1500),
+  });
+  const d = await res.json();
+  return d?.data || d;
+}
+
+async function _screenContext() {
+  const [ocr, app] = await Promise.all([
+    _memoryCall('memory.getRecentOcr', { maxAgeSeconds: 300 }).catch(() => null),
+    _memoryCall('memory.getActiveAppContext', {}).catch(() => null),
+  ]);
+  const capture = ocr?.capture || null;
+  const a = app?.app || {};
+  const url = a.url || capture?.url || null;
+  let host = null;
+  try { host = url ? new URL(url).hostname.replace(/^www\./, '') : null; } catch (_) {}
+  const appName = a.appName || capture?.appName || null;
+  const title = a.windowTitle || capture?.windowTitle || null;
+  const ocrText = (capture?.text || '').replace(/\s+/g, ' ').slice(0, 300);
+  if (!appName && !host && !ocrText) return null;
+  return { appName, host, title, url, ocrText };
+}
+
 async function _capabilityGate(text) {
   try {
     // "cast/mirror <app|screen|overlay>" is ambiguous (media-cast vs window
     // mirroring) — always clarify in planning even when a cast agent exists.
     if (AMBIGUOUS_CAST_RE.test(text)) return { planning: 'capability_gap' };
+
+    // Screen-referring prompts ("use this on my screen to…") resolve their
+    // target from live screen context — OCR text + active app — so the gate
+    // sees "nylas" rather than just "this". Additive enrichment only.
+    let query = text;
+    let screenCtx = null;
+    if (_needsAmbientCtx(text)) {
+      screenCtx = await _screenContext().catch(() => null);
+      if (screenCtx) {
+        query = `${text} ${[screenCtx.appName, screenCtx.host, screenCtx.title].filter(Boolean).join(' ')}`;
+      }
+    }
+
     const res = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.search`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: text, limit: 5 }),
+      body: JSON.stringify({ query, limit: 5 }),
       signal: AbortSignal.timeout(2000),
     });
-    const hits = (await res.json())?.results || [];
+    // Weak single-token noise (score 1) isn't evidence — e.g. "set calendar
+    // event" substring-matching catt's set_volume. Require a distinctive
+    // match (≥2) for a hit to pin or count.
+    const hits = ((await res.json())?.results || []).filter(h => (h.matchScore || 0) >= 2);
     const ready = hits.find(h => /\.agent$/.test(h.id) && h.installed && h.friction <= 1);
     if (ready) {
       // Specific action that maps to the tool's capabilities → pin and run.
@@ -121,7 +187,7 @@ async function _capabilityGate(text) {
     const inf = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.infer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: text }),
+      body: JSON.stringify({ query, screenText: screenCtx?.ocrText || null }),
       signal: AbortSignal.timeout(25000),
     }).then(r => r.json()).catch(() => null);
     const inferred = inf?.candidates || [];

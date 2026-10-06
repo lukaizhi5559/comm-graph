@@ -44,7 +44,7 @@ function _plansDir() {
 const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
 const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
-const MCP_API_KEY = process.env.MCP_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
+const MCP_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.MCP_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
 const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
 
 // ── Plan session state ────────────────────────────────────────────────────────
