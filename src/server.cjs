@@ -526,6 +526,7 @@ async function processMessage(args) {
   // QA. Skip classify + the context-blind guards entirely; generalQuick's
   // 0-sentinel self-corrects to shouldHandoff when tools are genuinely needed.
   let intent, intentName, confidence, classifySource;
+  let _openPlan = null, _resumePlanId = null;
   if (planning && planning.active === true) {
     // Planning mode pinned by the UI (toggle / continue-plan) — bypass the
     // classifier entirely so "yes", edits, and questions stay in the lane.
@@ -539,8 +540,12 @@ async function processMessage(args) {
     confidence = 0.9;
     classifySource = 'selection_fastlane';
   } else {
-    ({ intent, intentName, confidence, source: classifySource } =
-      await classify(classifyText, context, { hasSelectionContext }));
+    // Open-plan fact for the classifier — deterministic resume guard + a
+    // "paused plan exists" line in the classify prompt so continuation
+    // phrasings route semantically, not just on regex hits.
+    _openPlan = planningNode.findOpenPlan(routedSessionId);
+    ({ intent, intentName, confidence, source: classifySource, resumePlanId: _resumePlanId } =
+      await classify(classifyText, context, { hasSelectionContext, openPlan: _openPlan }));
   }
 
   // ── Proactive-card reply → always handoff ────────────────────────────────────
@@ -734,7 +739,11 @@ async function processMessage(args) {
         sessionId: routedSessionId,
         planning: {
           active: true,
-          planId: planning?.planId || null,
+          // planId precedence: explicit UI pin → resume-guard hit → open plan
+          // (skipped for fresh-draft requests so "plan a party" doesn't
+          // inherit an unrelated paused plan).
+          planId: planning?.planId || _resumePlanId
+            || (classifySource === 'planning_phrase_guard' ? null : (_openPlan ? _openPlan.planId : null)),
           name: planning?.name || null,
           startedExplicit: planning?.startedExplicit === true || classifySource === 'planning_pinned',
         },

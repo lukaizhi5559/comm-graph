@@ -51,7 +51,7 @@ const CLASSIFY_PROMPT_TEMPLATE = _loadClassifyPrompt();
 /**
  * Build the force-classification prompt for a given English user message.
  */
-function _buildClassifyMessages(englishText, conversationContext) {
+function _buildClassifyMessages(englishText, conversationContext, openPlan) {
   const intentList = Object.entries(INTENTS)
     .map(([num, info]) => `${num} - ${info.name}: ${info.description}`)
     .join('\n');
@@ -64,9 +64,13 @@ ${intentList}
 
 Return ONLY a single number (${_intentListStr}). No words, no explanation, no punctuation — just the number.`;
 
+  const openPlanLine = openPlan
+    ? `\n\nOpen plan: "${openPlan.title}" is paused — ${openPlan.pendingCount} of ${openPlan.totalTasks} tasks still undone (${openPlan.taskTitles.join('; ')}). If this message continues that plan or asks about it, return 6.`
+    : '';
+
   const userContent = conversationContext
-    ? `Conversation context (last 3 turns):\n${conversationContext}\n\nCurrent message: ${englishText}`
-    : `Message: ${englishText}`;
+    ? `Conversation context (last 3 turns):\n${conversationContext}${openPlanLine}\n\nCurrent message: ${englishText}`
+    : `Message: ${englishText}${openPlanLine}`;
 
   return [
     { role: 'system', content: systemPrompt },
@@ -124,6 +128,26 @@ function _lastAssistantTurn(conversationContext) {
 // lane deterministically (the LLM slips these to general_quick or handoff).
 const PLANNING_PHRASE_RE = /\b(?:let'?s|lets|help me|i want to|i need to|we need to|can we|wanna)\s+(?:make|create|build|come up with|work out|draft|do|start)\s+(?:a\s+|an\s+|the\s+|some\s+|up\s+a\s+)?plan\b|\bcome up with a plan\b|\bplan (?:out|for|to)\b|\bmake a plan\b|\bcreate a plan\b|\bdraft a plan\b|\bplanning mode\b|\bbrainstorm\b|\bwork out a plan\b|\bplanning session\b/i;
 
+// Plan-resume vocabulary — fires only when an open (paused) plan exists, so
+// the false-positive surface is bounded. Approval words are deliberately
+// absent: prompt-queue's _tryResolvePendingApproval consumes them upstream.
+const PLAN_RESUME_RE = /\bcontinue\b|\bresume\b|\bkeep going\b|\bcarry on\b|\bpick up where we left off\b|\bwhere were we\b|\bwhat happened with (?:the|that|my) (?:plan|setup|install)\b|\bfinish (?:the|that) (?:plan|setup|install)\b|\bhow'?s the (?:plan|setup|install) (?:going|doing)\b|\bdid (?:the|that|it) (?:plan|setup|install|task) (?:finish|work|succeed|complete|go through)\b|\bdo(?:n'?t| not) i have a plan\b|\bi have a plan\b|\bthe plan\b.*\b(?:continue|finish|done|status|going|working)\b/i;
+
+// "is <thing> installed / done / set up" — anchored when <thing> names a task
+// in the open plan, or the referent is bare "it"/"the plan".
+const _INSTALL_PROBE_RE = /\b(?:is|was|did)\s+(?:the\s+plan|it|that|([a-z0-9@._-]+))\s+(installed|set up|done|finished|working|running|complete|still going)\b/i;
+
+function _isPlanResume(englishText, openPlan) {
+  const t = String(englishText || '');
+  if (PLAN_RESUME_RE.test(t)) return true;
+  const m = t.match(_INSTALL_PROBE_RE);
+  if (!m) return false;
+  const entity = (m[1] || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!entity) return true; // bare "it"/"the plan" — referent is the open plan
+  const haystack = `${openPlan.title || ''} ${(openPlan.taskTitles || []).join(' ')}`.toLowerCase();
+  return haystack.includes(entity);
+}
+
 // Multi-deliverable complexity scorer — catches prompts that never SAY "plan"
 // but describe several services × several actions (the "Doc + Calendar +
 // Sheet" case). Counts distinct service signals and distinct action verbs;
@@ -171,6 +195,7 @@ async function classify(englishText, conversationContext, opts = {}) {
     return { intent: 1, intentName: 'general_quick', confidence: 0.5, source: 'empty_input' };
   }
   const hasSelectionContext = !!opts.hasSelectionContext;
+  const openPlan = opts.openPlan || null;
 
   // Explicit planning request — deterministic, runs before every other guard.
   // ("plan" inside a bigger automation prompt like "follow this plan" is NOT
@@ -180,6 +205,20 @@ async function classify(englishText, conversationContext, opts = {}) {
       inputPreview: englishText.substring(0, 60),
     });
     return { intent: 6, intentName: 'planning', confidence: 0.95, source: 'planning_phrase_guard' };
+  }
+
+  // Plan-resume guard — an open (paused) plan exists and the message uses
+  // continuation vocabulary or probes the plan's state. The LLM classifier
+  // can't see plan state and picks status_check / memory_retrieve; the
+  // planning lane resolves planId via _sessionToPlan and answers from the
+  // plan file (or emits <plan_run/>). Approval words are excluded — they're
+  // consumed by _tryResolvePendingApproval upstream.
+  if (openPlan && _isPlanResume(englishText, openPlan)) {
+    logger.info('[Classify] Plan-resume guard → planning', {
+      inputPreview: englishText.substring(0, 60),
+      planId: openPlan.planId,
+    });
+    return { intent: 6, intentName: 'planning', confidence: 0.9, source: 'plan_resume_guard', resumePlanId: openPlan.planId };
   }
 
   const normalized = englishText.toLowerCase().trim()
@@ -327,7 +366,7 @@ async function classify(englishText, conversationContext, opts = {}) {
   // ── Try force-prompt classification (primary) ────────────────────────────────
   // One retry on unparseable responses — a flaky provider echoing the system
   // prompt back is transient; the backend rotates providers between calls.
-  const messages = _buildClassifyMessages(englishText, conversationContext);
+  const messages = _buildClassifyMessages(englishText, conversationContext, opts.openPlan);
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const { text, provider } = await ask(messages, {

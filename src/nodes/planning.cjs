@@ -1112,6 +1112,66 @@ function _renderPlanState(sess) {
 
 function getActivePlanId() { return _activePlanId; }
 
+/**
+ * Find the most relevant open plan for continuation prompts — a non-terminal
+ * task plan with at least one incomplete task. Resolution order:
+ * this session's plan → most recently touched plan → newest open plan on disk.
+ * Disk hits re-bind _sessionToPlan so the mapping survives restarts.
+ * @param {string|null} sessionId
+ * @returns {{planId:string, title:string, pendingCount:number, totalTasks:number, taskTitles:string[], filePath:string}|null}
+ */
+function findOpenPlan(sessionId) {
+  const TERMINAL = new Set(['done', 'failed', 'cancelled']);
+  const TASK_TERMINAL = new Set([planFormat.TASK_STATUS.DONE, planFormat.TASK_STATUS.SKIPPED]);
+
+  const _openFromSess = (sess) => {
+    if (!sess || !Array.isArray(sess.tasks) || !sess.tasks.length) return null;
+    if (TERMINAL.has(String(sess.status || '').toLowerCase())) return null;
+    const pending = sess.tasks.filter(t => !TASK_TERMINAL.has(t.status));
+    if (!pending.length) return null;
+    return {
+      planId: sess.planId,
+      title: sess.title || sess.planId,
+      pendingCount: pending.length,
+      totalTasks: sess.tasks.length,
+      taskTitles: sess.tasks.map(t => t.title || '').filter(Boolean),
+      filePath: sess.filePath,
+    };
+  };
+
+  // Session-bound plan first.
+  const bound = sessionId ? _sessionToPlan.get(sessionId) : null;
+  const boundSess = bound
+    ? (_planSessions.get(bound) || _loadPlanFromDisk(bound))
+    : null;
+  const hit = _openFromSess(boundSess);
+  if (hit) return hit;
+
+  // Most recently touched in-memory plan.
+  const activeSess = _activePlanId
+    ? (_planSessions.get(_activePlanId) || _loadPlanFromDisk(_activePlanId))
+    : null;
+  const activeHit = _openFromSess(activeSess);
+  if (activeHit) return activeHit;
+
+  // Disk scan — newest open task plan wins.
+  try {
+    const dir = _plansDir();
+    if (!fs.existsSync(dir)) return null;
+    const files = fs.readdirSync(dir)
+      .filter(f => f.endsWith('.md') && f.startsWith('plan'))
+      .map(f => ({ f, mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const { f } of files) {
+      const planId = f.replace(/\.md$/, '');
+      const sess = _loadPlanFromDisk(planId);
+      const open = _openFromSess(sess);
+      if (open) return open;
+    }
+  } catch (_) {}
+  return null;
+}
+
 function getPlanSession(planId) {
   return _planSessions.get(planId) || _loadPlanFromDisk(planId);
 }
@@ -1142,4 +1202,4 @@ function retrySteps(planId, taskNum) {
   return { ok: true };
 }
 
-module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, retrySteps };
+module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, retrySteps, findOpenPlan };

@@ -12,6 +12,20 @@ const logger = require('../logger.cjs');
 const { ask, buildMessages } = require('../llm-providers.cjs');
 const { formatStatusSummary, getActiveTasks, getRecentTasks } = require('../taskJournal.cjs');
 
+// "is <tool> installed" — probe the real binary rather than guessing.
+const _INSTALL_PROBE_RE = /\b(?:is|was)\s+(?:the\s+plan|it|that|([a-z0-9@._-]+))\s+(installed|set up)\b/i;
+
+function _probeInstalled(englishText) {
+  const m = String(englishText || '').match(_INSTALL_PROBE_RE);
+  const bin = m && m[1] ? m[1].replace(/[^a-z0-9@._-]/gi, '') : null;
+  if (!bin || bin.length < 2) return null;
+  try {
+    const r = require('child_process').spawnSync('which', [bin], { timeout: 2000 });
+    if (r.status === 0) return `Yes — ${bin} is on the PATH.`;
+    return `No — ${bin} isn't on the PATH.`;
+  } catch (_) { return null; }
+}
+
 // ── Status query patterns ──────────────────────────────────────────────────────
 const STATUS_PATTERNS = [
   /\bhow\s+(is|'s)\s+(that|it|the)\b/i,
@@ -48,8 +62,29 @@ async function execute(englishText, systemPrompt) {
   });
 
   if (summary === 'Nothing is currently running. The slate is clean.') {
-    // No active tasks — respond directly, rotating phrasing so repeated
-    // checks don't read as a stuck loop.
+    // No active tasks in the journal — but a plan may still be open (paused
+    // mid-run). Report plan state instead of a blind "nothing's running",
+    // and probe "is <tool> installed" questions for a truthful answer.
+    let openPlan = null;
+    try { openPlan = require('./planning.cjs').findOpenPlan(null); } catch (_) {}
+    const probe = _probeInstalled(englishText);
+    if (openPlan || probe) {
+      const parts = [];
+      if (probe) parts.push(probe);
+      if (openPlan) {
+        parts.push(`Your plan "${openPlan.title}" is paused — `
+          + `${openPlan.totalTasks - openPlan.pendingCount} of ${openPlan.totalTasks} tasks done. `
+          + `Say "continue" to pick it back up.`);
+      }
+      const response = parts.join(' ');
+      return {
+        text: response,
+        fullText: response,
+        metadata: { source: 'status_check_plan', intent: 3, planId: openPlan ? openPlan.planId : null },
+      };
+    }
+    // No active tasks, no open plan — respond directly, rotating phrasing so
+    // repeated checks don't read as a stuck loop.
     const variants = [
       summary,
       'All clear — nothing in flight right now.',
