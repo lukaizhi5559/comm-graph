@@ -47,7 +47,7 @@ const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const { execute: handoff, complete: handoffComplete, remove: handoffRemove } = require('./handoff.cjs');
 const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
 const intentGuesser = require('./intentGuesser.cjs');
-const { REFERENTIAL_RE, ACTION_VERB_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE } = require('../../shared/text-patterns.cjs');
+const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = require('./screen-context.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
 
@@ -91,55 +91,6 @@ function _loadVerbFit() {
   return _verbFit;
 }
 
-const MEMORY_PORT = parseInt(process.env.USER_MEMORY_PORT || '3001', 10);
-const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.MCP_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
-
-// Same predicate ResolveReferencesV2 uses to decide a prompt needs ambient
-// screen context — the shared textPatterns keep gate and stategraph in sync.
-// ("this on my screen to send" = referential + artifact + action verb.)
-function _needsAmbientCtx(text) {
-  const t = text || '';
-  return (REFERENTIAL_RE.test(t) && AMBIENT_ARTIFACT_RE.test(t) && ACTION_VERB_RE.test(t))
-      || SCREEN_OBSERVATION_RE.test(t);
-}
-
-// Read-only screen context for the gate: recent OCR capture + active app.
-// Bounded (1.5s each) and fail-open — worst case we enrich nothing.
-async function _memoryCall(action, payload = {}) {
-  const res = await fetch(`http://127.0.0.1:${MEMORY_PORT}/${action}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(MEM_API_KEY ? { Authorization: `Bearer ${MEM_API_KEY}` } : {}),
-    },
-    body: JSON.stringify({
-      version: 'mcp.v1', service: 'user-memory', action,
-      payload, requestId: `cg_gate_${Date.now()}`,
-      context: { userId: 'local_user' },
-    }),
-    signal: AbortSignal.timeout(1500),
-  });
-  const d = await res.json();
-  return d?.data || d;
-}
-
-async function _screenContext() {
-  const [ocr, app] = await Promise.all([
-    _memoryCall('memory.getRecentOcr', { maxAgeSeconds: 300 }).catch(() => null),
-    _memoryCall('memory.getActiveAppContext', {}).catch(() => null),
-  ]);
-  const capture = ocr?.capture || null;
-  const a = app?.app || {};
-  const url = a.url || capture?.url || null;
-  let host = null;
-  try { host = url ? new URL(url).hostname.replace(/^www\./, '') : null; } catch (_) {}
-  const appName = a.appName || capture?.appName || null;
-  const title = a.windowTitle || capture?.windowTitle || null;
-  const ocrText = (capture?.text || '').replace(/\s+/g, ' ').slice(0, 300);
-  if (!appName && !host && !ocrText) return null;
-  return { appName, host, title, url, ocrText };
-}
-
 async function _capabilityGate(text) {
   try {
     // "cast/mirror <app|screen|overlay>" is ambiguous (media-cast vs window
@@ -174,9 +125,9 @@ async function _capabilityGate(text) {
       // Connector-only phrasing ("connect to X") → planning clarifies intent.
       const fit = _loadVerbFit()(text, ready);
       if (fit === 'pin') return { pin: ready.id };
-      return { planning: 'capability_clarify', hints: [ready, ...hits.filter(h => h.id !== ready.id)].slice(0, 5) };
+      return { planning: 'capability_clarify', hints: [ready, ...hits.filter(h => h.id !== ready.id)].slice(0, 5), screenCtx };
     }
-    if (hits.length) return { planning: 'capability_needs_setup', hints: hits.slice(0, 5) };
+    if (hits.length) return { planning: 'capability_needs_setup', hints: hits.slice(0, 5), screenCtx };
 
     // ── Semantic fallback ──────────────────────────────────────────────────
     // Keyword search missed — vocabulary gap, not necessarily a capability
@@ -191,7 +142,7 @@ async function _capabilityGate(text) {
       signal: AbortSignal.timeout(25000),
     }).then(r => r.json()).catch(() => null);
     const inferred = inf?.candidates || [];
-    if (inferred.length) return { planning: 'capability_needs_setup', hints: inferred.slice(0, 5) };
+    if (inferred.length) return { planning: 'capability_needs_setup', hints: inferred.slice(0, 5), screenCtx };
 
     if (SETUP_PHRASE_RE.test(text)) return { planning: 'capability_gap' };
     return null;
@@ -627,6 +578,7 @@ async function processMessage(args) {
   // and approves setup BEFORE anything executes.
   let _capPin = null;
   let _capHints = null;
+  let _capScreenCtx = null;
   if (intent === 0) {
     const gate = await _capabilityGate(classifyText);
     if (gate?.planning) {
@@ -634,6 +586,7 @@ async function processMessage(args) {
       intent = 6; intentName = 'planning'; confidence = 0.9;
       classifySource = 'capability_gap';
       _capHints = gate.hints || null;
+      _capScreenCtx = gate.screenCtx || null;
     } else if (gate?.pin) {
       logger.info('[Process] capability pin', { agentId: gate.pin });
       _capPin = gate.pin;
@@ -795,6 +748,9 @@ async function processMessage(args) {
         // Capability-gap re-route carried verified candidates — inject them
         // into the planning prompt so <choices> lists real, vetted options.
         capabilityHints: _capHints,
+        // Screen context the gate already fetched for ambient prompts — the
+        // planning lane opens with eyes instead of asking "what's on screen".
+        screenContext: _capScreenCtx,
       });
       // Auto-entered planning (phrase guard / complexity / intent-6 LLM) —
       // surface WHY so the UI shows "moved to planning" rather than silently

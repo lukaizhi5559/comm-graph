@@ -46,6 +46,7 @@ const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
 const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
 const MCP_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.MCP_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
 const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
+const { needsAmbientCtx, screenContext, memoryCall } = require('../screen-context.cjs');
 
 // ── Plan session state ────────────────────────────────────────────────────────
 // In-memory index of plan drafting sessions. The plan.md file is the source of
@@ -471,7 +472,7 @@ async function _toolWebSearch(query) {
     .join('\n');
 }
 
-const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|capability\.search|capability\.probe|capability\.select)\s*\(\s*"([^"]+)"\s*\)\s*<\/tool>/g;
+const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select)\s*\(\s*"([^"]+)"\s*\)\s*<\/tool>/g;
 
 const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const COMMAND_API_KEY = process.env.MCP_COMMAND_API_KEY || process.env.MCP_API_KEY || '';
@@ -486,6 +487,19 @@ async function _toolMediaResolve(query) {
   return results.slice(0, 3)
     .map(r => `- ${r.title || ''}\n  ${r.url || ''}`)
     .join('\n');
+}
+
+// Read-only look at the user's live screen — recent OCR text + active app.
+// The planner's eyes: call this whenever the task refers to "this", "my
+// screen", "this app/site/tool" instead of asking the user to describe it.
+async function _toolScreenRead(_focus) {
+  const ctx = await screenContext().catch(() => null);
+  if (!ctx) return 'Screen context unavailable (OCR monitor not running or empty).';
+  const parts = [];
+  if (ctx.appName) parts.push(`App: ${ctx.appName}`);
+  if (ctx.url) parts.push(`URL: ${ctx.url}`);
+  if (ctx.title) parts.push(`Window: "${ctx.title}"`);
+  return `${parts.join(', ')}\nVisible text: ${ctx.ocrText || '(no OCR text captured)'}`;
 }
 
 async function _toolCapabilitySearch(query) {
@@ -542,6 +556,7 @@ async function _runTools(text) {
     if (call.tool === 'memory.search') out = await _toolMemorySearch(call.query);
     else if (call.tool === 'web.search') out = await _toolWebSearch(call.query);
     else if (call.tool === 'media.resolve') out = await _toolMediaResolve(call.query);
+    else if (call.tool === 'screen.read') out = await _toolScreenRead(call.query);
     else if (call.tool === 'capability.search') out = await _toolCapabilitySearch(call.query);
     else if (call.tool === 'capability.probe') out = await _toolCapabilityProbe(call.query);
     else out = await _toolCapabilitySelect(call.query);
@@ -581,6 +596,15 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             Use it to learn whether a tool is
                                             installed, signed in, or what flags
                                             it takes. It cannot change anything.
+  <tool>screen.read("optional focus")</tool> — look at the user's live screen:
+                                            returns the active app, URL, window
+                                            title, and recent OCR text. Use it
+                                            whenever the request refers to "this",
+                                            "my screen", "this app/site/tool" —
+                                            NEVER claim you can take a screenshot
+                                            or that you can't see; this IS how
+                                            you see. OCR text may lag the live
+                                            screen by a few seconds.
   <tool>capability.select("twilio")</tool>  — after the user picks an option that
                                             is NOT already a registered agent,
                                             call this ONCE to register it as a
@@ -812,7 +836,7 @@ function _stripMarkers(text) {
  *   (marker blocks are filtered out before chunks reach this)
  * @returns {Promise<{text, fullText, metadata}>}
  */
-async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null }) {
+async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null, screenContext: passedScreenContext = null }) {
   const startedExplicit = planning.startedExplicit === true;
   const sess = _getOrCreateSession({
     planId: planning.planId || _sessionToPlan.get(sessionId) || (planning.active ? _activePlanId : null),
@@ -821,6 +845,11 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     conversationContext,
   });
   if (!sess.originalPrompt) sess.originalPrompt = englishText;
+
+  // Eyes for ambient prompts: if the message refers to the screen and no
+  // screen context was handed down, fetch it now — bounded, fail-open.
+  const screenCtx = passedScreenContext
+    || (needsAmbientCtx(englishText) ? await screenContext().catch(() => null) : null);
 
   // Conversational rename — "call it history.project.plan"
   const inlineName = planning.name || planFormat.extractDotNameFromPrompt(
@@ -842,6 +871,11 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       ? `\n\nVERIFIED CANDIDATES (existence confirmed by the capability index — prefer these in <choices> over your own suggestions, ordered easiest-setup first):\n`
         + capabilityHints.map(h =>
             `- ${h.label || h.id}: kind=${h.kind || '?'}, setup="${h.setupSummary || ''}"${h.installed ? ', already installed' : ''}${h.installCmd ? `, install: ${h.installCmd}` : ''}${h.detail ? ` — ${h.detail}` : ''}`).join('\n')
+      : '')
+    + (screenCtx
+      ? `\n\nACTIVE SCREEN (live context — what the user is looking at now; use this to resolve "this"/"that"/"my screen" references):\n`
+        + `App: ${screenCtx.appName || '?'}${screenCtx.url ? `, URL: ${screenCtx.url}` : ''}${screenCtx.title ? `, Window: "${screenCtx.title}"` : ''}`
+        + (screenCtx.ocrText ? `\nVisible text: ${screenCtx.ocrText}` : '')
       : '')
     + (sess.contextSeed
       ? `\n\nPRIOR CONVERSATION (context only — planning started mid-conversation; the user's latest message may refer to this):\n${sess.contextSeed}`
