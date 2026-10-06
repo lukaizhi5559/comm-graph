@@ -688,12 +688,20 @@ ONE structured choice block and wait for the user to pick:
                 {"label": "None of these", "description": "..."}]}</choices>
 CHOICE RULES — order options exactly as capability.search returned them
 (easiest setup first). Put "[Recommended] " in front of the FIRST option's
-label — the user usually just accepts it. Each option's description should
-quote its "setup:" summary in plain words (e.g. "no setup needed", "needs an
-API key you paste once") plus the real trade-off (costs money, needs an
-account, uses your browser login). Keep options to 4 max + "None of these".
+label — the user usually just accepts it. Each option's description MUST
+open with its verbatim "setup:" + "eta:" text (e.g. "needs an API key (paste
+once) — ~2 min, you paste the key") — the user must see what they're signing
+up for BEFORE they pick — then add the real trade-off (costs money, needs an
+account, uses your browser login). Carry "friction" and "setup" as structured
+fields on each option so the UI can badge them. If EVERY option needs
+sign-in or a developer account (friction ≥4), say so in the question text
+("all routes need a sign-in — easiest is X") — never present a hard path as
+if it were easy. Keep options to 4 max + "None of these".
 If the user is already signed in somewhere (capability.probe showed it),
 prefer that option even at slightly higher setup cost — mention why.
+AFTER the user picks a setup-needing option, the task that does the setup
+should say what they'll experience ("I'll drive the install; you'll paste a
+key when asked") — no surprise prompts mid-run.
 AFTER THE USER PICKS — if the choice is already a registered agent, use it
 directly in the Agents line. If it is a new CLI/API/MCP/local tool, emit
 <tool>capability.select("<tool-or-service-name>")</tool> FIRST — it files a
@@ -870,7 +878,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     + (Array.isArray(capabilityHints) && capabilityHints.length
       ? `\n\nVERIFIED CANDIDATES (existence confirmed by the capability index — prefer these in <choices> over your own suggestions, ordered easiest-setup first):\n`
         + capabilityHints.map(h =>
-            `- ${h.label || h.id}: kind=${h.kind || '?'}, setup="${h.setupSummary || ''}"${h.installed ? ', already installed' : ''}${h.installCmd ? `, install: ${h.installCmd}` : ''}${h.detail ? ` — ${h.detail}` : ''}`).join('\n')
+            `- ${h.label || h.id}: kind=${h.kind || '?'}, setup="${h.setupSummary || ''}", eta="${h.eta || ''}"${h.installed ? ', already installed' : ''}${h.installCmd ? `, install: ${h.installCmd}` : ''}${h.detail ? ` — ${h.detail}` : ''}`).join('\n')
       : '')
     + (screenCtx
       ? `\n\nACTIVE SCREEN (live context — what the user is looking at now; use this to resolve "this"/"that"/"my screen" references):\n`
