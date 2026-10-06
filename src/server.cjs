@@ -77,12 +77,23 @@ function _notifyThoughtEngine(type, info) {
 // a handoff-bound prompt should pin a ready agent or divert to planning.
 const COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const SETUP_PHRASE_RE = /\b(connect|set ?up|link|sync|install|pair|integrate)\b[^.\n]{0,60}\b(to|with|my)\b/i;
-const AMBIGUOUS_CAST_RE = /\b(cast|mirror|stream)\b[^.\n]{0,40}\b(app|screen|window|desktop)\b/i;
+const AMBIGUOUS_CAST_RE = /\b(cast|mirror|stream)\b[^.\n]{0,40}\b(app|screen|window|desktop|overlay)\b/i;
+
+// Connector verbs name the TARGET, not the action — "connect to my chromecast"
+// doesn't say cast/scan/play. When a ready agent matches but no action verb
+// maps to its declared capabilities, clarify intent in planning instead of
+// pinning blindly. Delegated to shared/capability-index.cjs verbFit().
+let _verbFit = null;
+function _loadVerbFit() {
+  if (_verbFit) return _verbFit;
+  try { _verbFit = require('../../shared/capability-index.cjs').verbFit; } catch (_) { _verbFit = () => 'clarify'; }
+  return _verbFit;
+}
 
 async function _capabilityGate(text) {
   try {
-    // "cast/mirror <app|screen>" is ambiguous (media-cast vs window-mirror) —
-    // always clarify in planning even when a cast agent exists.
+    // "cast/mirror <app|screen|overlay>" is ambiguous (media-cast vs window
+    // mirroring) — always clarify in planning even when a cast agent exists.
     if (AMBIGUOUS_CAST_RE.test(text)) return { planning: 'capability_gap' };
     const res = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.search`, {
       method: 'POST',
@@ -92,8 +103,30 @@ async function _capabilityGate(text) {
     });
     const hits = (await res.json())?.results || [];
     const ready = hits.find(h => /\.agent$/.test(h.id) && h.installed && h.friction <= 1);
-    if (ready) return { pin: ready.id };
-    if (hits.length) return { planning: 'capability_needs_setup' };
+    if (ready) {
+      // Specific action that maps to the tool's capabilities → pin and run.
+      // Connector-only phrasing ("connect to X") → planning clarifies intent.
+      const fit = _loadVerbFit()(text, ready);
+      if (fit === 'pin') return { pin: ready.id };
+      return { planning: 'capability_clarify', hints: [ready, ...hits.filter(h => h.id !== ready.id)].slice(0, 5) };
+    }
+    if (hits.length) return { planning: 'capability_needs_setup', hints: hits.slice(0, 5) };
+
+    // ── Semantic fallback ──────────────────────────────────────────────────
+    // Keyword search missed — vocabulary gap, not necessarily a capability
+    // gap. LLM proposes candidate tools; command-service mechanically
+    // verifies each (which/npm view/brew/seed/--version). Only verified
+    // candidates reach planning. Unregistered tools always clarify — pinning
+    // requires a registered descriptor for resolveAgent to bind.
+    const inf = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.infer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: text }),
+      signal: AbortSignal.timeout(25000),
+    }).then(r => r.json()).catch(() => null);
+    const inferred = inf?.candidates || [];
+    if (inferred.length) return { planning: 'capability_needs_setup', hints: inferred.slice(0, 5) };
+
     if (SETUP_PHRASE_RE.test(text)) return { planning: 'capability_gap' };
     return null;
   } catch (_) {
@@ -527,12 +560,14 @@ async function processMessage(args) {
   // prompt with no match — routes to the planning lane so the user clarifies
   // and approves setup BEFORE anything executes.
   let _capPin = null;
+  let _capHints = null;
   if (intent === 0) {
     const gate = await _capabilityGate(classifyText);
     if (gate?.planning) {
-      logger.info('[Process] capability-gap → planning lane', { reason: gate.planning });
+      logger.info('[Process] capability-gap → planning lane', { reason: gate.planning, hints: (gate.hints || []).length });
       intent = 6; intentName = 'planning'; confidence = 0.9;
       classifySource = 'capability_gap';
+      _capHints = gate.hints || null;
     } else if (gate?.pin) {
       logger.info('[Process] capability pin', { agentId: gate.pin });
       _capPin = gate.pin;
@@ -691,6 +726,9 @@ async function processMessage(args) {
         // Stream reply prose (translate-back replaces English output, so
         // streaming is disabled for non-English turns).
         onReplyChunk: wasTranslated ? null : onReplyChunk,
+        // Capability-gap re-route carried verified candidates — inject them
+        // into the planning prompt so <choices> lists real, vetted options.
+        capabilityHints: _capHints,
       });
       // Auto-entered planning (phrase guard / complexity / intent-6 LLM) —
       // surface WHY so the UI shows "moved to planning" rather than silently

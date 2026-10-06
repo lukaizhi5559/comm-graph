@@ -653,6 +653,15 @@ draft agent descriptor and returns the agentId your Agents line must use.
 If nothing viable exists, say so and offer alternatives (nearest registered
 agent, or a manual step the user does themselves).
 
+CAPABILITY FIT — when the user names a target but not a clear action ("connect
+to my chromecast", "use the scanner", "talk to my printer"), or when a chosen
+tool may not actually do what was asked ("mirror my screen" vs a media caster),
+do NOT write tasks yet. First call <tool>capability.probe("<tool> --help")</tool>
+to read the tool's real capabilities, then either ask ONE clarifying question
+("what should I do on it — cast a video, play audio, check status?") or emit
+<choices> describing what the tool CAN do. Never commit a tool to a Task for
+an action it doesn't support.
+
 OTHER MARKERS (optional):
   <plan_name>dot.syntax.name</plan_name> — when the user names the plan
     (e.g. history.project.plan) or you propose one and they accept.
@@ -771,7 +780,7 @@ function _stripMarkers(text) {
  *   (marker blocks are filtered out before chunks reach this)
  * @returns {Promise<{text, fullText, metadata}>}
  */
-async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null }) {
+async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null }) {
   const startedExplicit = planning.startedExplicit === true;
   const sess = _getOrCreateSession({
     planId: planning.planId || _sessionToPlan.get(sessionId) || (planning.active ? _activePlanId : null),
@@ -797,6 +806,11 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     + _renderAgentCatalog()
     + `\n\nCURRENT PLAN STATE (planId ${sess.planId}, file already saved — update it with <plan_update> when it changes):\n`
     + _renderPlanState(sess)
+    + (Array.isArray(capabilityHints) && capabilityHints.length
+      ? `\n\nVERIFIED CANDIDATES (existence confirmed by the capability index — prefer these in <choices> over your own suggestions, ordered easiest-setup first):\n`
+        + capabilityHints.map(h =>
+            `- ${h.label || h.id}: kind=${h.kind || '?'}, setup="${h.setupSummary || ''}"${h.installed ? ', already installed' : ''}${h.installCmd ? `, install: ${h.installCmd}` : ''}${h.detail ? ` — ${h.detail}` : ''}`).join('\n')
+      : '')
     + (sess.contextSeed
       ? `\n\nPRIOR CONVERSATION (context only — planning started mid-conversation; the user's latest message may refer to this):\n${sess.contextSeed}`
       : '');
