@@ -263,11 +263,13 @@ function _pickStepgenAppendix(task) {
   for (const a of agents) {
     const meta = serviceMap.describeAgent(a);
     if (!meta) continue;
-    if (meta.cliTool || meta.type === 'cli') hasCli = true;
+    if (meta.cliTool || meta.type === 'cli' || meta.type === 'mcp' || meta.type === 'local') hasCli = true;
     else if (meta.type === 'browser' || meta.type === 'api') hasBrowser = true;
   }
-  if (hasBrowser) return 'plan-skills-browser.md';
+  // CLI-first: deterministic programmatic agents get the cli appendix even
+  // when a task also lists a browser agent (cli/api/mcp > browser priority).
   if (hasCli) return 'plan-skills-cli-first.md';
+  if (hasBrowser) return 'plan-skills-browser.md';
   if (/[~\/][\w\-./]+\.(?:md|txt|json|csv|pdf|docx?|xlsx?|py|ts|js)\b/i.test(task.prompt || '')) {
     return 'plan-skills-file.md';
   }
@@ -463,7 +465,49 @@ async function _toolWebSearch(query) {
     .join('\n');
 }
 
-const _TOOL_RE = /<tool>\s*(memory\.search|web\.search)\s*\(\s*"([^"]+)"\s*\)\s*<\/tool>/g;
+const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|capability\.search|capability\.probe|capability\.select)\s*\(\s*"([^"]+)"\s*\)\s*<\/tool>/g;
+
+const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
+const COMMAND_API_KEY = process.env.MCP_COMMAND_API_KEY || process.env.MCP_API_KEY || '';
+
+async function _toolCapabilitySearch(query) {
+  const res = await _postJson(COMMAND_SERVICE_PORT, '/capability.search', {
+    query,
+  }, COMMAND_API_KEY, 6000);
+  const results = res?.results || res?.data?.results || [];
+  if (!Array.isArray(results) || !results.length) return 'No capability candidates found.';
+  return results.slice(0, 6).map((c, i) => {
+    const bits = [
+      `${i + 1}. ${c.label || c.id} [${c.kind}]`,
+      `setup: ${c.setupSummary || 'unknown'}`,
+      c.installed === false ? 'not installed' : null,
+      Array.isArray(c.missingSecrets) && c.missingSecrets.length ? `missing: ${c.missingSecrets.join(', ')}` : null,
+      c.detail ? `— ${c.detail}` : null,
+    ].filter(Boolean);
+    return bits.join(' ');
+  }).join('\n');
+}
+
+async function _toolCapabilityProbe(commandLine) {
+  const parts = String(commandLine || '').trim().split(/\s+/).filter(Boolean);
+  const tool = parts.shift();
+  const res = await _postJson(COMMAND_SERVICE_PORT, '/capability.probe', {
+    tool, argv: parts,
+  }, COMMAND_API_KEY, 20000);
+  if (res?.denied) return `probe denied: ${res.denied}`;
+  if (res?.installed === false) return `${tool}: not installed`;
+  const out = (res?.output || '').slice(0, 1500);
+  return `${tool} ${parts.join(' ')} → ${res?.ok ? 'ok' : `exit ${res?.exitCode ?? '?'}`}\n${out}`;
+}
+
+async function _toolCapabilitySelect(name) {
+  const res = await _postJson(COMMAND_SERVICE_PORT, '/capability.select', {
+    name,
+  }, COMMAND_API_KEY, 6000);
+  if (res?.ok === false) return `select failed: ${res.error || 'unknown'}`;
+  if (res?.alreadyRegistered) return `${res.agentId} is already registered — use it directly in Agents.`;
+  return `${res.agentId} registered as a draft agent (status: draft). Use "${res.agentId}" in the task's Agents line — plan-check will offer "Set up" before the run.${res?.secrets?.length ? `\nIt will need: ${res.secrets.join(', ')}` : ''}`;
+}
 
 async function _runTools(text) {
   const calls = [];
@@ -476,9 +520,12 @@ async function _runTools(text) {
   const results = [];
   for (const call of calls.slice(0, 3)) {
     logger.info('[Planning] Tool call', { tool: call.tool, query: call.query });
-    const out = call.tool === 'memory.search'
-      ? await _toolMemorySearch(call.query)
-      : await _toolWebSearch(call.query);
+    let out;
+    if (call.tool === 'memory.search') out = await _toolMemorySearch(call.query);
+    else if (call.tool === 'web.search') out = await _toolWebSearch(call.query);
+    else if (call.tool === 'capability.search') out = await _toolCapabilitySearch(call.query);
+    else if (call.tool === 'capability.probe') out = await _toolCapabilityProbe(call.query);
+    else out = await _toolCapabilitySelect(call.query);
     results.push(`${call.tool}("${call.query}") →\n${out || '(no result)'}`);
   }
   return results.join('\n\n');
@@ -496,8 +543,27 @@ you will NOT execute anything yourself. Your job is to (1) gather the context
 needed to make the plan correct, and (2) maintain the plan's Task list.
 
 TOOLS — when you need facts about the user or the world, emit ONE of:
-  <tool>memory.search("query")</tool>   — the user's stored facts/preferences
-  <tool>web.search("query")</tool>      — live web research
+  <tool>memory.search("query")</tool>       — the user's stored facts/preferences
+  <tool>web.search("query")</tool>          — live web research
+  <tool>capability.search("query")</tool>   — what can accomplish this: registered
+                                            agents, CLIs, APIs, MCP servers, and
+                                            built-in tools, ranked easiest-to-
+                                            setup first with a per-option "setup:"
+                                            summary.
+  <tool>capability.probe("gh auth status")</tool> — read-only CLI check: first
+                                            token is the tool, rest is a read-only
+                                            command (help/status/whoami/list/
+                                            version/auth status/doctor/scan).
+                                            Use it to learn whether a tool is
+                                            installed, signed in, or what flags
+                                            it takes. It cannot change anything.
+  <tool>capability.select("twilio")</tool>  — after the user picks an option that
+                                            is NOT already a registered agent,
+                                            call this ONCE to register it as a
+                                            draft agent. It returns the agentId
+                                            to put in the task's Agents line.
+                                            Setup still happens at plan-check —
+                                            this only files the intent.
 Use at most 3 tool calls per turn, then answer. Tool results come back inside
 <tool_results>. Do NOT use tools for things you already know.
 
@@ -555,15 +621,35 @@ web.agent, edit.agent, shell, cli.agent — are execution lanes, not services;
 a task whose deliverable lives on a registered service names that service's
 agent.
 
+ROUTING PREFERENCE — prefer type:cli/api/mcp agents over type:browser agents
+when both could satisfy the deliverable. Deterministic CLIs/APIs are faster
+and far more reliable than browser automation. Exception: keep the browser
+agent when its service has a trained playbook the user expects (signed-in
+app flows like composing in Gmail) or when no programmatic agent covers the
+capability. Browser agents are the last resort, not the default.
+
 CAPABILITY GAP — if a task needs something no registered agent covers (e.g.
-"send a text", a service nobody built an agent for), use
-<tool>web.search</tool> to find candidate services (a web app URL, a CLI
-tool, an API, or an MCP server), then emit ONE structured choice block and
-wait for the user to pick:
+"send a text", a service nobody built an agent for), FIRST use
+<tool>capability.search("...")</tool> for ranked candidates (CLIs, APIs, MCP
+servers, built-in tools — already ordered easiest-to-setup). Fall back to
+<tool>web.search</tool> only if capability.search finds nothing. Then emit
+ONE structured choice block and wait for the user to pick:
   <choices>{"question": "Which service should I use for X?",
     "options": [{"label": "...", "description": "...", "url": "..."},
                 {"label": "...", "description": "...", "cliTool": "..."},
                 {"label": "None of these", "description": "..."}]}</choices>
+CHOICE RULES — order options exactly as capability.search returned them
+(easiest setup first). Put "[Recommended] " in front of the FIRST option's
+label — the user usually just accepts it. Each option's description should
+quote its "setup:" summary in plain words (e.g. "no setup needed", "needs an
+API key you paste once") plus the real trade-off (costs money, needs an
+account, uses your browser login). Keep options to 4 max + "None of these".
+If the user is already signed in somewhere (capability.probe showed it),
+prefer that option even at slightly higher setup cost — mention why.
+AFTER THE USER PICKS — if the choice is already a registered agent, use it
+directly in the Agents line. If it is a new CLI/API/MCP/local tool, emit
+<tool>capability.select("<tool-or-service-name>")</tool> FIRST — it files a
+draft agent descriptor and returns the agentId your Agents line must use.
 If nothing viable exists, say so and offer alternatives (nearest registered
 agent, or a manual step the user does themselves).
 
