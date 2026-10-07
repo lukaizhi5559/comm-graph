@@ -51,7 +51,41 @@ function isStatusQuery(englishText) {
  * @param {string} systemPrompt - Full system prompt (persona + personality)
  * @returns {Promise<{ text: string, fullText: string, metadata: Object }>}
  */
+// "do we have a plan for X" / "the X plan" / "I thought we had X planned" —
+// search saved plans on disk (incl. terminal ones) instead of trusting memory.
+const _PLAN_PROBE_RE = /\b(?:a\s+|the\s+|my\s+|our\s+)?([\w][\w .-]{0,40}?)\s+plan\b|\bplan\s+(?:for|about|on)\s+([\w][\w .-]{1,40})/i;
+function _probePlan(englishText) {
+  const s = String(englishText || '');
+  if (!/\bplan\b/i.test(s)) return null;
+  const m = s.match(_PLAN_PROBE_RE);
+  const query = (m && (m[1] || m[2]) || '').trim()
+    .replace(/^(?:the|a|an|my|our)\s+/i, '').trim();
+  // "the plan" / "my plan" alone carries no referent — let open-plan path answer.
+  const meaningful = query.split(/[^a-z0-9]+/i).filter(t => t.length > 1 && !/^(the|a|an|my|our|new|next|same|plan)$/i.test(t));
+  if (!meaningful.length) return null;
+  const hits = require('../../../shared/system-map.cjs').findPlans(query);
+  if (!hits.length) return null;
+  const p = hits[0];
+  return `Yes — I found the ${p.name || p.title || 'saved'} plan (${p.planId}), `
+    + `status ${p.status}, ${p.pendingCount} of ${p.totalTasks} tasks unfinished`
+    + (p.taskTitles.length ? ` (${p.taskTitles.slice(0, 4).join('; ')})` : '') + '.'
+    + (/^(done|cancelled|failed)$/i.test(p.status)
+      ? ' It\'s not active — say "continue the ' + (p.name || query) + ' plan" in planning mode and I\'ll reopen it.'
+      : ' Say "continue" to pick it back up.');
+}
+
 async function execute(englishText, systemPrompt) {
+  // Plan-existence questions answer from disk, not the task journal — a saved
+  // plan is "something we had" even when nothing is running right now.
+  const planProbe = _probePlan(englishText);
+  if (planProbe) {
+    return {
+      text: planProbe,
+      fullText: planProbe,
+      metadata: { source: 'status_check_plan_probe', intent: 3 },
+    };
+  }
+
   // Get status summary from task journal
   const summary = formatStatusSummary();
 

@@ -33,6 +33,7 @@ const planFormat = require('../../../shared/plan-format.cjs');
 const { canonicalAgent } = require('../../../shared/agent-canonical.cjs');
 const skillIndex = require('../../../shared/skill-index.cjs');
 const serviceMap = require('../../../shared/service-map.cjs');
+const sysMap = require('../../../shared/system-map.cjs');
 
 // ── Paths / services ─────────────────────────────────────────────────────────
 
@@ -472,7 +473,7 @@ async function _toolWebSearch(query) {
     .join('\n');
 }
 
-const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select)\s*\(\s*"([^"]+)"\s*\)\s*<\/tool>/g;
+const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select|plan\.find|plan\.open|system\.map|logs\.tail)(?:\s*\(\s*"([^"]+)"\s*\))?\s*<\/tool>/g;
 
 const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const COMMAND_API_KEY = process.env.MCP_COMMAND_API_KEY || process.env.MCP_API_KEY || '';
@@ -541,7 +542,58 @@ async function _toolCapabilitySelect(name) {
   return `${res.agentId} registered as a draft agent (status: draft). Use "${res.agentId}" in the task's Agents line — plan-check will offer "Set up" before the run.${res?.secrets?.length ? `\nIt will need: ${res.secrets.join(', ')}` : ''}`;
 }
 
-async function _runTools(text) {
+// ── Self-knowledge tools — plans on disk, ~/.thinkdrop layout, project logs ──
+
+function _toolPlanFind(query) {
+  const hits = sysMap.findPlans(query).slice(0, 5);
+  if (!hits.length) return `(no saved plan matches "${query}" — searched name/title/prompt/task text of every plan_* file)`;
+  return hits.map(p =>
+    `${p.planId} — "${p.name || p.title || '(unnamed)'}" | status=${p.status} | ${p.pendingCount} of ${p.totalTasks} tasks unfinished | tasks: ${p.taskTitles.join('; ')}`
+  ).join('\n');
+}
+
+// Open (and if needed reopen) a saved plan and bind this session to it.
+// Terminal plans (done/failed/cancelled) are reopened: status → ready and
+// failed/skipped tasks → pending so the run can continue where it stopped.
+function _openPlanForSession(planId, sessionId) {
+  const sess2 = _loadPlanFromDisk(planId);
+  if (!sess2) return { sess: null, reopened: false, error: `plan ${planId} not found on disk` };
+  if (sessionId) _sessionToPlan.set(sessionId, planId);
+  _activePlanId = planId;
+  const isTerminal = /^(done|failed|cancelled)$/i.test(String(sess2.status || ''));
+  const allTasksTerminal = sess2.tasks.length > 0 && sess2.tasks.every(t => /done|skipped|failed|cancelled/i.test(String(t.status || '')));
+  if (!isTerminal && !allTasksTerminal) return { sess: sess2, reopened: false };
+  try {
+    let content = fs.readFileSync(sess2.filePath, 'utf8');
+    content = planFormat.updateFrontmatterStatus(content, 'ready');
+    for (const t of sess2.tasks) {
+      if (/failed|skipped/i.test(String(t.status || ''))) {
+        content = planFormat.updateTaskStatus(content, t.num, planFormat.TASK_STATUS.PENDING);
+      }
+    }
+    fs.writeFileSync(sess2.filePath, content, 'utf8');
+    logger.info('[Planning] Reopened plan', { planId, from: sess2.status });
+    return { sess: _loadPlanFromDisk(planId) || sess2, reopened: true };
+  } catch (err) {
+    logger.warn('[Planning] Plan reopen failed', { planId, error: err.message });
+    return { sess: sess2, reopened: false };
+  }
+}
+
+function _toolPlanOpen(planId, sessionId) {
+  const { sess: opened, reopened, error } = _openPlanForSession(planId, sessionId);
+  if (error) return error;
+  return `Plan "${opened.name || opened.title || opened.planId}" is now the active plan`
+    + (reopened ? ' — REOPENED: it had a terminal status; now status=ready and failed/skipped tasks are reset to pending' : '')
+    + `.\nCurrent state:\n${_renderPlanState(opened)}\nTell the user what you found and what the next step is.`;
+}
+
+function _toolLogsTail(query) {
+  const m = String(query || '').match(/^([^\s,"]+)(?:[,\s]+(\d+))?/);
+  return sysMap.tailLog(m ? m[1] : '', m && m[2] ? parseInt(m[2], 10) : 80);
+}
+
+async function _runTools(text, sessionId) {
   const calls = [];
   _TOOL_RE.lastIndex = 0;
   let m;
@@ -559,8 +611,12 @@ async function _runTools(text) {
     else if (call.tool === 'screen.read') out = await _toolScreenRead(call.query);
     else if (call.tool === 'capability.search') out = await _toolCapabilitySearch(call.query);
     else if (call.tool === 'capability.probe') out = await _toolCapabilityProbe(call.query);
+    else if (call.tool === 'plan.find') out = _toolPlanFind(call.query);
+    else if (call.tool === 'plan.open') out = _toolPlanOpen(call.query, sessionId);
+    else if (call.tool === 'system.map') out = sysMap.renderLayout();
+    else if (call.tool === 'logs.tail') out = _toolLogsTail(call.query);
     else out = await _toolCapabilitySelect(call.query);
-    results.push(`${call.tool}("${call.query}") →\n${out || '(no result)'}`);
+    results.push(`${call.tool}("${call.query || ''}") →\n${out || '(no result)'}`);
   }
   return results.join('\n\n');
 }
@@ -612,6 +668,22 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             to put in the task's Agents line.
                                             Setup still happens at plan-check —
                                             this only files the intent.
+  <tool>plan.find("nylas")</tool>           — search SAVED plans on disk by name/
+                                            title/task text. Use this (not
+                                            memory.search) for "the X plan",
+                                            "do we have a plan for Y" —
+                                            memory.search only knows user facts.
+  <tool>plan.open("plan_…")</tool>          — make a saved plan the active plan
+                                            for this session. Reopens terminal
+                                            (failed/cancelled) plans: resets
+                                            failed/skipped tasks to pending.
+  <tool>system.map</tool>                  — ThinkDrop's own data layout:
+                                            what every ~/.thinkdrop folder holds
+                                            and which service runs on which port.
+  <tool>logs.tail("comms-graph", 100)</tool> — tail a project log
+                                            (logs/<name>.log: main, comms-graph,
+                                            command, …). For "why did X fail /
+                                            didn't it work" — check logs first.
 Use at most 3 tool calls per turn, then answer. Tool results come back inside
 <tool_results>. Do NOT use tools for things you already know.
 
@@ -831,6 +903,14 @@ function _stripMarkers(text) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+// Unnamed plan continuation — "continue/resume/pick up/finish the plan" with
+// no named referent. Used to decide whether several saved plans need a
+// disambiguation card.
+const _UNNAMED_RESUME_RE = /\b(?:continu\w*|resum\w*|pick\w* up|carry on|keep going|get back to|work on|finish|go back to|reopen)\b[\s\S]{0,30}\bplan\b|\bplan\b[\s\S]{0,15}\b(?:continu\w*|resum\w*)/i;
+function _isUnnamedResume(t) {
+  return _UNNAMED_RESUME_RE.test(String(t || ''));
+}
+
 /**
  * Handle a prompt while planning mode is active.
  *
@@ -846,13 +926,52 @@ function _stripMarkers(text) {
  */
 async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null, screenContext: passedScreenContext = null }) {
   const startedExplicit = planning.startedExplicit === true;
-  const sess = _getOrCreateSession({
+  let sess = _getOrCreateSession({
     planId: planning.planId || _sessionToPlan.get(sessionId) || (planning.active ? _activePlanId : null),
     sessionId,
     originalPrompt: englishText,
     conversationContext,
   });
   if (!sess.originalPrompt) sess.originalPrompt = englishText;
+
+  // ── Plan referent resolution ────────────────────────────────────────────────
+  // "the nylas plan" — a DEFINITE reference to an existing plan. If it names a
+  // different saved plan than the session's, switch (and reopen if terminal).
+  // "a plan for X" (indefinite) is a draft request — never a referent.
+  const refMatch = String(englishText || '').match(/\bthe\s+([\w][\w .-]{0,40}?)\s+plan\b/i);
+  if (refMatch && !/^(?:new|next|same)$/i.test(refMatch[1].trim())) {
+    const hits = sysMap.findPlans(refMatch[1]);
+    const top = hits[0];
+    if (top && top.planId !== sess.planId && (!hits[1] || hits[1].score < top.score)) {
+      const { sess: opened, reopened } = _openPlanForSession(top.planId, sessionId);
+      if (opened) {
+        logger.info('[Planning] Referent switch', { from: sess.planId, to: opened.planId, reopened });
+        sess = opened;
+      }
+    }
+  } else if (_isUnnamedResume(englishText)) {
+    // "let continue the plan" with no named referent — if several resumable
+    // plans exist (open OR failed — never done), ask which instead of guessing.
+    const resumables = sysMap.resumablePlans().slice(0, 6);
+    if (resumables.length > 1) {
+      const options = resumables.map(p => ({
+        label: `the ${p.name || p.title || p.planId} plan`,
+        description: `${p.status} · ${p.pendingCount} of ${p.totalTasks} tasks left`,
+      }));
+      options.push({ label: 'none of these — start a new plan', description: 'draft a fresh plan instead' });
+      return {
+        text: 'Which plan did you mean?',
+        fullText: 'Which plan did you mean?',
+        metadata: {
+          source: 'planning', intent: 6, planId: sess.planId, planFile: sess.filePath,
+          planTitle: sess.title, planName: sess.name, planStatus: sess.status,
+          taskCount: sess.tasks.length, authRequired: 0, unknownAgents: [],
+          choices: { question: 'I found a few plans on the go — which one did you mean?', options },
+          runPlan: false, startedExplicit, speakable: true,
+        },
+      };
+    }
+  }
 
   // Eyes for ambient prompts: if the message refers to the screen and no
   // screen context was handed down, fetch it now — bounded, fail-open.
@@ -920,7 +1039,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     // enter stored history — the model would imitate the markup next turn.
     const cleanText = _stripMetaTags(text);
 
-    const toolResults = await _runTools(cleanText);
+    const toolResults = await _runTools(cleanText, sessionId);
     if (toolResults && round < MAX_TOOL_ROUNDS) {
       // Record the assistant's tool-call turn, then feed results back.
       sess.history.push({ role: 'assistant', content: cleanText });
@@ -1113,7 +1232,7 @@ function _liveInstallCheck(title) {
 function _renderPlanState(sess) {
   if (!sess.tasks.length) return '(no tasks yet — first turn)';
   const lines = sess.tasks.map(t => {
-    const live = t.status === 'in-progress' || t.status === 'pending' || t.status === 'running'
+    const live = /pending|progress|running/i.test(String(t.status || ''))
       ? _liveInstallCheck(t.title) : null;
     return `Task ${t.num} — ${t.title} | mode=${t.mode} | deps=[${t.dependsOn.join(',') || 'none'}] | auth=${t.auth} | status=${t.status}`
       + (live ? ` | live-check: ${live} (reality, right now — trust this over the stale status)` : '');
