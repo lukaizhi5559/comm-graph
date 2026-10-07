@@ -1104,8 +1104,26 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     };
   }
 
+  // ── Plan referent detection (pre-binding) ─────────────────────────────────
+  // Computed before session resolution: a definite referent or resume phrase
+  // is allowed to bind to an existing plan even when preferFresh is set.
+  const refMatch = String(englishText || '').match(/\bthe\s+([\w][\w .-]{0,40}?)\s+plan\b/i);
+  const referentHit = !!(refMatch && !/^(?:new|next|same)$/i.test(refMatch[1].trim()));
+  const unnamedResume = _isUnnamedResume(englishText);
+
+  let boundId = planning.planId || _sessionToPlan.get(sessionId) || (planning.active ? _activePlanId : null);
+  if (planning.preferFresh && boundId && !referentHit && !unnamedResume) {
+    // A capability_gap turn is a new capability request — inheriting the
+    // session's bound FINALIZED plan would let this prompt rewrite its tasks
+    // (observed: a file-count prompt overwrote the nylas plan). Only a session
+    // still drafting (its own clarify flow) may be continued; anything else
+    // gets a fresh draft. The bound plan stays on disk, resumable by referent.
+    const boundSess = _planSessions.get(boundId) || _loadPlanFromDisk(boundId);
+    if (boundSess && String(boundSess.status || 'drafting') !== 'drafting') boundId = null;
+  }
+
   let sess = _getOrCreateSession({
-    planId: planning.planId || _sessionToPlan.get(sessionId) || (planning.active ? _activePlanId : null),
+    planId: boundId,
     sessionId,
     originalPrompt: englishText,
     conversationContext,
@@ -1116,8 +1134,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   // "the nylas plan" — a DEFINITE reference to an existing plan. If it names a
   // different saved plan than the session's, switch (and reopen if terminal).
   // "a plan for X" (indefinite) is a draft request — never a referent.
-  const refMatch = String(englishText || '').match(/\bthe\s+([\w][\w .-]{0,40}?)\s+plan\b/i);
-  if (refMatch && !/^(?:new|next|same)$/i.test(refMatch[1].trim())) {
+  if (referentHit) {
     _activity(`searching saved plans for "${refMatch[1].trim()}"…`);
     const hits = sysMap.findPlans(refMatch[1]);
     const top = hits[0];
@@ -1129,7 +1146,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
         sess = opened;
       }
     }
-  } else if (_isUnnamedResume(englishText)) {
+  } else if (unnamedResume) {
     // "let continue the plan" with no named referent — if several resumable
     // plans exist (open OR failed — never done), ask which instead of guessing.
     _activity('looking for resumable plans…');

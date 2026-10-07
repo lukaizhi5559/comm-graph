@@ -79,6 +79,10 @@ function _notifyThoughtEngine(type, info) {
 const COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const SETUP_PHRASE_RE = /\b(connect|set ?up|link|sync|install|pair|integrate)\b[^.\n]{0,60}\b(to|with|my)\b/i;
 const AMBIGUOUS_CAST_RE = /\b(cast|mirror|stream)\b[^.\n]{0,40}\b(app|screen|window|desktop|overlay)\b/i;
+// QA-shaped prompts that a veto demoted to handoff (intent 0) must not be
+// capability-gated into planning — a question needs an answer, not a setup
+// plan. Action intents (command_automate etc.) still run the gate.
+const _GATE_SKIP_INTENTS = new Set(['web_search', 'general_knowledge', 'memory_retrieve', 'status_check']);
 
 // Connector verbs name the TARGET, not the action — "connect to my chromecast"
 // doesn't say cast/scan/play. When a ready agent matches but no action verb
@@ -142,7 +146,13 @@ async function _capabilityGate(text) {
       signal: AbortSignal.timeout(25000),
     }).then(r => r.json()).catch(() => null);
     const inferred = inf?.candidates || [];
-    if (inferred.length) return { planning: 'capability_needs_setup', hints: inferred.slice(0, 5), screenCtx };
+    // An inferred candidate that's already installed & friction-free means the
+    // job is doable right now via core skills (shell.run etc.) — not a setup
+    // decision. Only when EVERY candidate needs install/auth is planning's
+    // clarify warranted ("ls is installed" ≠ "you need a provider").
+    if (inferred.length && !inferred.some(c => c.installed && (c.friction ?? 9) <= 1)) {
+      return { planning: 'capability_needs_setup', hints: inferred.slice(0, 5), screenCtx };
+    }
 
     if (SETUP_PHRASE_RE.test(text)) return { planning: 'capability_gap' };
     return null;
@@ -503,7 +513,11 @@ async function processMessage(args) {
   // Use conversation-service history if available, otherwise fall back to in-memory
   // Strip canned-refusal Assistant lines left over from pre-fix sessions so
   // models don't mimic the refusal voice (heals already-poisoned history).
-  const context = sanitizeContext(convHistory || _formatContext());
+  // Merge service history with local turns — task results fed back on
+  // completion live in _conversationHistory and may never reach the service
+  // (no API key in dev), but they carry the actual answers follow-ups need.
+  const _localCtx = _formatContext();
+  const context = sanitizeContext([convHistory, _localCtx].filter(Boolean).join('\n'));
   // Highlighted-context tags ("[Highlighted: …]") ride inside the prompt. Strip
   // them for intent classification/guessing — a code- or command-looking blob
   // would otherwise bias the intent toward handoff. They stay in englishText
@@ -585,7 +599,8 @@ async function processMessage(args) {
   let _capHints = null;
   let _capScreenCtx = null;
   if (intent === 0) {
-    const gate = await _capabilityGate(classifyText);
+    const { guessedIntent: _gateGuess } = intentGuesser.guess(classifyText, { hasSelectionContext });
+    const gate = _GATE_SKIP_INTENTS.has(_gateGuess) ? null : await _capabilityGate(classifyText);
     if (gate?.planning) {
       logger.info('[Process] capability-gap → planning lane', { reason: gate.planning, hints: (gate.hints || []).length });
       intent = 6; intentName = 'planning'; confidence = 0.9;
@@ -803,6 +818,10 @@ async function processMessage(args) {
             || (classifySource === 'planning_phrase_guard' ? null : (_openPlan ? _openPlan.planId : null)),
           name: planning?.name || null,
           startedExplicit: planning?.startedExplicit === true || classifySource === 'planning_pinned',
+          // Capability-gap turns are NEW capability requests — they must not
+          // inherit (and mutate) the session's bound finalized plan. planning.cjs
+          // honors this by only reusing a bound session that's still drafting.
+          preferFresh: classifySource === 'capability_gap',
         },
         source,
         // Planning entered mid-conversation — the routed session's recent
@@ -1044,6 +1063,19 @@ const server = http.createServer(async (req, res) => {
     }
     if (body.sessionId) _lastSessionId = body.sessionId;
     handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items, body.sessionId || null, body.planFile || null, body.trace || null, body.artifacts || null);
+    // Feed the completed task's RESULT back into conversation history. The
+    // reply the user saw was only a handoff phrase ("one sec while I search"),
+    // so follow-ups like "how long in office" have no real answer to reason
+    // over — the quick lane then hallucinates from stale knowledge instead.
+    if (body.status === 'done' && body.result) {
+      const t = taskJournal.getTask(body.taskId);
+      const tPrompt = t?.prompt || null;
+      if (tPrompt) {
+        const resultText = String(body.result).slice(0, 800);
+        _addTurn(tPrompt, resultText, t.intent || 'handoff');
+        _logConversationTurn(tPrompt, resultText, t.intent || 'handoff', body.sessionId || t.sessionId || null);
+      }
+    }
     return _send(res, 200, { ok: true });
   }
 

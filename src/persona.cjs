@@ -120,6 +120,11 @@ async function buildSystemPrompt(opts = {}) {
 
   let prompt = BASE_PERSONA;
 
+  // Temporal grounding — every lane (quick answers, planning replies,
+  // statusCheck) needs the real date or it hallucinates elapsed time and
+  // invents "today". Same format the stategraph Answer node uses.
+  prompt += `\n\nCURRENT LOCAL TIME: ${new Date().toLocaleString('en-US')} (${Intl.DateTimeFormat().resolvedOptions().timeZone})`;
+
   if (overlay) {
     prompt += '\n\n' + overlay;
   }
