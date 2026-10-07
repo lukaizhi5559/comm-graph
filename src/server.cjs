@@ -618,7 +618,28 @@ async function processMessage(args) {
   // ── Step 4: Execute based on intent ───────────────────────────────────────────
   let result;
 
-  switch (intent) {
+  // Deterministic log-read fast path — "check the X log / show me the logs"
+  // answers from real log data (run visibly in the diagnosis pane) regardless
+  // of how the classifier routed the message. Only fires on an explicit
+  // "log" mention so normal status/planning turns pass through.
+  if (/\blogs?\b/i.test(englishText)) {
+    try {
+      const { probeLog } = require('./nodes/statusCheck.cjs');
+      const lp = await probeLog(englishText);
+      if (lp) {
+        const response = `Here's ${lp.name}.log:\n\`\`\`\n${lp.out || '(empty)'}\n\`\`\``;
+        result = {
+          text: response,
+          fullText: response,
+          metadata: { source: 'log_probe_fast_path', intent, log: lp.name, speakable: false },
+        };
+      }
+    } catch (err) {
+      logger.warn('[Server] log probe fast-path failed', { error: err.message });
+    }
+  }
+
+  if (!result) switch (intent) {
     case 0: { // handoff
       // Compute guessedIntent BEFORE handoff() so it's available for task:created
       // (intentGuesser.guess is a pure synchronous regex — ~1ms, no LLM/async)

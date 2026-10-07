@@ -9,8 +9,86 @@
  */
 
 const logger = require('../logger.cjs');
+const http = require('http');
 const { ask, buildMessages } = require('../llm-providers.cjs');
 const { formatStatusSummary, getActiveTasks, getRecentTasks } = require('../taskJournal.cjs');
+const sysMap = require('../../../shared/system-map.cjs');
+
+// ── Visible log reads — same 'thinkdrop: check' pane session as planning ──
+const COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
+let _diagSessionId = null;
+
+function _postJson(port, path_, payload, timeoutMs = 20000) {
+  return new Promise((resolve) => {
+    try {
+      const body = JSON.stringify(payload);
+      const req = http.request({
+        hostname: '127.0.0.1', port, path: path_, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: timeoutMs,
+      }, (res) => {
+        let raw = '';
+        res.on('data', c => { raw += c; });
+        res.on('end', () => { try { resolve(JSON.parse(raw)); } catch (_) { resolve(null); } });
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+      req.end(body);
+    } catch (_) { resolve(null); }
+  });
+}
+
+async function _ptyExec(cmd, timeoutMs = 15000) {
+  const r = await _postJson(COMMAND_PORT, '/terminal.exec', {
+    label: 'thinkdrop: check', sessionId: _diagSessionId || undefined, cmd, timeoutMs,
+  }, timeoutMs + 5000);
+  if (r && r.ok !== false && r.sessionId) _diagSessionId = r.sessionId;
+  return r;
+}
+
+const _ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
+
+function _cleanDelta(delta) {
+  return String(delta || '')
+    .replace(_ANSI_RE, '')
+    .split('\n')
+    .filter(l => !l.includes('__TD_EXIT'))
+    .filter(l => !/command not found: compdef/.test(l))
+    .filter(l => !/^\s*%\s*$/.test(l))
+    .join('\n')
+    .replace(/(?:^|\n)[^\n]*@\S+\s+[^\n]*[%$#>]\s*$/, '')
+    .trim();
+}
+
+// "check the comms-graph log" / "why did the last task fail" — answer from
+// REAL log data, run as a visible terminal command in the diagnosis pane.
+// Falls back to direct file reads when the PTY layer is unreachable.
+async function _probeLog(englishText) {
+  const s = String(englishText || '');
+  const wantsLog = /\blogs?\b/i.test(s);
+  const wantsWhy = /\bwhy\b|\bwhat happened\b|\bwent wrong\b|\bfail(?:ed|ure|ing)?\b|\berrors?\b|\bbroke\b|\bdidn'?t work\b/i.test(s);
+  if (!wantsLog && !wantsWhy) return null;
+
+  const names = sysMap.listLogs().map(l => l.file.replace(/\.log$/, ''));
+  const lower = s.toLowerCase();
+  const named = names.find(n => lower.includes(n.toLowerCase()) || lower.includes(n.split('-')[0].toLowerCase()));
+  const name = named || (wantsLog ? 'main' : 'command');
+  const nm = s.match(/\blast\s+(\d+)/i);
+  const n = nm ? Math.min(parseInt(nm[1], 10), 200) : 40;
+  const file = `${sysMap.logsDir()}/${name}.log`;
+  const cmd = wantsLog && !wantsWhy
+    ? `tail -n ${n} ${JSON.stringify(file)}`
+    : `grep -n -i -E 'error|fail|eaddr|timeout|crash' ${JSON.stringify(file)} | tail -n ${Math.min(n, 40)}`;
+  const r = await _ptyExec(cmd);
+  let out = r && r.ok !== false ? _cleanDelta(r.delta) : '';
+  if (!out) {
+    // PTY unreachable — fall back to the file helpers so the answer still works.
+    out = wantsLog && !wantsWhy
+      ? sysMap.tailLog(name, n)
+      : sysMap.grepLog(name, 'error|fail|eaddr|timeout|crash', { context: 1, maxMatches: Math.min(n, 40) });
+  }
+  return { name, out: String(out || '').slice(-6000) };
+}
 
 // "is <tool> installed" — probe the real binary rather than guessing.
 const _INSTALL_PROBE_RE = /\b(?:is|was)\s+(?:the\s+plan|it|that|([a-z0-9@._-]+))\s+(installed|set up)\b/i;
@@ -86,6 +164,18 @@ async function execute(englishText, systemPrompt) {
     };
   }
 
+  // Log/failure questions read the real log — visibly in the diagnosis pane.
+  const logProbe = await _probeLog(englishText).catch(() => null);
+  if (logProbe) {
+    const header = `Here's ${logProbe.name}.log:`;
+    const response = `${header}\n\`\`\`\n${logProbe.out || '(empty)'}\n\`\`\``;
+    return {
+      text: response,
+      fullText: response,
+      metadata: { source: 'status_check_log_probe', intent: 3, log: logProbe.name },
+    };
+  }
+
   // Get status summary from task journal
   const summary = formatStatusSummary();
 
@@ -152,4 +242,4 @@ async function execute(englishText, systemPrompt) {
   };
 }
 
-module.exports = { execute, isStatusQuery };
+module.exports = { execute, isStatusQuery, probeLog: _probeLog };

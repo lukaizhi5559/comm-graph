@@ -473,7 +473,7 @@ async function _toolWebSearch(query) {
     .join('\n');
 }
 
-const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select|plan\.find|plan\.open|system\.map|logs\.tail)(?:\s*\(\s*"([^"]+)"\s*\))?\s*<\/tool>/g;
+const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select|plan\.find|plan\.open|system\.map|logs\.tail|logs\.head|logs\.grep|logs\.range)(?:\s*\(\s*"([^"]+)"\s*\))?\s*<\/tool>/g;
 
 const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const COMMAND_API_KEY = process.env.MCP_COMMAND_API_KEY || process.env.MCP_API_KEY || '';
@@ -542,6 +542,38 @@ async function _toolCapabilitySelect(name) {
   return `${res.agentId} registered as a draft agent (status: draft). Use "${res.agentId}" in the task's Agents line — plan-check will offer "Set up" before the run.${res?.secrets?.length ? `\nIt will need: ${res.secrets.join(', ')}` : ''}`;
 }
 
+// ── Visible diagnosis — run checks inside a labeled PTY session ────────────
+// 'thinkdrop: check' lives in the terminal pane like cli.agent's sessions, so
+// the user watches the investigation instead of trusting prose. Everything is
+// fail-open: visibility must never break a tool.
+const DIAG_SESSION_LABEL = 'thinkdrop: check';
+let _diagSessionId = null;
+
+// Ticker line in the collapsed drawer header — fire-and-forget.
+function _activity(line, kind = 'note') {
+  try {
+    _postJson(MAIN_PORT, '/agent-turn', { type: 'terminal:activity', kind, line }, '', 2000).catch?.(() => {});
+  } catch (_) {}
+}
+
+async function _ptyDiagnose(cmd, timeoutMs = 30000) {
+  const r = await _postJson(COMMAND_SERVICE_PORT, '/terminal.exec', {
+    label: DIAG_SESSION_LABEL, sessionId: _diagSessionId || undefined,
+    cmd, timeoutMs,
+  }, '', Math.min(timeoutMs + 3000, 60000));
+  if (r && r.ok !== false && r.sessionId) _diagSessionId = r.sessionId;
+  return r;
+}
+
+async function _ptyNote(text) {
+  const r = await _postJson(COMMAND_SERVICE_PORT, '/terminal.note', {
+    label: DIAG_SESSION_LABEL, sessionId: _diagSessionId || undefined,
+    text: String(text || '').slice(0, 200),
+  }, '', 3000);
+  if (r && r.ok !== false && r.sessionId) _diagSessionId = r.sessionId;
+  return r;
+}
+
 // ── Self-knowledge tools — plans on disk, ~/.thinkdrop layout, project logs ──
 
 function _toolPlanFind(query) {
@@ -588,9 +620,67 @@ function _toolPlanOpen(planId, sessionId) {
     + `.\nCurrent state:\n${_renderPlanState(opened)}\nTell the user what you found and what the next step is.`;
 }
 
-function _toolLogsTail(query) {
+// Parse "name[, n]" tool queries into {name, n} — shared by the log tools.
+function _parseLogQuery(query, defN) {
   const m = String(query || '').match(/^([^\s,"]+)(?:[,\s]+(\d+))?/);
-  return sysMap.tailLog(m ? m[1] : '', m && m[2] ? parseInt(m[2], 10) : 80);
+  return { name: m ? m[1] : '', n: m && m[2] ? parseInt(m[2], 10) : defN };
+}
+
+function _logFilePath(name) {
+  const safe = String(name || '').replace(/\.log$/i, '').replace(/[^\w-]/g, '');
+  return safe ? path.join(sysMap.logsDir(), safe + '.log') : null;
+}
+
+function _toolLogsTail(query) {
+  const { name, n } = _parseLogQuery(query, 80);
+  return sysMap.tailLog(name, n);
+}
+
+function _toolLogsHead(query) {
+  const { name, n } = _parseLogQuery(query, 50);
+  return sysMap.headLog(name, n);
+}
+
+// "logname | pattern [, context]"
+function _toolLogsGrep(query) {
+  const parts = String(query || '').split('|').map(s => s.trim());
+  const m = (parts[1] || '').match(/^([^\s,"]+)(?:[,\s]+(\d+))?/);
+  return sysMap.grepLog(parts[0], m ? m[1] : '', { context: m && m[2] ? parseInt(m[2], 10) : 3 });
+}
+
+// "logname | from-to"
+function _toolLogsRange(query) {
+  const parts = String(query || '').split('|').map(s => s.trim());
+  const m = (parts[1] || '').match(/(\d+)\s*-\s*(\d+)/);
+  return sysMap.logRange(parts[0], m ? m[1] : 1, m ? m[2] : 80);
+}
+
+// Strip PTY delta down to real output: ANSI codes, exit markers, zsh init
+// noise, end-of-output markers, and the trailing user@host prompt line.
+const _PTY_ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
+function _ptyCleanDelta(delta) {
+  return String(delta || '')
+    .replace(_PTY_ANSI_RE, '')
+    .split('\n')
+    .filter(l => !l.includes('__TD_EXIT'))
+    .filter(l => !/command not found: compdef/.test(l))
+    .filter(l => !/^\s*%\s*$/.test(l))
+    .join('\n')
+    .replace(/(?:^|\n)[^\n]*@\S+\s+[^\n]*[%$#>]\s*$/, '')
+    .trim();
+}
+
+// Run a log read as a REAL terminal command inside the diagnosis pane — the
+// user watches `tail`/`grep` happen; the screen output IS the tool result.
+// Falls back to the file helpers when the PTY layer is unreachable.
+async function _ptyLogsCmd(shellCmd, fallbackFn) {
+  const r = await _ptyDiagnose(shellCmd);
+  const text = r && r.ok !== false ? _ptyCleanDelta(r.delta) : '';
+  return text || fallbackFn();
+}
+
+function _ptyCmdText(r) {
+  return r ? _ptyCleanDelta(r.delta) : '';
 }
 
 async function _runTools(text, sessionId) {
@@ -605,17 +695,73 @@ async function _runTools(text, sessionId) {
   for (const call of calls.slice(0, 3)) {
     logger.info('[Planning] Tool call', { tool: call.tool, query: call.query });
     let out;
-    if (call.tool === 'memory.search') out = await _toolMemorySearch(call.query);
-    else if (call.tool === 'web.search') out = await _toolWebSearch(call.query);
-    else if (call.tool === 'media.resolve') out = await _toolMediaResolve(call.query);
-    else if (call.tool === 'screen.read') out = await _toolScreenRead(call.query);
-    else if (call.tool === 'capability.search') out = await _toolCapabilitySearch(call.query);
-    else if (call.tool === 'capability.probe') out = await _toolCapabilityProbe(call.query);
-    else if (call.tool === 'plan.find') out = _toolPlanFind(call.query);
-    else if (call.tool === 'plan.open') out = _toolPlanOpen(call.query, sessionId);
-    else if (call.tool === 'system.map') out = sysMap.renderLayout();
-    else if (call.tool === 'logs.tail') out = _toolLogsTail(call.query);
-    else out = await _toolCapabilitySelect(call.query);
+    if (call.tool === 'memory.search') {
+      await _ptyNote(`searching memory for "${call.query}"…`);
+      out = await _toolMemorySearch(call.query);
+    }
+    else if (call.tool === 'web.search') {
+      await _ptyNote(`searching the web for "${call.query}"…`);
+      out = await _toolWebSearch(call.query);
+    }
+    else if (call.tool === 'media.resolve') {
+      await _ptyNote(`finding playable media: "${call.query}"…`);
+      out = await _toolMediaResolve(call.query);
+    }
+    else if (call.tool === 'screen.read') {
+      await _ptyNote('reading the screen…');
+      out = await _toolScreenRead(call.query);
+    }
+    else if (call.tool === 'capability.search') {
+      await _ptyNote(`looking up capabilities for "${call.query}"…`);
+      out = await _toolCapabilitySearch(call.query);
+    }
+    else if (call.tool === 'capability.probe') {
+      // Read-only probe runs VISIBLY in the diagnosis pane — same command the
+      // user could run, with the pane watching exit status.
+      const r = await _ptyDiagnose(call.query);
+      out = _ptyCmdText(r) || await _toolCapabilityProbe(call.query);
+    }
+    else if (call.tool === 'plan.find') {
+      await _ptyNote(`searching saved plans for "${call.query}"…`);
+      out = _toolPlanFind(call.query);
+    }
+    else if (call.tool === 'plan.open') {
+      await _ptyNote(`opening saved plan ${call.query}…`);
+      out = _toolPlanOpen(call.query, sessionId);
+    }
+    else if (call.tool === 'system.map') {
+      await _ptyNote('loading ThinkDrop system map…');
+      out = sysMap.renderLayout();
+    }
+    else if (call.tool === 'logs.tail' || call.tool === 'logs.head'
+             || call.tool === 'logs.grep' || call.tool === 'logs.range') {
+      // Real terminal command in the pane — visible, bounded, greppable.
+      const file = _logFilePath((call.query || '').split('|')[0].trim().split(/[,\s]/)[0]);
+      const args2 = String(call.query || '');
+      let shellCmd = null;
+      if (file) {
+        if (call.tool === 'logs.tail') shellCmd = `tail -n ${_parseLogQuery(args2, 80).n} ${JSON.stringify(file)}`;
+        else if (call.tool === 'logs.head') shellCmd = `head -n ${_parseLogQuery(args2, 50).n} ${JSON.stringify(file)}`;
+        else if (call.tool === 'logs.grep') {
+          const parts = args2.split('|').map(s => s.trim());
+          const gm = (parts[1] || '').match(/^([^\s,"]+)(?:[,\s]+(\d+))?/);
+          shellCmd = gm ? `grep -n -i -C${gm[2] || 3} ${JSON.stringify(gm[1])} ${JSON.stringify(file)} | head -n 120` : null;
+        } else {
+          const parts = args2.split('|').map(s => s.trim());
+          const rm = (parts[1] || '').match(/(\d+)\s*-\s*(\d+)/);
+          shellCmd = rm ? `sed -n '${rm[1]},${rm[2]}p' ${JSON.stringify(file)} | nl -ba -v${rm[1]}` : null;
+        }
+      }
+      const fb = call.tool === 'logs.tail' ? () => _toolLogsTail(call.query)
+               : call.tool === 'logs.head' ? () => _toolLogsHead(call.query)
+               : call.tool === 'logs.grep' ? () => _toolLogsGrep(call.query)
+               : () => _toolLogsRange(call.query);
+      out = shellCmd ? await _ptyLogsCmd(shellCmd, fb) : fb();
+    }
+    else {
+      await _ptyNote(`registering ${call.query}…`);
+      out = await _toolCapabilitySelect(call.query);
+    }
     results.push(`${call.tool}("${call.query || ''}") →\n${out || '(no result)'}`);
   }
   return results.join('\n\n');
@@ -684,6 +830,14 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             (logs/<name>.log: main, comms-graph,
                                             command, …). For "why did X fail /
                                             didn't it work" — check logs first.
+  <tool>logs.head("main", 50)</tool>      — first N lines of a log — startup
+                                            failures live at the top, never tail.
+  <tool>logs.grep("comms-graph | EADDRINUSE | 3")</tool>
+                                        — search a log for a pattern with
+                                            ±context lines and line numbers.
+  <tool>logs.range("comms-graph | 120-180")</tool>
+                                        — print lines N-M of a log (zoom into
+                                            a region grep located).
 Use at most 3 tool calls per turn, then answer. Tool results come back inside
 <tool_results>. Do NOT use tools for things you already know.
 
@@ -940,20 +1094,24 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   // "a plan for X" (indefinite) is a draft request — never a referent.
   const refMatch = String(englishText || '').match(/\bthe\s+([\w][\w .-]{0,40}?)\s+plan\b/i);
   if (refMatch && !/^(?:new|next|same)$/i.test(refMatch[1].trim())) {
+    _activity(`searching saved plans for "${refMatch[1].trim()}"…`);
     const hits = sysMap.findPlans(refMatch[1]);
     const top = hits[0];
     if (top && top.planId !== sess.planId && (!hits[1] || hits[1].score < top.score)) {
       const { sess: opened, reopened } = _openPlanForSession(top.planId, sessionId);
       if (opened) {
         logger.info('[Planning] Referent switch', { from: sess.planId, to: opened.planId, reopened });
+        _activity(reopened ? `reopened plan "${opened.name || opened.planId}"` : `switched to plan "${opened.name || opened.planId}"`);
         sess = opened;
       }
     }
   } else if (_isUnnamedResume(englishText)) {
     // "let continue the plan" with no named referent — if several resumable
     // plans exist (open OR failed — never done), ask which instead of guessing.
+    _activity('looking for resumable plans…');
     const resumables = sysMap.resumablePlans().slice(0, 6);
     if (resumables.length > 1) {
+      _activity(`found ${resumables.length} resumable plans — asking which one`);
       const options = resumables.map(p => ({
         label: `the ${p.name || p.title || p.planId} plan`,
         description: `${p.status} · ${p.pendingCount} of ${p.totalTasks} tasks left`,
