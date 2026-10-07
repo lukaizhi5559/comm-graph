@@ -1080,6 +1080,30 @@ function _isUnnamedResume(t) {
  */
 async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null, screenContext: passedScreenContext = null }) {
   const startedExplicit = planning.startedExplicit === true;
+
+  // ── Fresh-draft escape — "none of these — start a new plan" (the dismiss
+  // option on the resume choice card) and explicit "start a new/fresh plan"
+  // phrasing. Unbind the session and open a new draft instead of mutating the
+  // still-bound plan. Deterministic reply — no LLM call needed.
+  if (/^none of these\b|\bstart (?:a )?(?:new|fresh) plan\b/i.test(String(englishText || '').trim())) {
+    _sessionToPlan.delete(sessionId);
+    const draft = _getOrCreateSession({
+      planId: null, sessionId,
+      originalPrompt: '', conversationContext,
+    });
+    const text = 'Starting a fresh plan — what would you like it to do?';
+    return {
+      text,
+      fullText: text,
+      metadata: {
+        source: 'planning', intent: 6, planId: draft.planId, planFile: draft.filePath,
+        planTitle: draft.title, planName: draft.name, planStatus: draft.status,
+        taskCount: 0, authRequired: 0, unknownAgents: [],
+        choices: null, runPlan: false, startedExplicit, speakable: true,
+      },
+    };
+  }
+
   let sess = _getOrCreateSession({
     planId: planning.planId || _sessionToPlan.get(sessionId) || (planning.active ? _activePlanId : null),
     sessionId,
@@ -1121,9 +1145,13 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
         text: 'Which plan did you mean?',
         fullText: 'Which plan did you mean?',
         metadata: {
-          source: 'planning', intent: 6, planId: sess.planId, planFile: sess.filePath,
-          planTitle: sess.title, planName: sess.name, planStatus: sess.status,
-          taskCount: sess.tasks.length, authRequired: 0, unknownAgents: [],
+          // No plan identity — nothing is chosen yet. Carrying the bound
+          // session's planFile/'ready' status would fire the proactive
+          // plan:check readiness card underneath this question card and pin
+          // planning:state to a plan the user hasn't picked.
+          source: 'planning', intent: 6, planId: null, planFile: null,
+          planTitle: null, planName: null, planStatus: null,
+          taskCount: 0, authRequired: 0, unknownAgents: [],
           choices: { question: 'I found a few plans on the go — which one did you mean?', options },
           runPlan: false, startedExplicit, speakable: true,
         },

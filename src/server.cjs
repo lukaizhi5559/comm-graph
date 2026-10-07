@@ -639,6 +639,42 @@ async function processMessage(args) {
     }
   }
 
+  // Plan-referent re-route — messages ABOUT a saved plan ("the nylas plan",
+  // "no the nylas plan", a choice-card label riding back, "i thought we had a
+  // nylas plan") must never become handoff tasks and must land in the lane
+  // that can act on them:
+  //   - definite selection, not informational → planning (referent-switch
+  //     binds the session; status_check would only describe it and the next
+  //     "continue" would re-ask forever)
+  //   - informational ("thought we had…", "do we have…") → status_check
+  //     (_probePlan answers from disk)
+  //   - the dismiss sentinel "none of these — start a new plan" → planning
+  //     (fresh-draft escape)
+  if (!result && (intent === 0 || intent === 1 || intent === 3) && /\bplan\b|none of these/i.test(englishText)) {
+    try {
+      const sysMap = require('../../shared/system-map.cjs');
+      const s = String(englishText || '');
+      if (/^none of these\b|\bstart (?:a )?(?:new|fresh) plan\b/i.test(s)) {
+        logger.info('[Server] Fresh-plan sentinel → planning lane');
+        intent = 6;
+        intentName = 'planning';
+      } else {
+        const refM = s.match(/\bthe\s+([\w][\w .-]{0,40}?)\s+plan\b/i)
+          || s.match(/\bplan\s+(?:for|about|on)\s+([\w][\w .-]{1,40})/i)
+          || s.match(/\b([\w][\w .-]{0,40}?)\s+plan\b/i);
+        const informational = /\b(?:thought|think|remember|had|have|has|was|were|is|are|there|what|which|show|tell|do we|did we|find|search|look|any)\b/i.test(s);
+        if (refM && refM[1] && sysMap.findPlans(refM[1].trim()).length) {
+          const to = informational ? 3 : 6;
+          if (to !== intent) {
+            logger.info('[Server] Plan referent re-route', { ref: refM[1].trim(), from: intent, to, informational });
+            intent = to;
+            intentName = to === 6 ? 'planning' : 'status_check';
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
   if (!result) switch (intent) {
     case 0: { // handoff
       // Compute guessedIntent BEFORE handoff() so it's available for task:created
