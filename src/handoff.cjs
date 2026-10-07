@@ -219,4 +219,46 @@ function remove(taskId) {
   return deleted;
 }
 
-module.exports = { execute, complete, remove, detectAgent, isLocked, getWaitingCount };
+// ── Queued-task re-notify sweep ─────────────────────────────────────────────
+// _notifyMain can fail (main process down, port stolen by a stale instance —
+// observed: a 5h-old zombie Electron held :3010 and every approved plan
+// "dispatched" into the void). Tasks then sat `queued` forever — the old log
+// line claimed "picked up on retry" but no retry existed. This sweep re-notifies
+// queued tasks that never got a `running` ping, up to 3 attempts, then fails
+// them honestly so the UI shows the truth instead of a silent stuck queue.
+const _notifyAttempts = new Map(); // taskId → attempt count
+const SWEEP_INTERVAL_MS = 15 * 1000;
+const STALE_QUEUED_MS   = 20 * 1000; // queued with no ack for this long = notify missed
+const MAX_NOTIFY_ATTEMPTS = 3;
+
+let _sweepTimer = null;
+function startRetrySweep() {
+  if (_sweepTimer) return;
+  _sweepTimer = setInterval(async () => {
+    const journal = require('./taskJournal.cjs');
+    for (const task of journal.getActiveTasks()) {
+      if (task.status !== 'queued') continue;
+      if (Date.now() - (task.createdAt || 0) < STALE_QUEUED_MS) continue;
+      const attempts = (_notifyAttempts.get(task.id) || 0) + 1;
+      _notifyAttempts.set(task.id, attempts);
+      if (attempts > MAX_NOTIFY_ATTEMPTS) {
+        logger.warn('[Handoff] Notify retry exhausted — marking task failed', { taskId: task.id, attempts });
+        journal.updateTask(task.id, 'failed', {
+          error: 'dispatch unreachable — the app did not acknowledge the task (is a stale instance holding the port?)',
+        });
+        _notifyAttempts.delete(task.id);
+        continue;
+      }
+      logger.info('[Handoff] Re-notifying queued task (attempt ' + attempts + ')', { taskId: task.id });
+      try {
+        const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
+        const ok = await _notifyMain(task.id, task.prompt, task.agentId, task.source, null,
+          guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null);
+        if (ok) _notifyAttempts.delete(task.id);
+      } catch (_) { /* next sweep */ }
+    }
+  }, SWEEP_INTERVAL_MS);
+  _sweepTimer.unref?.();
+}
+
+module.exports = { execute, complete, remove, detectAgent, isLocked, getWaitingCount, startRetrySweep };

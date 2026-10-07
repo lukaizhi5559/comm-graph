@@ -44,7 +44,7 @@ const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
 const planningNode = require('./nodes/planning.cjs');
 const { execute: statusCheck } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
-const { execute: handoff, complete: handoffComplete, remove: handoffRemove } = require('./handoff.cjs');
+const { execute: handoff, complete: handoffComplete, remove: handoffRemove, startRetrySweep: startHandoffRetrySweep } = require('./handoff.cjs');
 const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
 const intentGuesser = require('./intentGuesser.cjs');
 const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = require('./screen-context.cjs');
@@ -1076,6 +1076,7 @@ const server = http.createServer(async (req, res) => {
 
 // ── Start ──────────────────────────────────────────────────────────────────────
 server.listen(PORT, '127.0.0.1', () => {
+  startHandoffRetrySweep();
   logger.info(`[Server] comms-graph listening on http://127.0.0.1:${PORT}`, {
     env: process.env.NODE_ENV || 'development',
     personalityPort: process.env.PERSONALITY_SERVICE_PORT || '3012',

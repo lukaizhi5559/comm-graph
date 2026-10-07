@@ -1092,10 +1092,32 @@ function _renderAgentCatalog() {
   } catch (_) { return '(registry unavailable — use generic surfaces only)'; }
 }
 
+// Cheap reality check for install-shaped tasks: does the binary the task is
+// supposed to install actually exist on PATH right now? Plan-file statuses go
+// stale (a task "running" when its process died, or an install that finished
+// out-of-band) — the LLM was quoting file status verbatim and telling users
+// "Task 2 is running" while the binary already sat on PATH. One `which` call
+// per install task is ~2ms and turns the reply into observed truth.
+const _INSTALL_BIN_RE = /\binstall(?:ing)?\s+(?:the\s+)?([a-z0-9][a-z0-9._-]*)/i;
+function _liveInstallCheck(title) {
+  const m = String(title || '').match(_INSTALL_BIN_RE);
+  if (!m) return null;
+  const bin = m[1].replace(/-cli$/i, '').replace(/[^a-z0-9@._-]/gi, '');
+  if (!bin || bin.length < 2 || /^(node\.?js|npm|package|the)$/i.test(bin)) return null;
+  try {
+    const r = require('child_process').spawnSync('which', [bin], { timeout: 3000 });
+    return r.status === 0 ? `${bin} on PATH` : `${bin} NOT on PATH`;
+  } catch (_) { return null; }
+}
+
 function _renderPlanState(sess) {
   if (!sess.tasks.length) return '(no tasks yet — first turn)';
-  const lines = sess.tasks.map(t =>
-    `Task ${t.num} — ${t.title} | mode=${t.mode} | deps=[${t.dependsOn.join(',') || 'none'}] | auth=${t.auth} | status=${t.status}`);
+  const lines = sess.tasks.map(t => {
+    const live = t.status === 'in-progress' || t.status === 'pending' || t.status === 'running'
+      ? _liveInstallCheck(t.title) : null;
+    return `Task ${t.num} — ${t.title} | mode=${t.mode} | deps=[${t.dependsOn.join(',') || 'none'}] | auth=${t.auth} | status=${t.status}`
+      + (live ? ` | live-check: ${live} (reality, right now — trust this over the stale status)` : '');
+  });
   if (sess.risks.length) lines.push('Risks: ' + sess.risks.join('; '));
   // Show the gate truth so the LLM never claims execution while blocked.
   try {
