@@ -22,9 +22,19 @@
  */
 
 const logger = require('../logger.cjs');
+const http = require('http');
 const { askEarly, buildMessages } = require('../llm-providers.cjs');
 const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
 const { isCannedRefusal, isPromptEcho } = require('../refusal.cjs');
+const { isContextDependent } = require('../../../shared/text-patterns.cjs');
+
+const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
+const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
+const SERP_FIRST_ENABLED = process.env.GENERAL_QUICK_SERP !== '0';
+const SERP_TIMEOUT_MS = 7000;
+
+// Questions asking about ThinkDrop/the assistant itself — a persona echo is
+// the CORRECT answer for these, never a sentinel.
 
 // ── Direct answer mode directive ─────────────────────────────────────────────
 // Appended to the system prompt to override the persona's handoff phrase
@@ -99,6 +109,78 @@ Nothing else. Just the number 0. No explanation, no handoff phrase.
 // the CORRECT answer for these, never a sentinel.
 const SELF_REFERENTIAL_RE = /\bthinkdrop\b|\bwho are you\b|\bwhat can you do\b|\byour (?:capabilit\w*|features?|tools?|skills?|limits?)\b|\babout yourself\b/i;
 
+// ── SERP-first gate ──────────────────────────────────────────────────────────
+// Knowledge-shaped questions try web.search before the LLM: a captured AI
+// Overview is a free, fresher, sourced answer. Chitchat/personal/recall/
+// self-referential/selection prompts are excluded — they have no SERP answer.
+const KNOWLEDGE_QUESTION_RE = /^(?:who|what|when|where|which|whose|why|how)\b|\bwhat(?:'s| is| are| was| were)\b|\bwho(?:'s| is| are| was| were)\b|\bdefine\b|\bexplain\b|\btell me about\b|\bhow (?:many|much|old|long|far|tall|deep|fast)\b|\bwhen (?:did|does|will|is|was)\b|\blatest\b|\bcurrent(?:ly)?\b|\btoday'?s?\b|\bnews\b|\bprice of\b|\bweather\b/i;
+const PERSONAL_OR_RECALL_RE = /\b(my|our|we|us)\b|\b(yesterday|earlier|before|last time|we talked|we discussed|chatted|our conversation|remind me what)\b/i;
+const GREETING_RE = /^\s*(hi|hello|hey|yo|good\s+(morning|afternoon|evening)|thanks|thank you|ok(?:ay)?|cool|nice|lol)\b/i;
+
+function _isKnowledgeQuestion(text) {
+  const t = String(text || '').trim();
+  if (!t || t.length < 8) return false;
+  if (SELF_REFERENTIAL_RE.test(t)) return false;
+  if (GREETING_RE.test(t)) return false;
+  if (PERSONAL_OR_RECALL_RE.test(t)) return false;
+  // Pronoun-subject prompts ("how long has he been in office") carry no
+  // referent — a SERP lookup sends the literal "he" to Google and returns
+  // whoever IT picks (observed: Trump→Biden follow-up). The LLM path gets
+  // conversationContext and binds the pronoun itself.
+  if (isContextDependent(t)) return false;
+  if (!KNOWLEDGE_QUESTION_RE.test(t)) return false;
+  return true;
+}
+
+function _postJson(port, urlPath, payload, apiKey, timeoutMs) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const req = http.request({
+      hostname: '127.0.0.1', port, path: urlPath, method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      timeout: timeoutMs,
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve(null); } });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
+
+// Returns { answer, sources } when the SERP captured a usable AI Overview,
+// else null. Never throws — any failure falls through to the LLM path.
+async function _serpAnswer(query, lang) {
+  if (!WS_API_KEY) return null;
+  const res = await _postJson(WEB_SEARCH_PORT, '/web.search', {
+    version: 'mcp.v1', service: 'web-search', action: 'web.search',
+    payload: { query, maxResults: 3, ...(lang && lang !== 'en' ? { lang } : {}) },
+    requestId: 'cg_gq_ws_' + Date.now(),
+    context: { userId: 'local_user' },
+  }, WS_API_KEY, SERP_TIMEOUT_MS);
+  const data = res?.data || res;
+  const overview = typeof data?.aiOverview === 'string' ? data.aiOverview.trim() : '';
+  if (overview.length > 40) {
+    const sources = (data?.results || [])
+      .filter(r => r.url && r.url.startsWith('http')).slice(0, 5)
+      .map(r => ({ url: r.url, title: r.title || '', hostname: (() => { try { return new URL(r.url).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })() }));
+    return { answer: overview, sources };
+  }
+  // No overview — return whatever snippets exist so the caller can ground the
+  // LLM call on fresh results instead of stale training knowledge.
+  const snippets = (data?.results || []).slice(0, 3)
+    .map(r => `- ${r.title || ''}: ${r.snippet || r.description || ''}`.trim())
+    .filter(s => s.length > 4);
+  return snippets.length ? { snippets } : null;
+}
+
 /**
  * @param {string} englishText  - English user message
  * @param {string} systemPrompt - Full system prompt (persona + personality overlay + language)
@@ -108,9 +190,41 @@ const SELF_REFERENTIAL_RE = /\bthinkdrop\b|\bwho are you\b|\bwhat can you do\b|\
  */
 async function execute(englishText, systemPrompt, conversationContext, opts = {}) {
   try {
+    // ── SERP-first for knowledge questions ────────────────────────────────────
+    // A captured AI Overview is a free, fresher, sourced answer — skip the LLM
+    // entirely. Selection-context prompts are excluded (the highlighted text
+    // lives on the user's screen, not on the SERP).
+    let serpSnippets = null;
+    if (SERP_FIRST_ENABLED && !opts.hasSelectionContext && _isKnowledgeQuestion(englishText)) {
+      const _searchQuery = (opts.detectedLanguage && opts.detectedLanguage !== 'en' && opts.originalPrompt)
+        ? opts.originalPrompt : englishText;
+      try {
+        const serp = await _serpAnswer(_searchQuery, opts.detectedLanguage);
+        if (serp?.answer) {
+          logger.info('[GeneralQuick] serp_overview — skipping LLM', {
+            chars: serp.answer.length, lang: opts.detectedLanguage || 'en',
+            inputPreview: englishText.substring(0, 60),
+          });
+          return {
+            text: serp.answer,
+            fullText: serp.answer,
+            metadata: { source: 'serp_overview', provider: 'web-search', intent: 1, sources: serp.sources },
+          };
+        }
+        serpSnippets = serp?.snippets || null;
+      } catch (e) {
+        logger.warn('[GeneralQuick] SERP-first failed — falling through to LLM', { error: e.message });
+      }
+    }
+
     // Append direct-answer directive to override the persona's routing instructions
-    const directPrompt = systemPrompt +
+    let directPrompt = systemPrompt +
       (opts.hasSelectionContext ? SELECTION_ANSWER_DIRECTIVE : DIRECT_ANSWER_DIRECTIVE);
+    // No overview but we do have fresh snippets — ground the LLM on them so the
+    // answer isn't stale-cutoff knowledge (and fewer sentinel-0 handoffs).
+    if (serpSnippets) {
+      directPrompt += `\n\nWEB CONTEXT (fresh search results — ground your answer in these when relevant):\n${serpSnippets.join('\n')}`;
+    }
     const messages = buildMessages(englishText, directPrompt, conversationContext);
     const { firstSentence, fullText, provider } = await askEarly(messages, {
       maxTokens: opts.hasSelectionContext ? 400 : 150,

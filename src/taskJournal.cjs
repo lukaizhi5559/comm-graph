@@ -116,7 +116,7 @@ function setOnTerminal(fn) {
  * @param {string|null} [opts.sessionId] - Conversation session the task belongs to (for recall)
  * @returns {string} task id
  */
-function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null, userApproved = false, thoughtContext = null, planMeta = null }) {
+function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null, userApproved = false, thoughtContext = null, planMeta = null, originalPrompt = null, detectedLanguage = null }) {
   const id = _uid();
   /** @type {TaskEntry} */
   const task = {
@@ -143,6 +143,10 @@ function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text
     // Plan-runner dispatch context — { planId, planTaskNum, planTask,
     // preflightAuthBypass } — persisted so parked/queued replays keep it.
     planMeta: planMeta || null,
+    // Original-language prompt + ISO code — persisted so parked/queued replays
+    // keep searching in the user's language, not its English translation.
+    originalPrompt: originalPrompt || null,
+    detectedLanguage: detectedLanguage || null,
   };
   _tasks.set(id, task);
   _save();

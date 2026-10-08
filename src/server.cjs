@@ -27,6 +27,9 @@ const logger = require('./logger.cjs');
 // ── Load .env ──────────────────────────────────────────────────────────────────
 try {
   require('dotenv').config({ path: path.join(__dirname, '../.env') });
+  // Root .env fallback (override:false — comms-graph/.env wins) so service API
+  // keys like MCP_WEB_SEARCH_API_KEY resolve without duplicating them here.
+  require('dotenv').config({ path: path.join(__dirname, '../../.env'), override: false });
 } catch (_) {
   // dotenv not installed — env vars must be set externally
 }
@@ -699,6 +702,7 @@ async function processMessage(args) {
         englishPrompt: englishText,
         source,
         originalPrompt: originalText,
+        detectedLanguage,
         guessedIntent: _gi0,
         sessionId: routedSessionId,
         thoughtContext,
@@ -729,7 +733,7 @@ async function processMessage(args) {
     }
 
     case 1: { // general_quick
-      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext });
+      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext, originalPrompt: originalText, detectedLanguage });
       // If generalQuick couldn't answer (LLM failed), handoff to main state graph
       if (result.metadata.shouldHandoff) {
         const { guessedIntent: _gi1 } = intentGuesser.guess(classifyText, { hasSelectionContext });
@@ -737,6 +741,7 @@ async function processMessage(args) {
           englishPrompt: englishText,
           source,
           originalPrompt: originalText,
+          detectedLanguage,
           guessedIntent: _gi1,
           sessionId: routedSessionId,
         });
@@ -771,6 +776,7 @@ async function processMessage(args) {
           englishPrompt: englishText,
           source,
           originalPrompt: originalText,
+          detectedLanguage,
           guessedIntent: _gi2,
           sessionId: routedSessionId,
         });
@@ -856,6 +862,7 @@ async function processMessage(args) {
           englishPrompt: englishText,
           source,
           originalPrompt: originalText,
+          detectedLanguage,
           guessedIntent: _gi5,
           sessionId: routedSessionId,
         });
@@ -882,7 +889,7 @@ async function processMessage(args) {
 
     default: {
       // Unknown intent — default to general_quick
-      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext });
+      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext, originalPrompt: originalText, detectedLanguage });
     }
   }
 
@@ -890,7 +897,13 @@ async function processMessage(args) {
   // Use fullText (the complete answer) not text (the first-sentence preview) —
   // display, translate-back, and conversation history all need the full reply.
   let finalText = result.fullText || result.text;
-  if (wasTranslated && detectedLanguage !== 'en' && finalText && finalText.trim()) {
+  // A localized SERP overview (or a same-language LLM reply) is already in the
+  // user's language — a translate-back call would waste an LLM round-trip
+  // echoing zh text through an "en→zh" prompt. Script-detectable languages
+  // (zh/ja/ko/ar/ru/hi) only; latin languages fall through and translate.
+  const _scriptLang = require('./translate.cjs').detectScriptLanguage(finalText || '');
+  const _alreadyLocalized = _scriptLang && _scriptLang === detectedLanguage;
+  if (wasTranslated && detectedLanguage !== 'en' && finalText && finalText.trim() && !_alreadyLocalized) {
     try {
       finalText = await fromEnglish(finalText, detectedLanguage);
       logger.info('[Process] Translated response back', {

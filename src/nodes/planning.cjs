@@ -47,6 +47,11 @@ const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
 const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
 const MCP_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.MCP_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
 const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
+if (!WS_API_KEY) {
+  // web.search tool calls will 401 without this — surface it once instead of
+  // letting the LLM narrate "blocked by authorization" with no root cause.
+  logger.warn('[Planning] MCP_WEB_SEARCH_API_KEY not set — web.search tool calls will be rejected (401)');
+}
 const { needsAmbientCtx, screenContext, memoryCall } = require('../screen-context.cjs');
 
 // ── Plan session state ────────────────────────────────────────────────────────
@@ -466,8 +471,13 @@ async function _toolWebSearch(query) {
   if (!Array.isArray(results) || !results.length) {
     return `No web results found.${data?.fallbackReason ? ` (${data.fallbackReason})` : ''}`;
   }
+  // A captured AI Overview is the strongest signal — put it first so the
+  // planner quotes it instead of synthesizing from snippets.
+  const overview = typeof data?.aiOverview === 'string' && data.aiOverview.length > 40
+    ? `AI Overview (authoritative answer):\n${data.aiOverview.slice(0, 2000)}\n\nResults:\n`
+    : '';
   // URLs are first-class — the LLM can only offer links it was actually shown.
-  return results.slice(0, 5)
+  return overview + results.slice(0, 5)
     .map(r => `- ${r.title || ''}\n  ${r.url || r.link || ''}\n  ${r.snippet || r.description || ''}`.trim())
     .filter(s => s.length > 2)
     .join('\n');

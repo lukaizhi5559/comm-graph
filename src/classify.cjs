@@ -22,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('./logger.cjs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE } = require('../../shared/text-patterns.cjs');
+const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE, isContextDependent } = require('../../shared/text-patterns.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
@@ -355,6 +355,19 @@ async function classify(englishText, conversationContext, opts = {}) {
   };
 
   const _adoptKeyword = (reason) => {
+    // Context-dependency guard: a prompt whose subject is a pronoun with no
+    // named referent ("how long has he been in office") can only be answered
+    // after resolveReferences binds the pronoun — a standalone quick tier
+    // would send the literal "he" to Google and answer about the wrong
+    // person (observed: follow-up to a Trump answer returned a Biden
+    // overview). Keyword adoption is blocked no matter which path led here.
+    if (isContextDependent(englishText)) {
+      logger.info('[Classify] Context-dependent prompt — keyword veto blocked', {
+        wouldBe: keywordHit.intentName, reason,
+        inputPreview: englishText.substring(0, 60),
+      });
+      return { intent: 0, intentName: 'handoff', confidence: 0.85, source: 'context_dependent' };
+    }
     logger.info('[Classify] Keyword fallback result', {
       intent: keywordHit.intent, intentName: keywordHit.intentName,
       confidence: keywordHit.confidence, reason,
