@@ -28,12 +28,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const logger = require('../logger.cjs');
-const { ask, askStream } = require('../llm-providers.cjs');
+const { ask, askEarly, askStream } = require('../llm-providers.cjs');
 const planFormat = require('../../../shared/plan-format.cjs');
 const { canonicalAgent } = require('../../../shared/agent-canonical.cjs');
 const skillIndex = require('../../../shared/skill-index.cjs');
 const serviceMap = require('../../../shared/service-map.cjs');
 const sysMap = require('../../../shared/system-map.cjs');
+const { PLAN_CONFIRM_RE, PLAN_RUN_RE, PLAN_RUN_NEG_RE } = require('../../../shared/plan-check-phrases.cjs');
 
 // ── Paths / services ─────────────────────────────────────────────────────────
 
@@ -117,6 +118,7 @@ function _getOrCreateSession({ planId, sessionId, originalPrompt, conversationCo
   // Write the skeleton immediately so the Plans tab shows the draft the
   // moment planning mode opens — before the first LLM turn finishes.
   _writePlanFile(sess);
+  try { sess._diskMtime = fs.statSync(filePath).mtimeMs; } catch (_) {}
   return sess;
 }
 
@@ -145,11 +147,45 @@ function _loadPlanFromDisk(planId) {
     _planSessions.set(planId, sess);
     if (sess.sessionId) _sessionToPlan.set(sess.sessionId, planId);
     _activePlanId = planId;
+    try { sess._diskMtime = fs.statSync(filePath).mtimeMs; } catch (_) {}
     return sess;
   } catch (err) {
     logger.warn('[Planning] Failed to load plan from disk', { planId, error: err.message });
     return null;
   }
+}
+
+/**
+ * Re-read the plan file when it changed on disk since the session last saw
+ * it — planRunner writes task statuses mid-run, /plan.status heals orphaned
+ * markers, the user edits the file, and background stepgen streams steps in.
+ * Rendering CURRENT PLAN STATE from the session snapshot let the LLM narrate
+ * stale "running" statuses after the run died; this makes each turn see the
+ * file as it actually is.
+ */
+function _refreshSessionFromDisk(sess) {
+  try {
+    const stat = fs.statSync(sess.filePath);
+    if (sess._diskMtime && stat.mtimeMs <= sess._diskMtime) return;
+    const content = fs.readFileSync(sess.filePath, 'utf8');
+    const fm = planFormat.parseFrontmatter(content) || {};
+    const fresh = planFormat.parseTasks(content);
+    // Preserve in-memory-only bookkeeping (stepgen dedup state) across the
+    // refresh — steps/stepsStatus themselves parse back from the file.
+    const prev = new Map((sess.tasks || []).map(t => [t.num, t]));
+    for (const t of fresh) {
+      const p = prev.get(t.num);
+      if (p && p.prompt === t.prompt) {
+        if (p._stepsHash != null) t._stepsHash = p._stepsHash;
+        if (p._normalized) t._normalized = p._normalized;
+      }
+    }
+    sess.tasks = fresh;
+    sess.risks = _parseRisks(content);
+    if (fm.status) sess.status = fm.status;
+    if (fm.name) sess.name = fm.name;
+    sess._diskMtime = stat.mtimeMs;
+  } catch (_) {}
 }
 
 function _parseRisks(content) {
@@ -191,6 +227,7 @@ function _writePlanFile(sess) {
       content = content.replace(/## Risks\n\s*$/m, '## Risks\n' + sess.risks.map(r => `- ${r}`).join('\n') + '\n');
     }
     fs.writeFileSync(sess.filePath, content, 'utf8');
+    try { sess._diskMtime = fs.statSync(sess.filePath).mtimeMs; } catch (_) {}
     return true;
   } catch (err) {
     logger.error('[Planning] Plan write failed', { planId: sess.planId, error: err.message });
@@ -483,7 +520,7 @@ async function _toolWebSearch(query) {
     .join('\n');
 }
 
-const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select|plan\.find|plan\.open|system\.map|logs\.tail|logs\.head|logs\.grep|logs\.range)(?:\s*\(\s*"([^"]+)"\s*\))?\s*<\/tool>/g;
+const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select|plan\.find|plan\.open|plan\.status|plan\.cancel|journal\.recent|url\.open|setup\.start|screen\.preview|system\.map|logs\.tail|logs\.head|logs\.grep|logs\.range)(?:\s*\(\s*(?:"([^"]*)")?\s*\))?\s*<\/tool>/g;
 
 const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const COMMAND_API_KEY = process.env.MCP_COMMAND_API_KEY || process.env.MCP_API_KEY || '';
@@ -665,6 +702,183 @@ function _toolLogsRange(query) {
   return sysMap.logRange(parts[0], m ? m[1] : 1, m ? m[2] : 80);
 }
 
+// ── Live truth tools ──────────────────────────────────────────────────────────
+// The planner kept claiming cancels/runs/statuses it never performed. Every
+// such claim must now trace to one of these results — run state lives in the
+// main process (planRunner), task history in this process's taskJournal.
+
+function _resolvePlanId(query, sessionId) {
+  return String(query || '').trim()
+    || (sessionId && _sessionToPlan.get(sessionId))
+    || _activePlanId || null;
+}
+
+async function _toolPlanStatus(query, sessionId) {
+  const planId = _resolvePlanId(query, sessionId);
+  const res = await _postJson(MAIN_PORT, '/plan.status', { planId }, '', 4000);
+  if (!res || res.ok !== true) {
+    return 'plan.status FAILED — could not reach the app. Do NOT guess at run state; tell the user the status check failed.';
+  }
+  const parts = [];
+  // Lead with the effective verdict — "running" must never be the first word
+  // of a dead run's report (the old "plan file status: running" line anchored
+  // the model into narrating progress that wasn't happening).
+  if (res.liveState) {
+    parts.push(res.liveState === 'not-running'
+      ? 'LIVE STATE: NOT RUNNING — nothing is executing right now'
+      : `LIVE RUN: ${res.liveState}${res.waitingTasks?.length ? ` (paused — waiting for input on task(s) ${res.waitingTasks.join(', ')})` : ''}`);
+  } else if (res.runStatus) parts.push(`live run: ${res.runStatus}`);
+  else parts.push('no live run — nothing is executing right now');
+  if (res.planStatus) parts.push(`plan file status: ${res.planStatus}`);
+  if (res.heldAtReview?.length) parts.push(`waiting on approval: task(s) ${res.heldAtReview.join(', ')}`);
+  if (res.pendingCheck) parts.push('a readiness-check card is still open');
+  if (res.waitingTasks?.length) {
+    parts.push(`PAUSED waiting for input: task(s) ${res.waitingTasks.join(', ')} — the plan is NOT progressing until answered/resumed`);
+  }
+  if (res.interruptedTasks?.length) {
+    parts.push(`INTERRUPTED (stale marker healed): task(s) ${res.interruptedTasks.join(', ')} — were mid-flight when the run died; they are NOT running`);
+  }
+  if (res.tasks?.length) {
+    parts.push('tasks: ' + res.tasks.map(t => `#${t.num} ${t.status || 'pending'} — ${t.title}`).join(' | '));
+  }
+  if (res.runs?.length > 1) parts.push(`other live runs: ${res.runs.map(r => r.planId).join(', ')}`);
+  parts.push('TRUTHFULNESS: relay exactly what this says. A task listed as interrupted/waiting-for-input is NOT in progress — say the plan is paused/stopped and offer "run it" to resume. Never say "wrapping up" or "in progress" unless a live run exists.');
+  return parts.join('\n');
+}
+
+async function _toolPlanCancel(query, sessionId) {
+  const planId = _resolvePlanId(query, sessionId);
+  const res = await _postJson(MAIN_PORT, '/plan.cancel', { planId }, '', 4000);
+  if (!res || res.ok !== true) {
+    return 'plan.cancel FAILED — the request did not reach the app; the plan was NOT cancelled. Say so plainly, do not claim it worked.';
+  }
+  const exitNote = res.exitedPlanning
+    ? ' Planning mode is now OFF — you may tell the user so.'
+    : '';
+  if (res.cancelled) return `Plan ${res.planId} is cancelled — the run was stopped, remaining tasks marked skipped, held approvals dismissed.${exitNote}`;
+  return res.planId
+    ? `Plan ${res.planId} had no live run to stop (any open checklist/review cards were dismissed).${exitNote}`
+    : 'No plan specified and no live run exists — nothing was cancelled.';
+}
+
+// Real activity history — answers "what did I do / what's been running / did
+// it finish" from the task journal instead of inventing a summary.
+function _toolJournalRecent(query) {
+  const q = String(query || '').trim();
+  let limit = 15;
+  let needle = '';
+  if (/^\d+$/.test(q)) limit = Math.min(parseInt(q, 10), 50);
+  else if (q) needle = q.toLowerCase();
+  const tj = require('../taskJournal.cjs');
+  const match = t => !needle
+    || (t.prompt || '').toLowerCase().includes(needle)
+    || (t.originalPrompt || '').toLowerCase().includes(needle)
+    || (t.agentId || '').toLowerCase().includes(needle);
+  const fmtAgo = (ms) => {
+    if (!ms) return '';
+    const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.round(s / 60)}m ago`;
+    if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+    return `${Math.round(s / 86400)}d ago`;
+  };
+  const fmt = (t, live) => `[${live ? 'LIVE ' : ''}${t.status}] ${String(t.prompt || t.originalPrompt || '').slice(0, 90)}`
+    + (t.agentId ? ` — ${t.agentId}` : '')
+    + ` · ${fmtAgo(t.doneAt || t.startedAt || t.createdAt)}`;
+  const lines = [
+    ...(tj.getActiveTasks() || []).filter(match).map(t => fmt(t, true)),
+    ...(tj.getRecentTasks(50) || []).filter(match).slice(0, limit).map(t => fmt(t, false)),
+  ];
+  return lines.length
+    ? lines.join('\n')
+    : (needle ? `No journal entries match "${needle}".` : 'The task journal is empty — nothing has run yet.');
+}
+
+// Open a real browser page for the user — signup/login/verify/dashboard
+// destinations they must visit in person. Only http(s) URLs; report failure
+// honestly, never claim a page opened that didn't.
+async function _toolUrlOpen(query) {
+  const url = String(query || '').trim();
+  if (!/^https?:\/\//i.test(url)) {
+    return `url.open FAILED — "${url || 'empty'}" is not an http(s) URL. Get the real link first (setup.start result, capability info, or web.search).`;
+  }
+  const res = await _postJson(MAIN_PORT, '/url.open', { url }, '', 4000);
+  if (!res || res.ok !== true) {
+    return `url.open FAILED — the browser could not be opened (${res?.error || 'no response'}). Give the user the URL to paste instead: ${url}`;
+  }
+  return `Opened ${url} in the user's browser. Tell them it's open — do NOT claim they completed anything there yet.`;
+}
+
+// ThinkDrop-driven service setup — the terminal lane runs the real init /
+// auth / install command, verifies it, and resumes the parked plan. Use this
+// instead of telling the user to run commands (nylas init, gh auth login…).
+async function _toolSetupStart(query) {
+  const service = String(query || '').trim().replace(/\.agent$/, '');
+  if (!service) return 'setup.start needs a service name, e.g. setup.start("nylas").';
+  const res = await _postJson(MAIN_PORT, '/setup.start', { service }, '', 5000);
+  if (!res || res.ok !== true) {
+    return `setup.start FAILED — the setup lane could not start for "${service}" (${res?.error || 'no response'}). Only now may you give the user manual steps — with the destination URL.`;
+  }
+  if (res.already) return `Setup for ${res.service} is ALREADY running in the terminal — narrate that it's in progress; the plan resumes automatically once it verifies.`;
+  const bits = [`Setup for ${res.service} is now running in the ThinkDrop terminal — it drives the real init/auth commands, verifies, and resumes the plan. Tell the user to watch the terminal pane and answer its prompts.`];
+  if (res.setupUrl) bits.push(`Their console/dashboard: ${res.setupUrl} — offer to open it for them (url.open) if they need to create an account, approve scopes, or copy a key.`);
+  return bits.join(' ');
+}
+
+// Render a DRAFT of the plan's deliverable on the GhostLayer so the user sees
+// what the plan will produce before they approve it. Pipe-separated arg:
+//   screen.preview("kind | title | content")
+// kind ∈ text|image|chart|effect|emoji|alert|deck|scene|three|doc
+// content: chart → "label N" pairs (one per line or comma-separated);
+//          deck  → slides split by '--'; doc → markdown; three → preset name.
+const _PREVIEW_KINDS = new Set(['text', 'image', 'chart', 'effect', 'emoji', 'alert', 'deck', 'scene', 'three', 'doc']);
+async function _toolScreenPreview(query) {
+  const parts = String(query || '').split('|').map(s => s.trim());
+  const kind = _PREVIEW_KINDS.has(parts[0]) ? parts.shift() : 'text';
+  const title = parts.shift() || 'Plan preview';
+  const body = parts.join('\n');
+
+  const payload = {
+    kind, title, durationMs: 0, dismiss: 'manual', blocking: false,
+    interactive: kind === 'chart' || kind === 'deck' || kind === 'scene' || kind === 'three',
+  };
+  if (kind === 'chart') {
+    const data = [];
+    const re = /([\w][\w .\-'()&/]{0,40}?)\s*[:=]?\s*(-?\d[\d,]*(?:\.\d+)?)\s*([KMBT])?\s*%?\s*(?=[,;\n]|$)/gm;
+    let pm;
+    while ((pm = re.exec(body)) !== null && data.length < 12) {
+      const label = pm[1].trim().replace(/[,:;=]+$/, '');
+      const value = parseFloat(pm[2].replace(/,/g, '')) * ({ K: 1e3, M: 1e6, B: 1e9, T: 1e12 }[(pm[3] || '').toUpperCase()] || 1);
+      if (label && /[A-Za-z]/.test(label) && Number.isFinite(value)) data.push({ label, value });
+    }
+    if (!data.length) return `screen.preview needs chart data as "label N" pairs — e.g. screen.preview("chart | Q3 Sales | apples 5, bananas 3").`;
+    payload.chart = { type: 'bar', data, xKey: 'label', yKey: 'value' };
+  } else if (kind === 'deck') {
+    const slides = body.split(/\n\s*--\s*\n|\n\s*\n/).map(s => s.trim()).filter(Boolean).slice(0, 8)
+      .map(s => { const ls = s.split('\n').map(l => l.trim()).filter(Boolean); return { title: ls[0], text: ls.slice(1).join('\n') }; });
+    if (!slides.length) return 'screen.preview deck needs slide text separated by "--" or blank lines.';
+    payload.deck = { slides };
+  } else if (kind === 'doc') {
+    if (!body) return 'screen.preview doc needs markdown content after the title pipe.';
+    payload.doc = { markdown: body };
+  } else if (kind === 'three') {
+    payload.three = { scene: (body || 'starfield').toLowerCase() };
+  } else if (kind === 'scene') {
+    payload.scene = { name: body };
+    if (!body) return 'screen.preview scene needs a registered scene name or generated markup.';
+  } else {
+    if (!body && !title) return 'screen.preview needs content, e.g. screen.preview("text | Title | body text").';
+    payload.text = body;
+    payload.fit = 'auto';
+  }
+
+  const res = await _postJson(MAIN_PORT, '/screen/display', payload, '', 4000);
+  if (!res || res.ok === false) {
+    return `screen.preview FAILED — the GhostLayer didn't take the display (${res?.error || 'no response'}). Describe the deliverable in text instead.`;
+  }
+  return `Preview shown on the user's screen (${kind}${payload.title ? ` — "${payload.title}"` : ''}). It's a draft — tell the user it stays up until they tap it away, and this is what the plan will produce.`;
+}
+
 // Strip PTY delta down to real output: ANSI codes, exit markers, zsh init
 // noise, end-of-output markers, and the trailing user@host prompt line.
 const _PTY_ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
@@ -738,6 +952,30 @@ async function _runTools(text, sessionId) {
     else if (call.tool === 'plan.open') {
       await _ptyNote(`opening saved plan ${call.query}…`);
       out = _toolPlanOpen(call.query, sessionId);
+    }
+    else if (call.tool === 'plan.status') {
+      await _ptyNote(`checking plan status…`);
+      out = await _toolPlanStatus(call.query, sessionId);
+    }
+    else if (call.tool === 'plan.cancel') {
+      await _ptyNote(`cancelling the plan…`);
+      out = await _toolPlanCancel(call.query, sessionId);
+    }
+    else if (call.tool === 'journal.recent') {
+      await _ptyNote(`checking the task journal…`);
+      out = _toolJournalRecent(call.query);
+    }
+    else if (call.tool === 'url.open') {
+      await _ptyNote(`opening ${call.query}…`);
+      out = await _toolUrlOpen(call.query);
+    }
+    else if (call.tool === 'setup.start') {
+      await _ptyNote(`starting ${call.query} setup in the terminal…`);
+      out = await _toolSetupStart(call.query);
+    }
+    else if (call.tool === 'screen.preview') {
+      await _ptyNote('rendering a preview on screen…');
+      out = await _toolScreenPreview(call.query);
     }
     else if (call.tool === 'system.map') {
       await _ptyNote('loading ThinkDrop system map…');
@@ -823,7 +1061,13 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             draft agent. It returns the agentId
                                             to put in the task's Agents line.
                                             Setup still happens at plan-check —
-                                            this only files the intent.
+                                            this only files the intent. It does
+                                            NOT create the task — the task does
+                                            not exist until you emit
+                                            <plan_update> using the returned
+                                            agentId in the same reply or the
+                                            next one. Never say the task/plan
+                                            is set up before that marker lands.
   <tool>plan.find("nylas")</tool>           — search SAVED plans on disk by name/
                                             title/task text. Use this (not
                                             memory.search) for "the X plan",
@@ -833,6 +1077,58 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             for this session. Reopens terminal
                                             (failed/cancelled) plans: resets
                                             failed/skipped tasks to pending.
+  <tool>plan.status()</tool>                — LIVE run state of the active plan
+                                            (or "plan.status("plan_…")" for a
+                                            specific one): running/cancelled,
+                                            per-task status, approvals waiting.
+                                            "is it still running", "did it
+                                            finish", "where is it at" → call
+                                            this first. NEVER answer status
+                                            questions from memory or vibes.
+  <tool>plan.cancel()</tool>                — actually cancels the plan/run NOW
+                                            (stops the run, clears held cards).
+                                            When the user asks to cancel/stop/
+                                            abort the plan, call this — NEVER
+                                            say it was cancelled without it.
+  <tool>journal.recent("email")</tool>      — REAL task history: what has
+                                            actually run lately (status + when).
+                                            "what did I do this week", "what's
+                                            been running", "did the X send" →
+                                            this tool. Number arg = how many
+                                            (default 15).
+  <tool>setup.start("nylas")</tool>         — ThinkDrop runs the service's real
+                                            setup ITSELF in the terminal pane:
+                                            init/auth/install commands, then it
+                                            verifies and resumes the plan. Call
+                                            this when a service needs setup —
+                                            NEVER tell the user to run setup
+                                            commands themselves (no "run nylas
+                                            init", no "run gh auth login"). The
+                                            result may include a setupUrl for
+                                            the console/dashboard — relay it.
+  <tool>screen.preview("kind | title | content")</tool>
+                                          — show a DRAFT of the plan's deliverable
+                                            on the user's screen (GhostLayer).
+                                            kind ∈ text|image|chart|effect|emoji|
+                                            alert|deck|scene|three|doc. Use it
+                                            when the plan produces a visual
+                                            artifact (chart, slideshow, essay,
+                                            3D model, animation) so the user
+                                            approves against a real preview —
+                                            NOT as a substitute for the final
+                                            step, which stays a screen.display
+                                            task. chart content = "label N"
+                                            pairs; deck = slides split by "--";
+                                            doc = markdown; three = preset name
+                                            (starfield/particles/wave/cube/knot/
+                                            globe).
+  <tool>url.open("https://…")</tool>       — open a page in the user's browser.
+                                            Use when they must personally sign
+                                            up, log in, verify, approve scopes,
+                                            or copy a credential — and only with
+                                            a REAL URL (from setup.start's
+                                            setupUrl, capability info, or
+                                            web.search). Never invent URLs.
   <tool>system.map</tool>                  — ThinkDrop's own data layout:
                                             what every ~/.thinkdrop folder holds
                                             and which service runs on which port.
@@ -975,14 +1271,55 @@ OTHER MARKERS (optional):
     ("let's do it", "run it", "go ahead", "I'm ready"). Emitting this marker
     REQUESTS the run — the app then performs a readiness check and reports
     the result back as its own message. NEVER say tasks are "running" or
-    "queued" — say you're starting the plan check. Only emit when the plan
-    has tasks; if you're still gathering info, keep asking instead.
+    "queued" — say you're starting the plan check. The check decides what
+    happens next: all-clear with no approval gates starts the run itself;
+    approval-gated plans wait for the user to press "Run all" / "Review
+    task" on the card — if that's needed, say exactly that ("press Run all
+    on the readiness card to start"). Only emit when the plan has tasks —
+    on an empty plan it is REJECTED and nothing runs; emit <plan_update>
+    with the tasks first. If you're still gathering info, keep asking instead.
     If RUN GATE says BLOCKED, a run will be refused — never tell the user
     tasks are running; state which agent needs attention instead.
+  <plan_exit/> — when the user wants OUT of planning mode ("stop planning",
+    "exit planning", "leave plan mode", "I'm done planning", "forget the
+    planning"). Emitting this marker REALLY flips the mode off in the app —
+    the plan draft stays saved and resumable ("continue the plan"). Never say
+    planning mode is off/closed/exited without this marker — it is the ONLY
+    thing that exits.
 
 REPLY TEXT — everything outside the markers is spoken/shown to the user.
 Keep it short and conversational: acknowledge, ask your one question, or
 summarize what changed in the plan. Do not restate the whole plan in prose.
+
+TRUTHFULNESS — NEVER claim something happened that a tool or marker did not
+produce. No "cancelled", "sent", "done", "finished at <time>", "running",
+"queued", "scheduled", or remembered facts without the matching tool result.
+Status question → plan.status. History/activity question → journal.recent.
+Cancel/stop request → plan.cancel (its result tells you what actually stopped).
+A plan is "running" ONLY when plan.status reports a live run. Tasks marked
+interrupted or waiting-for-input mean the plan is PAUSED — say so plainly and
+offer to resume ("say 'run it'"), never narrate progress that isn't happening.
+Question about the user → memory.search ALWAYS first — even "what do you
+remember about me". If a tool fails, report the failure; never fill the gap
+with a plausible-sounding answer.
+
+NO EXECUTION FROM THIS LANE — you cannot dispatch work: no handoff, no
+background task, no "let me run that" — there is no mechanism. The only run
+lever is <plan_run/> (the WHOLE approved plan). When the user asks to just
+do something now that is NOT the plan ("just send it", "do that now",
+"actually never mind the plan, do X"): say it needs leaving planning and
+emit <plan_exit/>, or offer to add it as a Task. Never write "doing that
+now", "on it", "handing this off", "one sec while I…", or "let me check"
+for anything that isn't a <tool> call in THIS turn.
+
+SETUP & LINKS — when a service needs setup (account, auth, credentials,
+install): call setup.start — ThinkDrop runs the real commands in the
+terminal itself and resumes the plan after it verifies. NEVER instruct the
+user to run setup commands ("run nylas init", "run gh auth login",
+"npm install …") — setup.start does it. When the user must personally visit
+a page (sign up, log in, verify, approve scopes, copy an API key), ALWAYS
+give the direct URL and offer to open it via url.open — real URLs only
+(setup.start's setupUrl or a web.search result); never guess a URL.
 ═══════════════════════════════════════════════`;
 
 // ── Marker extraction ─────────────────────────────────────────────────────────
@@ -1001,7 +1338,7 @@ function _extractTag(text, tag) {
 // Includes 'budget:token_budget' — a provider scaffolding artifact (model
 // echoes its context-window tag inside content). Not a lane marker; stripped
 // at the backend's ThinkStripper too — this is defense-in-depth.
-const _STREAM_MARKERS = new Set(['tool', 'plan_update', 'plan_name', 'plan_status', 'plan_desc', 'tool_results', 'choices', 'budget:token_budget']);
+const _STREAM_MARKERS = new Set(['tool', 'plan_update', 'plan_name', 'plan_status', 'plan_desc', 'tool_results', 'choices', 'plan_exit', 'budget:token_budget']);
 
 class _StreamFilter {
   constructor(onEmit) { this.onEmit = onEmit; this.buf = ''; this.sink = null; this.visible = 0; }
@@ -1024,15 +1361,15 @@ class _StreamFilter {
       if (gt === -1) { if (end) { this._emit(this.buf); this.buf = ''; } return; }
       const tag = this.buf.slice(1, gt).trim();
       const m = tag.match(/^([a-z_][a-z0-9_:]*)\s*(\/)?$/i);
-      if (m && (_STREAM_MARKERS.has(m[1]) || m[1] === 'plan_run')) {
-        if (m[1] === 'plan_run' || m[2]) { this.buf = this.buf.slice(gt + 1); continue; }
+      if (m && (_STREAM_MARKERS.has(m[1]) || m[1] === 'plan_run' || m[1] === 'plan_exit')) {
+        if (m[1] === 'plan_run' || m[1] === 'plan_exit' || m[2]) { this.buf = this.buf.slice(gt + 1); continue; }
         this.sink = m[1];
         this.buf = this.buf.slice(gt + 1);
         continue;
       }
       // Orphan closing tag for a known marker — drop it silently.
       const cm = tag.match(/^\/([a-z_][a-z0-9_:]*)$/i);
-      if (cm && (_STREAM_MARKERS.has(cm[1]) || cm[1] === 'plan_run')) {
+      if (cm && (_STREAM_MARKERS.has(cm[1]) || cm[1] === 'plan_run' || cm[1] === 'plan_exit')) {
         this.buf = this.buf.slice(gt + 1);
         continue;
       }
@@ -1059,6 +1396,7 @@ function _stripMarkers(text) {
     .replace(/<plan_desc>[\s\S]*?<\/plan_desc>/g, '')
     .replace(/<plan_status>[\s\S]*?<\/plan_status>/g, '')
     .replace(/<plan_run\s*\/?\s*>/g, '')
+    .replace(/<plan_exit\s*\/?\s*>/g, '')
     .replace(/<choices>[\s\S]*?<\/choices>/g, '')
     .replace(/<tool_results>[\s\S]*?<\/tool_results>/g, '')
     .replace(/\n{3,}/g, '\n\n')
@@ -1073,6 +1411,83 @@ function _stripMarkers(text) {
 const _UNNAMED_RESUME_RE = /\b(?:continu\w*|resum\w*|pick\w* up|carry on|keep going|get back to|work on|finish|go back to|reopen)\b[\s\S]{0,30}\bplan\b|\bplan\b[\s\S]{0,15}\b(?:continu\w*|resum\w*)/i;
 function _isUnnamedResume(t) {
   return _UNNAMED_RESUME_RE.test(String(t || ''));
+}
+
+// Apply <plan_update>/<plan_name>/<plan_desc>/<plan_status> markers from one
+// assistant round. Runs per-round (not just on the final reply) — a
+// <plan_update> riding alongside a <tool> call used to be silently dropped
+// when the loop continued, leaving "I updated the plan" prose with zero tasks.
+// Returns true when the plan actually changed.
+function _applyPlanMarkers(text, sess, unknownAgents) {
+  let changed = false;
+  const update = _extractTag(text, 'plan_update');
+  if (update) {
+    const newTasks = planFormat.parseTasks(update);
+    if (newTasks.length) {
+      // Canonicalize service aliases in the file itself — google_docs.agent →
+      // google.agent so preflight and the run lock share one identity.
+      for (const t of newTasks) {
+        t.agents = (t.agents || []).map(a => canonicalAgent(a) || a);
+      }
+      // Phantom-agent detection — names that match no registry entry, no
+      // generic surface, and no local agent are flagged for the check card
+      // (with a "did you mean" suggestion when one is unambiguous).
+      try {
+        const svcMap = require('../../../shared/service-map.cjs');
+        const LOCAL = new Set(['shell', 'none', 'general_knowledge', 'synthesize']);
+        for (const t of newTasks) {
+          const bad = (t.agents || []).filter(a => {
+            const n = String(a).toLowerCase();
+            return n && !LOCAL.has(n) && !skillIndex.skillExists(n) && !svcMap.isServiceAgent(a);
+          });
+          for (const a of bad) {
+            const entry = { taskNum: t.num, agent: a, suggested: svcMap.suggestAgent(a) || null };
+            if (!unknownAgents.some(u => u.taskNum === entry.taskNum && u.agent === entry.agent)) {
+              unknownAgents.push(entry);
+            }
+          }
+        }
+      } catch (_) {}
+      // Preserve statuses/results for tasks that survive the edit, and carry
+      // generated steps over when the task's prompt didn't change.
+      for (const t of newTasks) {
+        const prev = sess.tasks.find(p => p.num === t.num);
+        if (prev && (prev.status !== planFormat.TASK_STATUS.PENDING || prev.result)) {
+          t.status = prev.status;
+          t.result = prev.result;
+        }
+        if (prev && prev.steps && prev.prompt === t.prompt) {
+          t.steps = prev.steps;
+          t._stepsHash = prev._stepsHash;
+        }
+      }
+      sess.tasks = newTasks;
+      changed = true;
+    }
+    const risks = _extractTag(update, 'risks');
+    if (risks) {
+      sess.risks = risks.split('\n').map(l => l.replace(/^\s*-\s*/, '').trim()).filter(Boolean);
+      changed = true;
+    }
+  }
+  const nameTag = _extractTag(text, 'plan_name');
+  if (nameTag && planFormat.isValidDotName(nameTag)) {
+    sess.name = nameTag;
+    changed = true;
+  }
+  // <plan_desc> — generated one-liner replaces the "Plan for:" echo of the
+  // original prompt once the plan has real content to summarize.
+  const descTag = _extractTag(text, 'plan_desc');
+  if (descTag && sess.tasks.length) {
+    sess.description = descTag.slice(0, 300);
+    changed = true;
+  }
+  const statusTag = _extractTag(text, 'plan_status');
+  if (statusTag === 'ready' && sess.tasks.length) {
+    sess.status = 'ready';
+    changed = true;
+  }
+  return changed;
 }
 
 /**
@@ -1202,6 +1617,60 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     sess._nameChanged = true;
   }
 
+  // Fresh truth each turn — the session snapshot goes stale the moment
+  // planRunner, /plan.status healing, stepgen, or the user touches the file.
+  _refreshSessionFromDisk(sess);
+
+  // ── Deterministic run confirm — the durable fix for "do it" ──────────────
+  // The <plan_run/> marker depends on the LLM choosing to emit it; observed
+  // failure: the model wrote "Starting the plan check now — I'll verify…" as
+  // bare prose, no marker, and the run never fired. Bare confirm/run phrases
+  // are too regular to leave to the model — when the session already has
+  // tasks and isn't live/terminal, treat the phrase as the execution request
+  // directly, skip the LLM round entirely, and return runPlan: true so main
+  // fires the readiness check. Nothing else on this path invents prose.
+  const _runConfirm = (() => {
+    if (sess.tasks.length === 0) return false;
+    const st = String(sess.status || 'drafting');
+    if (!['drafting', 'ready'].includes(st)) return false;
+    const t = String(englishText || '').toLowerCase().replace(/[.!?,;:'"]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 60 || PLAN_RUN_NEG_RE.test(t)) return false;
+    // Run-shaped phrases ("do it", "run it", "send it") are unambiguous —
+    // fire during drafting or ready. Bare confirms ("yes", "sure") only fire
+    // once the plan is ready — during drafting a "yes" is usually answering a
+    // clarify question, not requesting execution.
+    if (st === 'ready' && t.length <= 30 && PLAN_CONFIRM_RE.test(t)) return true;
+    return t.length <= 45 && PLAN_RUN_RE.test(t);
+  })();
+  if (_runConfirm) {
+    logger.info('[Planning] Deterministic run confirm — bypassing LLM', { planId: sess.planId, text: String(englishText).slice(0, 60) });
+    if (sess.status === 'drafting') sess.status = 'ready';
+    // Keep auth annotations current so metadata + file agree.
+    let confirmAuthRequired = [];
+    try {
+      const { assessTasks } = require('../planPreflight.cjs');
+      const assessment = assessTasks(sess.tasks);
+      confirmAuthRequired = assessment.authRequired;
+      for (const t of sess.tasks) {
+        const a = assessment.byTask.get(t.num);
+        if (a && a.auth !== t.auth) t.auth = a.auth;
+      }
+    } catch (_) {}
+    _writePlanFile(sess);
+    _sessionToPlan.set(sessionId, sess.planId);
+    const text = "Kicking off the readiness check — I'll report back what it finds.";
+    return {
+      text,
+      fullText: text,
+      metadata: {
+        source: 'planning', intent: 6, planId: sess.planId, planFile: sess.filePath,
+        planTitle: sess.title, planName: sess.name, planStatus: sess.status,
+        taskCount: sess.tasks.length, authRequired: confirmAuthRequired, unknownAgents: [],
+        choices: null, runPlan: true, startedExplicit, speakable: true,
+      },
+    };
+  }
+
   const sysContent = (systemPrompt || '') + PLANNING_DIRECTIVE
     + `\n\nREGISTERED AGENTS (the ONLY agent names allowed in Tasks):\n`
     + _renderAgentCatalog()
@@ -1229,7 +1698,14 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
 
   let replyText = '';
   let toolNotes = null;
+  let planCancelQuery = null;
   const MAX_TOOL_ROUNDS = 2;
+  let planChanged = false;
+  const unknownAgents = [];
+  // <plan_run/> seen in ANY round (the request flag sticks across the loop);
+  // planRunRejected gates the corrective re-prompt to a single retry.
+  let planRunSeen = false;
+  let planRunRejected = false;
 
   const streamFilter = onReplyChunk ? new _StreamFilter(onReplyChunk) : null;
 
@@ -1252,6 +1728,18 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     // enter stored history — the model would imitate the markup next turn.
     const cleanText = _stripMetaTags(text);
 
+    // A plan.cancel call in ANY round may close the lane — the final
+    // replyText won't carry the earlier round's tool call, so capture the
+    // query here where each round's text is still in scope.
+    const cancelM = cleanText.match(/<tool>\s*plan\.cancel\(\s*(?:"([^"]*)")?\s*\)/);
+    if (cancelM) planCancelQuery = cancelM[1] || '';
+
+    // Plan markers land the round they're written — a <plan_update> riding
+    // beside a <tool> call must still reach sess.tasks (previously only the
+    // final replyText was parsed, silently dropping mid-loop updates).
+    if (_applyPlanMarkers(cleanText, sess, unknownAgents)) planChanged = true;
+    if (/<plan_run\s*\/?\s*>/.test(cleanText)) planRunSeen = true;
+
     const toolResults = await _runTools(cleanText, sessionId);
     if (toolResults && round < MAX_TOOL_ROUNDS) {
       // Record the assistant's tool-call turn, then feed results back.
@@ -1261,84 +1749,68 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       continue;
     }
 
+    // <plan_run/> on an empty plan used to be silently swallowed — the marker
+    // stripped, the fallback said "Working on the plan now.", nothing ran.
+    // Reject it like a failed tool call (once) so the model writes the task it
+    // was about to run — or explains what's missing.
+    if (planRunSeen && !sess.tasks.length && !planRunRejected && round < MAX_TOOL_ROUNDS) {
+      planRunRejected = true;
+      sess.history.push({ role: 'assistant', content: cleanText });
+      sess.history.push({ role: 'user', content: '<tool_results>\nplan_run → REJECTED: the plan has no tasks, so nothing would run. Emit the complete task list in <plan_update> first (Agents line: use the agentId from capability.select or REGISTERED AGENTS), then <plan_run/> again — or ask the user what is missing.\n</tool_results>' });
+      continue;
+    }
+
     sess.history.push({ role: 'assistant', content: cleanText });
     replyText = cleanText;
     break;
   }
   if (streamFilter) streamFilter.flush();
 
-  // ── Apply plan mutations ────────────────────────────────────────────────────
-  let planChanged = false;
-  const unknownAgents = [];
-  const update = _extractTag(replyText, 'plan_update');
-  if (update) {
-    const newTasks = planFormat.parseTasks(update);
-    if (newTasks.length) {
-      // Canonicalize service aliases in the file itself — google_docs.agent →
-      // google.agent so preflight and the run lock share one identity.
-      for (const t of newTasks) {
-        t.agents = (t.agents || []).map(a => canonicalAgent(a) || a);
-      }
-      // Phantom-agent detection — names that match no registry entry, no
-      // generic surface, and no local agent are flagged for the check card
-      // (with a "did you mean" suggestion when one is unambiguous).
+  // ── Run-confirm verifier — the marker-paraphrase net ──────────────────────
+  // Observed failure: user says "do it", the model writes "Starting the plan
+  // check now — I'll verify…" as PROSE, never emits <plan_run/>, and the run
+  // silently dies. When the turn smells like a confirm — the user's text is
+  // confirm-shaped OR the reply itself claims to be starting — one tiny
+  // yes/no call decides whether the user actually confirmed execution. Blast
+  // radius is bounded: a false YES only fires the readiness CHECK, never the
+  // run itself.
+  if (!planRunSeen && sess.tasks.length > 0
+      && ['drafting', 'ready'].includes(String(sess.status || 'drafting'))) {
+    const _userTxt = String(englishText || '');
+    const _userConfirmish = _userTxt.length <= 80
+      && /^[\s"'(\[]*(yes|yeah|yep|yup|sure|ok|okay|go|do|run|send|start|proceed|looks? good|sounds? good|let'?s|please|alright|absolutely|definitely|approved?|confirm|fire|ship|launch|execute|kick)\b/i.test(_userTxt)
+      && !PLAN_RUN_NEG_RE.test(_userTxt);
+    const _replyClaimsStart = /\b(starting|kicking off|firing|beginning|launching|executing|running|checking|verifying)\b[^.!?\n]{0,60}\b(check|checks|readiness|plan|run|task|tasks|it|this|verif)/i.test(replyText);
+    if (_userConfirmish || _replyClaimsStart) {
       try {
-        const svcMap = require('../../../shared/service-map.cjs');
-        const LOCAL = new Set(['shell', 'none', 'general_knowledge', 'synthesize']);
-        for (const t of newTasks) {
-          const bad = (t.agents || []).filter(a => {
-            const n = String(a).toLowerCase();
-            return n && !LOCAL.has(n) && !skillIndex.skillExists(n) && !svcMap.isServiceAgent(a);
-          });
-          if (bad.length) unknownAgents.push(...bad.map(a => ({ taskNum: t.num, agent: a, suggested: svcMap.suggestAgent(a) || null })));
-        }
-      } catch (_) {}
-      // Preserve statuses/results for tasks that survive the edit, and carry
-      // generated steps over when the task's prompt didn't change.
-      for (const t of newTasks) {
-        const prev = sess.tasks.find(p => p.num === t.num);
-        if (prev && (prev.status !== planFormat.TASK_STATUS.PENDING || prev.result)) {
-          t.status = prev.status;
-          t.result = prev.result;
-        }
-        if (prev && prev.steps && prev.prompt === t.prompt) {
-          t.steps = prev.steps;
-          t._stepsHash = prev._stepsHash;
-        }
+        const v = await askEarly([
+          { role: 'user', content: `The user has a plan with ${sess.tasks.length} task(s) that is ready to execute.\nUser's latest message: "${_userTxt.slice(0, 200)}"\nAssistant's reply: "${String(replyText).slice(0, 300)}"\nDid the user just confirm they want the plan executed NOW? Answer YES or NO only.` },
+        ], { maxTokens: 8, temperature: 0 });
+        const verdict = /^yes\b/i.test((v.firstSentence || v.fullText || '').trim());
+        logger.info('[Planning] Run-confirm verifier', { verdict, userText: _userTxt.slice(0, 60), trigger: _userConfirmish ? 'user-text' : 'reply-claims' });
+        if (verdict) planRunSeen = true;
+      } catch (err) {
+        logger.warn('[Planning] Run verifier failed (non-fatal)', { error: err.message });
       }
-      sess.tasks = newTasks;
-      planChanged = true;
-    }
-    const risks = _extractTag(update, 'risks');
-    if (risks) {
-      sess.risks = risks.split('\n').map(l => l.replace(/^\s*-\s*/, '').trim()).filter(Boolean);
-      planChanged = true;
     }
   }
-  const nameTag = _extractTag(replyText, 'plan_name');
-  if (nameTag && planFormat.isValidDotName(nameTag)) {
-    sess.name = nameTag;
-    planChanged = true;
-  }
-  // <plan_desc> — generated one-liner replaces the "Plan for:" echo of the
-  // original prompt once the plan has real content to summarize.
-  const descTag = _extractTag(replyText, 'plan_desc');
-  if (descTag && sess.tasks.length) {
-    sess.description = descTag.slice(0, 300);
-    planChanged = true;
-  }
-  const statusTag = _extractTag(replyText, 'plan_status');
-  if (statusTag === 'ready' && sess.tasks.length) {
-    sess.status = 'ready';
-    planChanged = true;
-  }
+
   // <plan_run/> — user confirmed execution. Only meaningful with tasks; the
   // run itself is triggered by main.js from metadata.runPlan below.
-  const runPlan = /<plan_run\s*\/?\s*>/.test(replyText) && sess.tasks.length > 0;
+  const runPlan = planRunSeen && sess.tasks.length > 0;
   if (runPlan && sess.status === 'drafting') {
     sess.status = 'ready';
     planChanged = true;
   }
+  // <plan_exit/> — the ONLY LLM-side way to close the lane. Also implied by a
+  // plan.cancel call that targeted THIS lane's plan (cancelling a different
+  // named plan shouldn't kick the user out of drafting). main.js reads
+  // metadata.exitPlanning to actually flip _planningMode and to skip the
+  // planId re-pin that would otherwise undo the exit on the same turn.
+  const lanePlanId = planning.planId || sess.planId;
+  const cancelledThisLane = planCancelQuery !== null
+    && _resolvePlanId(planCancelQuery, sessionId) === lanePlanId;
+  const exitPlanning = /<plan_exit\s*\/?\s*>/.test(replyText) || cancelledThisLane;
   if (!sess.description && sess.tasks.length) {
     sess.description = `Plan for: ${sess.originalPrompt.slice(0, 200)}`;
     planChanged = true;
@@ -1368,7 +1840,13 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   // keep chatting/editing while steps stream into the plan file.
   _scheduleStepGen(sess);
   _activePlanId = sess.planId;
-  if (sessionId) _sessionToPlan.set(sessionId, sess.planId);
+  if (sessionId) {
+    // Lane closed — unbind so the next prompt on this session can't silently
+    // re-enter planning on the old plan. The plan file stays on disk and
+    // remains resumable via a "the X plan" referent.
+    if (exitPlanning) _sessionToPlan.delete(sessionId);
+    else _sessionToPlan.set(sessionId, sess.planId);
+  }
 
   // <choices> — capability-gap options for the renderer QuestionCard.
   let choices = null;
@@ -1383,9 +1861,30 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       logger.warn('[Planning] Malformed <choices> block ignored', { error: err.message });
     }
   }
+  // Deterministic backstop — the capability gate already ranked verified
+  // candidates; the selection surface must never depend on the LLM emitting
+  // a <choices> marker. Synthesize the card from capabilityHints when the
+  // turn arrived via a capability lane and the model dropped the block.
+  if (!choices && Array.isArray(capabilityHints) && capabilityHints.length && !sess.tasks.length) {
+    choices = {
+      question: 'How should I handle this? These are the verified options:',
+      options: capabilityHints.slice(0, 6).map(h => ({
+        label: h.label || h.id,
+        description: [h.setupSummary, h.eta, h.installed ? 'installed' : null, h.detail]
+          .filter(Boolean).slice(0, 3).join(' · ').slice(0, 200),
+      })),
+    };
+    logger.info('[Planning] Synthesized <choices> from capability hints', { planId: sess.planId, options: choices.options.length });
+  }
 
+  // Marker-only replies need a fallback that says what actually happened —
+  // never "working on it" prose when nothing moved.
   const spoken = _stripMarkers(replyText)
-    || (sess.tasks.length ? 'I updated the plan — take a look.' : 'Working on the plan now.');
+    || (sess.tasks.length
+      ? 'I updated the plan — take a look.'
+      : (planRunSeen
+        ? "The plan is still empty — nothing to run. Tell me the tasks you want in it, or say 'exit planning'."
+        : "The plan is empty — tell me what you want it to do."));
 
   return {
     text: spoken,
@@ -1403,6 +1902,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       unknownAgents,
       choices,
       runPlan,
+      exitPlanning,
       startedExplicit,
       speakable: true,
     },
@@ -1447,7 +1947,13 @@ function _renderPlanState(sess) {
   const lines = sess.tasks.map(t => {
     const live = /pending|progress|running/i.test(String(t.status || ''))
       ? _liveInstallCheck(t.title) : null;
-    return `Task ${t.num} — ${t.title} | mode=${t.mode} | deps=[${t.dependsOn.join(',') || 'none'}] | auth=${t.auth} | status=${t.status}`
+    // A 'running' status is only a file marker — it proves dispatch, not life.
+    // If the run died the marker lingers until something heals it, so the LLM
+    // must verify with plan.status before narrating any progress.
+    const staleNote = String(t.status || '') === 'running'
+      ? ' (file marker — call plan.status before claiming this is running)'
+      : '';
+    return `Task ${t.num} — ${t.title} | mode=${t.mode} | deps=[${t.dependsOn.join(',') || 'none'}] | auth=${t.auth} | status=${t.status}${staleNote}`
       + (live ? ` | live-check: ${live} (reality, right now — trust this over the stale status)` : '');
   });
   if (sess.risks.length) lines.push('Risks: ' + sess.risks.join('; '));
@@ -1536,6 +2042,15 @@ function clearActivePlan() {
 }
 
 /**
+ * Planning mode exited — unbind the conversation session from its plan so the
+ * next prompt can't silently re-enter the lane. Keeps _activePlanId: the plan
+ * stays the "most recently touched" resume target for "continue the plan".
+ */
+function releaseSession(sessionId) {
+  if (sessionId) _sessionToPlan.delete(sessionId);
+}
+
+/**
  * Re-run step generation for one task after a failure. Clears the
  * `Steps Status` marker on disk + the live task, then re-schedules.
  */
@@ -1556,4 +2071,4 @@ function retrySteps(planId, taskNum) {
   return { ok: true };
 }
 
-module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, retrySteps, findOpenPlan };
+module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, releaseSession, retrySteps, findOpenPlan };

@@ -25,7 +25,7 @@ const logger = require('../logger.cjs');
 const http = require('http');
 const { askEarly, buildMessages } = require('../llm-providers.cjs');
 const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
-const { isCannedRefusal, isPromptEcho } = require('../refusal.cjs');
+const { isCannedRefusal, isPromptEcho, isRoutingPromise, stripRoutingPromises } = require('../refusal.cjs');
 const { isContextDependent } = require('../../../shared/text-patterns.cjs');
 
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
@@ -61,6 +61,9 @@ If you cannot answer because:
 - Your knowledge is outdated or has a cutoff date
 - You lack the capability or tools for what's being asked
 - The question needs web search, browser access, file access, or device context
+- A [File: /path] or [Folder: /path] tag appears in the message — those are
+  path references you CANNOT open or read; if the request needs the file's
+  contents or modifies it, signal 0
 - The question asks about PAST CONVERSATIONS or chat history beyond what is shown
   in the context — you can only see this session's recent turns, so questions
   like "what did we talk about yesterday", "have we chatted before", or
@@ -71,6 +74,12 @@ If you cannot answer because:
 detailed step-by-step guides, creative writing, documents (a deeper system
 handles those) — then respond with EXACTLY: 0
 Nothing else. Just the number 0. No explanation, no handoff phrase.
+
+NEVER confirm or acknowledge an action you cannot perform yourself —
+"Understood — I'll add X", "I'll get that done" without an actual result is
+the WORST possible output. If the request is an action, signal 0.
+A routing phrase is not an answer — if you would say "let me route/pass/hand
+that to ThinkDrop", output 0 instead.
 ═══════════════════════════════════════════════`;
 
 // ── Selection variant ────────────────────────────────────────────────────────
@@ -98,11 +107,20 @@ Do NOT promise to look something up — either answer now, or signal that you ca
 If you cannot answer because:
 - The question asks for an ACTION (search, open, save, send, run, edit a file…),
   not an answer about the text
+- A [File: /path] or [Folder: /path] tag appears in the message — those are
+  path references you CANNOT open or read; if the request needs the file's
+  contents or modifies it, signal 0
 - You lack real-time or live data, web/browser/file access, or device context
 - The question asks about PAST CONVERSATIONS or chat history beyond what is shown
 
 ...then respond with EXACTLY: 0
 Nothing else. Just the number 0. No explanation, no handoff phrase.
+
+NEVER confirm or acknowledge an action you cannot perform yourself —
+"Understood — I'll add X", "I'll get that done" without an actual result is
+the WORST possible output. If the request is an action, signal 0.
+A routing phrase is not an answer — if you would say "let me route/pass/hand
+that to ThinkDrop", output 0 instead.
 ═══════════════════════════════════════════════`;
 
 // Questions asking about ThinkDrop/the assistant itself — a persona echo is
@@ -242,16 +260,26 @@ async function execute(englishText, systemPrompt, conversationContext, opts = {}
     // correct answer there.
     const refusal = isCannedRefusal(response);
     const promptEcho = !SELF_REFERENTIAL_RE.test(englishText) && isPromptEcho(response, systemPrompt);
-    if (!response || !response.trim() || response.trim() === '0' || refusal || promptEcho) {
+    // Routing-promise backstop: the persona teaches "route with confidence —
+    // never say I can't", so the model sometimes writes "Let me route that to
+    // ThinkDrop now" instead of the 0 sentinel. Check fullText — the deferral
+    // usually trails a benign-looking first sentence. Whatever the words
+    // claim, a quick lane cannot route — honor the intent and hand off.
+    const routingPromise = isRoutingPromise(fullText || response);
+    if (!response || !response.trim() || response.trim() === '0' || refusal || promptEcho || routingPromise) {
       const phrase = getRandomHandoffPhrase();
+      // A non-routing lead sentence ("Understood — I'll add placeholders …")
+      // is a better ack than a generic phrase — and stays true now that the
+      // dispatch is real.
+      const handoffAck = routingPromise ? (stripRoutingPromises(fullText || response) || null) : null;
       logger.info('[GeneralQuick] Handoff signaled', {
         phrase, provider,
-        reason: !response ? 'empty' : (refusal ? 'refusal' : (promptEcho ? 'prompt-echo' : 'sentinel')),
+        reason: !response ? 'empty' : (refusal ? 'refusal' : (promptEcho ? 'prompt-echo' : (routingPromise ? 'routing-promise' : 'sentinel'))),
       });
       return {
         text: phrase,
         fullText: phrase,
-        metadata: { source: 'handoff', provider, intent: 1, shouldHandoff: true },
+        metadata: { source: 'handoff', provider, intent: 1, shouldHandoff: true, ...(handoffAck ? { handoffAck } : {}) },
       };
     }
 

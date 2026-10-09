@@ -67,7 +67,7 @@ function detectAgent(englishPrompt) {
  * @param {object|null} [thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<boolean>} true if notification was sent
  */
-function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planMeta = null, detectedLanguage = null) {
+function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planMeta = null, detectedLanguage = null, capabilityReason = null) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       taskId,
@@ -80,6 +80,7 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
       sessionId: sessionId || null,
       userApproved: userApproved === true,
       thoughtContext: thoughtContext || null,
+      ...(capabilityReason ? { capabilityReason } : {}),
       ...(planMeta && planMeta.planId ? { planId: planMeta.planId } : {}),
       ...(planMeta && planMeta.planTaskNum ? { planTaskNum: planMeta.planTaskNum } : {}),
       ...(planMeta && planMeta.planTask ? { planTask: true } : {}),
@@ -117,7 +118,7 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
  * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null }) {
+async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, capabilityReason = null }) {
   // Plan-dispatched tasks carry the task's canonical agentId so the lock key
   // is the shared session (google_*.agent → google.agent), not prompt text.
   const agentId = pinnedAgentId || detectAgent(englishPrompt);
@@ -143,7 +144,7 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
   if (acquired) {
     // Lock acquired — notify main.js to spawn stategraph run
     updateTask(taskId, 'queued');
-    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext, planMeta, detectedLanguage);
+    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext, planMeta, detectedLanguage, capabilityReason);
     if (!notified) {
       logger.warn('[Handoff] Failed to notify main.js — task will be picked up on retry', { taskId });
     }

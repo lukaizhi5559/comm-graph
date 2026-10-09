@@ -39,8 +39,9 @@ const PORT = parseInt(process.env.PORT || '3015', 10);
 // ── Module imports ──────────────────────────────────────────────────────────────
 const { toEnglish, fromEnglish, normalizeLanguage } = require('./translate.cjs');
 const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona.cjs');
-const { classify, INTENTS } = require('./classify.cjs');
-const { sanitizeContext } = require('./refusal.cjs');
+const { classify, INTENTS, GRAPH_ONLY_INTENTS } = require('./classify.cjs');
+const { sanitizeContext, isRoutingPromise, stripRoutingPromises } = require('./refusal.cjs');
+const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE } = require('../../shared/text-patterns.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
 const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
@@ -87,15 +88,39 @@ const AMBIGUOUS_CAST_RE = /\b(cast|mirror|stream)\b[^.\n]{0,40}\b(app|screen|win
 // plan. Action intents (command_automate etc.) still run the gate.
 const _GATE_SKIP_INTENTS = new Set(['web_search', 'general_knowledge', 'memory_retrieve', 'status_check']);
 
-// Connector verbs name the TARGET, not the action — "connect to my chromecast"
-// doesn't say cast/scan/play. When a ready agent matches but no action verb
-// maps to its declared capabilities, clarify intent in planning instead of
-// pinning blindly. Delegated to shared/capability-index.cjs verbFit().
-let _verbFit = null;
-function _loadVerbFit() {
-  if (_verbFit) return _verbFit;
-  try { _verbFit = require('../../shared/capability-index.cjs').verbFit; } catch (_) { _verbFit = () => 'clarify'; }
-  return _verbFit;
+// ── Capability-gap guard ────────────────────────────────────────────────────
+// Three-layer routing, mirrored inside command-service:
+//   1. /capability.search — mechanical retrieval (generous recall; never the
+//      decision itself — a substring match can no longer become a pin).
+//   2. /capability.select-best — ONE bounded temp-0 LLM pick over the
+//      retrieved fact table ({pick, fit:exact|partial|none, reason}).
+//   3. decideGate (server-side) — pure mapping from VERIFIED FACTS:
+//      exact+ready→pin, exact+unready→needs_setup, partial→clarify,
+//      none→infer/stategraph, selector-failure→ASKING (never lexical pin).
+let _decideGate = null;
+function _loadDecideGate() {
+  if (_decideGate) return _decideGate;
+  try { _decideGate = require('../../shared/capability-index.cjs').decideGate; } catch (_) { _decideGate = () => 'fallback'; }
+  return _decideGate;
+}
+
+// Materialize an unregistered pick (platform affordance, infer-installed
+// tool, cli-registry provider) into a draft agent descriptor so
+// resolveAgent's registered-check can bind the pin. Returns the agentId
+// to pin, or null when materialization failed.
+async function _materializePin(candidateId) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.select`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: candidateId }),
+      signal: AbortSignal.timeout(4000),
+    });
+    const r = await res.json();
+    return r?.ok && r.agentId ? r.agentId : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function _capabilityGate(text) {
@@ -119,25 +144,63 @@ async function _capabilityGate(text) {
     const res = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.search`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, limit: 5 }),
+      body: JSON.stringify({ query, limit: 10 }),
       signal: AbortSignal.timeout(2000),
     });
-    // Weak single-token noise (score 1) isn't evidence — e.g. "set calendar
-    // event" substring-matching catt's set_volume. Require a distinctive
-    // match (≥2) for a hit to pin or count.
-    const hits = ((await res.json())?.results || []).filter(h => (h.matchScore || 0) >= 2);
-    const ready = hits.find(h => /\.agent$/.test(h.id) && h.installed && h.friction <= 1);
-    if (ready) {
-      // Specific action that maps to the tool's capabilities → pin and run.
-      // Connector-only phrasing ("connect to X") → planning clarifies intent.
-      const fit = _loadVerbFit()(text, ready);
-      if (fit === 'pin') return { pin: ready.id };
-      return { planning: 'capability_clarify', hints: [ready, ...hits.filter(h => h.id !== ready.id)].slice(0, 5), screenCtx };
+    const results = (await res.json())?.results || [];
+
+    // ── Semantic selection ─────────────────────────────────────────────────
+    // Retrieved candidates → one bounded pick. The lexical matchScore stays
+    // purely a retrieval ranker here — it can surface a candidate, but only
+    // the selector can pin it.
+    if (results.length) {
+      const sel = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.select-best`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, screenText: screenCtx?.ocrText || null, candidates: results }),
+        signal: AbortSignal.timeout(12000),
+      }).then(r => r.json()).catch(() => null);
+
+      const decision = (sel && sel.ok === false) ? 'fallback' : (sel?.decision || 'fallback');
+      const hints = sel
+        ? [sel.pick, ...(sel.alternatives || [])].filter(Boolean).slice(0, 5)
+        : [];
+
+      if (decision === 'pin' && sel.pick?.id) {
+        let pinId = sel.pick.id;
+        if (!sel.pick.registered) {
+          const materialized = await _materializePin(pinId);
+          if (!materialized) {
+            // Can't bind a phantom — ask instead of pinning.
+            logger.warn('[capability-gate] materialize failed for pick', { id: pinId });
+            return { planning: 'capability_clarify', hints, screenCtx };
+          }
+          pinId = materialized;
+        }
+        logger.info('[capability-gate] pin', { id: pinId, reason: sel.reason || '' });
+        return { pin: pinId, reason: sel.reason || '', fit: sel.fit };
+      }
+      if (decision === 'needs_setup' && sel.pick) {
+        return { planning: 'capability_needs_setup', hints: hints.length ? hints : results.slice(0, 5), screenCtx };
+      }
+      if (decision === 'clarify' && sel.pick) {
+        return { planning: 'capability_clarify', hints, screenCtx };
+      }
+      if (decision === 'fallback') {
+        // Selector unavailable — degrade to ASKING on distinctive hits only;
+        // weak single-token noise isn't evidence of a capability question.
+        const strong = results.filter(h => (h.matchScore || 0) >= 2);
+        if (strong.length) {
+          logger.warn('[capability-gate] selector failed — degrading to clarify (no lexical pin)');
+          return { planning: 'capability_clarify', hints: strong.slice(0, 5), screenCtx, degraded: true };
+        }
+        // fall through to infer
+      }
+      // decision 'none' → not a capability task — fall through to infer/stategraph
     }
-    if (hits.length) return { planning: 'capability_needs_setup', hints: hits.slice(0, 5), screenCtx };
 
     // ── Semantic fallback ──────────────────────────────────────────────────
-    // Keyword search missed — vocabulary gap, not necessarily a capability
+    // Retrieval found nothing — vocabulary gap, not necessarily a capability
     // gap. LLM proposes candidate tools; command-service mechanically
     // verifies each (which/npm view/brew/seed/--version). Only verified
     // candidates reach planning. Unregistered tools always clarify — pinning
@@ -527,15 +590,19 @@ async function processMessage(args) {
   // so the answering nodes (and any handoff payload) still see the selection.
   // Exact-string removal via selectedText — a `]` inside the blob would
   // truncate a non-greedy tag regex (observed: captured log lines like "[0]").
-  const hasSelectionContext = !!(selectedText && String(selectedText).trim());
+  const _selLines = String(selectedText || '').split('\n').map(s => s.trim()).filter(s => s.length > 2);
+  // [File:]/[Folder:] chips are path POINTERS, not content — generalQuick can't
+  // open them, so a selection made only of file refs isn't self-contained QA
+  // context; the prompt needs the real classifier's guards (action veto,
+  // deictic) and usually the stategraph's file tools. [Context:]/[Thought:]
+  // and raw highlight lines DO carry text and still count.
+  const hasSelectionContext = _selLines.some(l => !FILE_REF_TAG_LINE_RE.test(l));
   let classifyText = englishText;
-  if (hasSelectionContext) {
-    for (const chunk of String(selectedText).split('\n').map(s => s.trim()).filter(s => s.length > 2)) {
-      classifyText = classifyText.split(chunk).join(' ');
-    }
+  for (const chunk of _selLines) {
+    classifyText = classifyText.split(chunk).join(' ');
   }
   classifyText = classifyText
-    .replace(/\[Highlighted:\s*[^\]]*\]/g, ' ')  // leftover wrappers are whitespace-only
+    .replace(ATTACHMENT_TAG_RE, ' ')  // leftover wrappers are whitespace-only
     .replace(/\s{2,}/g, ' ')
     .trim() || englishText;
   // ── Selection fast lane ───────────────────────────────────────────────────
@@ -552,10 +619,23 @@ async function processMessage(args) {
     confidence = 1.0;
     classifySource = 'planning_pinned';
   } else if (hasSelectionContext) {
-    intent = 1;
-    intentName = 'general_quick';
-    confidence = 0.9;
-    classifySource = 'selection_fastlane';
+    // Action veto (same shape as classify.cjs's): a highlight answers questions
+    // ABOUT text — it cannot run actions. "post this", "add these dates to my
+    // calendar" still need the graph even with a selection riding along. The
+    // guesser is a free synchronous regex pre-check, no LLM cost.
+    const { guessedIntent: _selGuess } = intentGuesser.guess(classifyText, { hasSelectionContext });
+    if (GRAPH_ONLY_INTENTS.has(_selGuess)) {
+      logger.info('[Process] Selection action veto → handoff', { guessedIntent: _selGuess });
+      intent = 0;
+      intentName = 'handoff';
+      confidence = 0.85;
+      classifySource = 'selection_action_veto';
+    } else {
+      intent = 1;
+      intentName = 'general_quick';
+      confidence = 0.9;
+      classifySource = 'selection_fastlane';
+    }
   } else {
     // Open-plan fact for the classifier — deterministic resume guard + a
     // "paused plan exists" line in the classify prompt so continuation
@@ -599,6 +679,7 @@ async function processMessage(args) {
   // prompt with no match — routes to the planning lane so the user clarifies
   // and approves setup BEFORE anything executes.
   let _capPin = null;
+  let _capReason = null;
   let _capHints = null;
   let _capScreenCtx = null;
   if (intent === 0) {
@@ -611,8 +692,9 @@ async function processMessage(args) {
       _capHints = gate.hints || null;
       _capScreenCtx = gate.screenCtx || null;
     } else if (gate?.pin) {
-      logger.info('[Process] capability pin', { agentId: gate.pin });
+      logger.info('[Process] capability pin', { agentId: gate.pin, reason: gate.reason || '' });
       _capPin = gate.pin;
+      _capReason = gate.reason || null;
     }
   }
 
@@ -707,6 +789,7 @@ async function processMessage(args) {
         sessionId: routedSessionId,
         thoughtContext,
         agentId: _capPin || undefined,
+        capabilityReason: _capReason || undefined,
       });
 
       // Generate intent-aware handoff phrase (LLM for command_automate, static pool for others)
@@ -746,9 +829,13 @@ async function processMessage(args) {
           sessionId: routedSessionId,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi1);
+        // Preserve the lane's task-specific ack (routing sentences stripped) —
+        // "Understood — I'll add placeholders …" beats a generic phrase and is
+        // truthful now that the dispatch below is real.
+        const head = result.metadata?.handoffAck || basePhrase;
         const handoffText = handoffResult.parked
-          ? `${basePhrase} I'll start on that as soon as the current task finishes.`
-          : basePhrase;
+          ? `${head} I'll start on that as soon as the current task finishes.`
+          : head;
         result = {
           text: handoffText,
           fullText: handoffText,
@@ -891,6 +978,53 @@ async function processMessage(args) {
       // Unknown intent — default to general_quick
       result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext, originalPrompt: originalText, detectedLanguage });
     }
+  }
+
+  // ── Routing-promise / unclaimed-sentinel invariant ─────────────────────────
+  // A quick lane's reply must be an answer — never prose that PROMISES routing
+  // ("Let me route that to ThinkDrop now") while nothing dispatches, and never
+  // a handoff phrase whose shouldHandoff flag no case consumed (the default:
+  // bucket used to display the phrase and do nothing). Detect either and ACT
+  // on it — convert to a real handoff so the words are backed by a task.
+  // intent 0 already dispatched; intent 6 has its own marker system.
+  if (result && intent !== 0 && intent !== 6 && !result.metadata?.taskId
+      && (result.metadata?.shouldHandoff || isRoutingPromise(result.fullText || result.text))) {
+    logger.info('[Process] Quick-lane routing promise/unclaimed sentinel → handoff', {
+      was: intentName, source: result.metadata?.source || null,
+    });
+    const { guessedIntent: _giQ } = intentGuesser.guess(classifyText, { hasSelectionContext });
+    const handoffResult = await handoff({
+      englishPrompt: englishText,
+      source,
+      originalPrompt: originalText,
+      detectedLanguage,
+      guessedIntent: _giQ,
+      sessionId: routedSessionId,
+      thoughtContext,
+    });
+    const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _giQ);
+    // Keep the lane's task-specific ack minus the routing sentences when one
+    // exists — it's true now that the dispatch is real.
+    const head = result.metadata?.handoffAck
+      || stripRoutingPromises(result.fullText || result.text)
+      || basePhrase;
+    const handoffText = handoffResult.parked
+      ? `${head} I'll start on that as soon as the current task finishes.`
+      : head;
+    result = {
+      text: handoffText,
+      fullText: handoffText,
+      metadata: {
+        ...result.metadata,
+        source: `${result.metadata?.source || intentName}_routing_handoff`,
+        intent: 0,
+        taskId: handoffResult.taskId,
+        agentId: handoffResult.agentId,
+        parked: handoffResult.parked,
+        speakable: false,
+        guessedIntent,
+      },
+    };
   }
 
   // ── Step 5: Translate response back to user's language (if non-English) ──────
@@ -1123,6 +1257,14 @@ const server = http.createServer(async (req, res) => {
   if (req.url === '/comms.signal' && req.method === 'POST') {
     const body = await _readBody(req);
     logger.info('[Server] Signal ack', { signalType: body.signalType, taskId: body.taskId });
+    return _send(res, 200, { ok: true });
+  }
+
+  // ── Planning-mode exit (from main.js) — unbind the session→plan mapping so
+  // a follow-up prompt can't silently re-enter the lane on the old plan.
+  if (req.url === '/plan.exit' && req.method === 'POST') {
+    const body = await _readBody(req);
+    planningNode.releaseSession(body.sessionId || null);
     return _send(res, 200, { ok: true });
   }
 

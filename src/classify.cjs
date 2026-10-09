@@ -133,6 +133,11 @@ const PLANNING_PHRASE_RE = /\b(?:let'?s|lets|help me|i want to|i need to|we need
 // absent: prompt-queue's _tryResolvePendingApproval consumes them upstream.
 const PLAN_RESUME_RE = /\bcontinue\b|\bresume\b|\bkeep going\b|\bcarry on\b|\bpick up where we left off\b|\bwhere were we\b|\bwhat happened with (?:the|that|my) (?:plan|setup|install)\b|\bfinish (?:the|that) (?:plan|setup|install)\b|\bhow'?s the (?:plan|setup|install) (?:going|doing)\b|\bdid (?:the|that|it) (?:plan|setup|install|task) (?:finish|work|succeed|complete|go through)\b|\bdo(?:n'?t| not) i have a plan\b|\bi have a plan\b|\bthe plan\b.*\b(?:continue|finish|done|status|going|working)\b/i;
 
+// Intents only the main stategraph can serve — a quick-tier pick with one of
+// these guessed is an action-veto flake (also used by server.cjs's selection
+// fastlane so "post this" + a highlight can't be answered instead of run).
+const GRAPH_ONLY_INTENTS = new Set(['command_automate', 'screen_analysis', 'web_search', 'memory_retrieve']);
+
 // "is <thing> installed / done / set up" — anchored when <thing> names a task
 // in the open plan, or the referent is bare "it"/"the plan".
 const _INSTALL_PROBE_RE = /\b(?:is|was|did)\s+(?:the\s+plan|it|that|([a-z0-9@._-]+))\s+(installed|set up|done|finished|working|running|complete|still going)\b/i;
@@ -317,7 +322,6 @@ async function classify(englishText, conversationContext, opts = {}) {
   // intentGuesser claims a graph-only intent, a quick pick is a flake.
   // Observed: "post a tweet saying hello world" drew general_quick and comms
   // answered "tweet going live" — nothing ever ran.
-  const _GRAPH_ONLY_INTENTS = new Set(['command_automate', 'screen_analysis', 'web_search', 'memory_retrieve']);
   let _guessedIntent = null;
   try { _guessedIntent = require('./intentGuesser.cjs').guess(englishText, { hasSelectionContext }).guessedIntent; } catch (_) {}
   const _vetoQuick = (result) => {
@@ -330,7 +334,7 @@ async function classify(englishText, conversationContext, opts = {}) {
     // Observed: "…explain the status for each repo… commit it" — the status
     // keyword vetoed the LLM's handoff and the prompt died as a canned
     // journal summary while intentGuesser saw command_automate.
-    if (!_sameMemoryDomain && (result.intent === 1 || result.intent === 2 || result.intent === 3 || result.intent === 4 || result.intent === 5) && _GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
+    if (!_sameMemoryDomain && (result.intent === 1 || result.intent === 2 || result.intent === 3 || result.intent === 4 || result.intent === 5) && GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
       logger.info('[Classify] Action veto — quick tier cannot serve graph-only intent', {
         llmIntent: result.intent, guessedIntent: _guessedIntent,
         inputPreview: englishText.substring(0, 60),
@@ -471,4 +475,4 @@ async function classify(englishText, conversationContext, opts = {}) {
   return { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'default_handoff' };
 }
 
-module.exports = { classify, INTENTS, _complexityPlanningScore };
+module.exports = { classify, INTENTS, GRAPH_ONLY_INTENTS, _complexityPlanningScore };

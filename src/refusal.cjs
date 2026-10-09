@@ -64,6 +64,8 @@ const REFUSAL_OPENERS = [
  * legitimate and must not be flagged. */
 const REFUSAL_MAX_LEN = 300;
 
+const { ROUTING_PROMISE_RE } = require('../../shared/text-patterns.cjs');
+
 const _WS_CHARS = new Set([' ', '\t', '\n', '\r', '\f', '\v']);
 
 /** Normalize for matching: lowercase, straight quotes, single spaces — string ops only. */
@@ -151,4 +153,32 @@ function isPromptEcho(response, systemPrompt) {
   return hits >= 2 && hits >= Math.ceil(lines.length / 2);
 }
 
-module.exports = { REFUSAL_OPENERS, REFUSAL_MAX_LEN, isCannedRefusal, isPromptEcho, sanitizeContext };
+/**
+ * Is this response a routing/deferral promise instead of an answer?
+ * The persona teaches "route with confidence — never say I can't", so quick
+ * lanes sometimes emit "Let me route that to ThinkDrop now" / "let me pull
+ * that up" instead of the 0 sentinel. From a lane with no execution, those
+ * words are a lie — callers must convert the match into a real handoff.
+ * English-only; runs on the lane's pre-translation output.
+ */
+function isRoutingPromise(text) {
+  return ROUTING_PROMISE_RE.test(String(text || ''));
+}
+
+/**
+ * Remove routing-promise sentences from a response, keeping whatever real
+ * content preceded them ("Understood — I'll add placeholders …" survives
+ * once the "Let me route that to ThinkDrop now." tail is dropped). Returns
+ * '' when nothing but deferral prose remains.
+ */
+function stripRoutingPromises(text) {
+  const s = String(text || '');
+  if (!s.trim()) return '';
+  const kept = s
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map(sentence => sentence.trim())
+    .filter(sentence => sentence && !ROUTING_PROMISE_RE.test(sentence));
+  return kept.join(' ').trim();
+}
+
+module.exports = { REFUSAL_OPENERS, REFUSAL_MAX_LEN, isCannedRefusal, isPromptEcho, isRoutingPromise, stripRoutingPromises, sanitizeContext };
