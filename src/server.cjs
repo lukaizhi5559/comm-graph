@@ -123,11 +123,45 @@ async function _materializePin(candidateId) {
   }
 }
 
+// GhostLayer deliverables — charts/effects/scenes painted onto the screen are
+// native screen.display output, not external-service capability gaps. The
+// stategraph's screenOutput detection owns these; the gate must not divert
+// them into setup planning (e.g. "create a pie chart" → chartjs candidates).
+const SCREEN_OUTPUT_RE = /\b(?:pie|bar|line|donut)\s*chart|\bcharts?\s+(?:up|of|showing)\b|on\s+(?:my|the)\s+screen|make\s+it\s+rain|emoji\s+rain|fireworks|slideshow|slide\s*show|\b3d\s+(?:model|scene)\b|\borbit\b/i;
+
+// Local file-system chores — moving/copying/organizing files between local
+// folders uses native fs tools; there is no service to pick.
+const LOCAL_FS_RE = /\b(?:move|copy|rename|organize|sort|delete|archive)\b[^.\n]{0,60}\b(?:files?|folders?|directories)\b|\b(?:files?|folders?)\s+in\s+(?:my\s+)?(?:downloads|desktop|documents|home)\b/i;
+
+// Unresolved recipient — "text my wife", "call my mom" — no usable contact
+// info in the text. Planning asks for it AFTER the user picks a route.
+const MISSING_INFO_RE = /\b(?:text|message|msg|email|e-mail|call|phone|send|tell|notify|ping|dm|facetime|whatsapp)\s+my\s+(?:wife|husband|spouse|partner|fianc[ée]e?|mom|dad|mother|father|parents?|sister|brother|siblings?|son|daughter|kids?|boss|coworker|colleague|landlord|doctor|dentist|lawyer|accountant|neighbor|roommate|girlfriend|boyfriend|friend|family|team)\b/i;
+
+// (Selector 'none' is authoritative — a named-site scrape that lexically
+// matches service tokens, e.g. "not my own calendar" on a church prompt,
+// must NOT be pulled into the options lane by a regex.)
+
+let _mergeRouteOptions = null;
+function _loadMerge() {
+  if (!_mergeRouteOptions) {
+    try { _mergeRouteOptions = require('../../shared/capability-index.cjs').mergeRouteOptions; }
+    catch (_) { _mergeRouteOptions = (r) => (r || []).slice(0, 8); }
+  }
+  return _mergeRouteOptions;
+}
+
 async function _capabilityGate(text) {
   try {
     // "cast/mirror <app|screen|overlay>" is ambiguous (media-cast vs window
     // mirroring) — always clarify in planning even when a cast agent exists.
     if (AMBIGUOUS_CAST_RE.test(text)) return { planning: 'capability_gap' };
+
+    // Screen-output deliverables bypass the gate — painting a chart/effect
+    // onto the screen needs no external service.
+    if (SCREEN_OUTPUT_RE.test(text)) return null;
+
+    // Purely local file chores need no service either — native fs tools.
+    if (LOCAL_FS_RE.test(text) && !/\b(?:upload|download|fetch|search|look\s+up)\b/i.test(text)) return null;
 
     // Screen-referring prompts ("use this on my screen to…") resolve their
     // target from live screen context — OCR text + active app — so the gate
@@ -149,54 +183,85 @@ async function _capabilityGate(text) {
     });
     const results = (await res.json())?.results || [];
 
-    // ── Semantic selection ─────────────────────────────────────────────────
-    // Retrieved candidates → one bounded pick. The lexical matchScore stays
-    // purely a retrieval ranker here — it can surface a candidate, but only
-    // the selector can pin it.
+    // ── Semantic selection + external discovery (parallel) ─────────────────
+    // A capability hit means this is a service task — the user always sees the
+    // real options list in planning (installed routes first, discovered
+    // CLI/API/MCP second) and picks. select-best still runs: its pick orders
+    // the list and flags whether the prompt is missing required details.
     if (results.length) {
-      const sel = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.select-best`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, screenText: screenCtx?.ocrText || null, candidates: results }),
-        signal: AbortSignal.timeout(12000),
-      }).then(r => r.json()).catch(() => null);
+      const inferBody = JSON.stringify({ query, screenText: screenCtx?.ocrText || null });
+      const [sel, inf] = await Promise.all([
+        fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.select-best`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, screenText: screenCtx?.ocrText || null, candidates: results }),
+          signal: AbortSignal.timeout(12000),
+        }).then(r => r.json()).catch(() => null),
+        fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.infer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: inferBody,
+          signal: AbortSignal.timeout(25000),
+        }).then(r => r.json()).catch(() => null),
+      ]);
 
       const decision = (sel && sel.ok === false) ? 'fallback' : (sel?.decision || 'fallback');
-      const hints = sel
-        ? [sel.pick, ...(sel.alternatives || [])].filter(Boolean).slice(0, 5)
-        : [];
+      const inferred = inf?.candidates || [];
 
-      if (decision === 'pin' && sel.pick?.id) {
-        let pinId = sel.pick.id;
-        if (!sel.pick.registered) {
-          const materialized = await _materializePin(pinId);
-          if (!materialized) {
-            // Can't bind a phantom — ask instead of pinning.
-            logger.warn('[capability-gate] materialize failed for pick', { id: pinId });
-            return { planning: 'capability_clarify', hints, screenCtx };
+      // 'none' means the selector saw hits but judged them irrelevant — not a
+      // capability task at all (named-site scrapes, weather, chat). Fall
+      // through to the stategraph like a no-hit prompt.
+      if (decision !== 'none') {
+        // Unresolved recipient — "text my wife", "call my mom" — no usable
+        // contact info in the text. Planning asks for it AFTER the pick.
+        const needsInfo = /(?:\+?\d[\d\s().-]{6,}\d)|@\S+|[\w.+-]+@[\w-]+\.\w+/.test(text)
+          ? null
+          : (MISSING_INFO_RE.test(text) ? 'recipient' : null);
+        // The selector's pick + alternatives are the vetted ready pool —
+        // raw matchScore is too noisy (generic tokens like "text"/"my"
+        // match catt/vscode/pandoc keyword lists). Augment with ready
+        // candidates whose keywords/capabilities share a real token with
+        // the query — "check my gmail" should still surface nylas
+        // (list_emails ~ "mail") even when the selector's alts omit it.
+        const qTokens = new Set((String(text).toLowerCase().match(/[a-z]{4,}/g) || [])
+          .filter(w => !/^(check|what|tell|show|give|with|that|this|from|into|have|want|need|please|today|tonight|about|when|them|they|there|here|just|also|then|some|more|been|came|know|like|list|read|send|text|call|make|keep)$/.test(w)));
+        const overlapsQuery = (r) => {
+          const hay = [r.service, r.id, r.tool, ...(r.keywords || []), ...(r.capabilities || [])].filter(Boolean).join(' ').toLowerCase();
+          for (const w of qTokens) {
+            if (hay.includes(w)) return true;
+            // Affixed service words — 'gmail' should match 'list_emails'
+            // ('mail'), 'imessage' → 'message'.
+            if (w.length >= 5 && (hay.includes(w.slice(1)) || hay.includes(w.slice(0, -1)))) return true;
           }
-          pinId = materialized;
+          return false;
+        };
+        const pool = [sel?.pick, ...(sel?.alternatives || [])].filter(Boolean);
+        const extras = results
+          .filter(r => r && r.installed !== false && (r.friction ?? 9) <= 2 && overlapsQuery(r))
+          .slice(0, 4);
+        const merged = [...pool, ...extras];
+        const options = _loadMerge()(
+          merged.length ? merged : results.filter(r => (r.matchScore || 0) >= 2),
+          inferred, sel?.pick);
+        if (options.length) {
+          logger.info('[capability-gate] service task → planning options', {
+            decision, options: options.length, needsInfo,
+          });
+          return { planning: 'capability_options', hints: options, needsInfo, recommended: sel?.pick?.id || null, screenCtx };
         }
-        logger.info('[capability-gate] pin', { id: pinId, reason: sel.reason || '' });
-        return { pin: pinId, reason: sel.reason || '', fit: sel.fit };
-      }
-      if (decision === 'needs_setup' && sel.pick) {
-        return { planning: 'capability_needs_setup', hints: hints.length ? hints : results.slice(0, 5), screenCtx };
-      }
-      if (decision === 'clarify' && sel.pick) {
-        return { planning: 'capability_clarify', hints, screenCtx };
-      }
-      if (decision === 'fallback') {
-        // Selector unavailable — degrade to ASKING on distinctive hits only;
-        // weak single-token noise isn't evidence of a capability question.
-        const strong = results.filter(h => (h.matchScore || 0) >= 2);
-        if (strong.length) {
-          logger.warn('[capability-gate] selector failed — degrading to clarify (no lexical pin)');
-          return { planning: 'capability_clarify', hints: strong.slice(0, 5), screenCtx, degraded: true };
+        // Empty options but selector had a pick — keep old clarify behavior.
+        if (decision === 'clarify' || decision === 'needs_setup' || decision === 'fallback') {
+          const hints = sel ? [sel.pick, ...(sel.alternatives || [])].filter(Boolean).slice(0, 5) : results.slice(0, 5);
+          if (hints.length) return { planning: 'capability_clarify', hints, screenCtx };
         }
-        // fall through to infer
       }
-      // decision 'none' → not a capability task — fall through to infer/stategraph
+      // 'none' with no service signal — fall through to infer/stategraph
+      if (!inferred.length) return null;
+      // no-hit path continues below with the already-fetched infer results
+      if (inferred.length && !inferred.some(c => c.installed && (c.friction ?? 9) <= 1)) {
+        return { planning: 'capability_needs_setup', hints: inferred.slice(0, 5), screenCtx };
+      }
+      return null;
     }
 
     // ── Semantic fallback ──────────────────────────────────────────────────
@@ -645,6 +710,45 @@ async function processMessage(args) {
       await classify(classifyText, context, { hasSelectionContext, openPlan: _openPlan }));
   }
 
+  // ── Bogus resume guard ─────────────────────────────────────────────────────
+  // The classifier sees the open-plan fact and may "resume" it for a clearly
+  // NEW-topic prompt — that merges unrelated tasks into the old plan (observed:
+  // a Spotify setup prompt joining the reminders plan). A resume is only
+  // honest for continuation-shaped text: an explicit plan reference, a resume
+  // verb, or a short reply. A full new-task prompt starts a fresh plan.
+  const _t = String(classifyText || '').trim();
+  // 'resume' is a verb only with a plan/task object — "build me a new
+  // resume" (the document) must not count as continuation-shaped.
+  const _resumeish = /\b(?:the|that|this|same|it|my)\s+[\w .-]{0,30}?\s*plan\b|\bresume\s+(?:the\s+|my\s+|that\s+)?(?:plan|task|draft)\b|\b(?:continue|run|start|go\s+ahead|yes|ok|approve|confirm|cancel|exit)\b/i.test(_t)
+    || _t.split(/\s+/).length <= 6;
+  if (_resumePlanId && intent === 6 && !_resumeish) {
+    logger.info('[Process] Dropping classifier resume — new-topic prompt', {
+      planId: _resumePlanId, textPreview: _t.slice(0, 60),
+    });
+    _resumePlanId = null;
+  }
+
+  // ── Short reply while a plan awaits input → resume planning ────────────────
+  // The UI pin normally keeps replies in the lane, but a bare answer
+  // ("555-0134", "Messages") that loses the pin must not dispatch as a new
+  // task. Only short, verb-free replies count — a fresh task prompt like
+  // "text my wife" still routes on its own merits.
+  if (!_resumePlanId && _openPlan && intent !== 6) {
+    const _ansText = String(classifyText || '').trim();
+    const _words = _ansText.split(/\s+/).length;
+    const _hasVerb = /\b(send|add|create|check|show|tell|text|call|open|search|find|get|set|make|remind|schedule|summarize|give|what|how|when|where|who|why)\b/i.test(_ansText);
+    if (_ansText.length <= 60 && _words <= 6 && (!_hasVerb || _openPlan.awaitingInput)) {
+      intent = 6;
+      intentName = 'planning';
+      confidence = 0.9;
+      classifySource = 'open_plan_reply';
+      _resumePlanId = _openPlan.planId;
+      logger.info('[Process] Open plan awaiting input — resuming for short reply', {
+        planId: _openPlan.planId, reply: _ansText.slice(0, 40),
+      });
+    }
+  }
+
   // ── Proactive-card reply → always handoff ────────────────────────────────────
   // A prompt carrying thoughtContext is a reply to a proactive card. Quick
   // intents (general_quick et al.) lack the context machinery to resolve it —
@@ -681,6 +785,8 @@ async function processMessage(args) {
   let _capPin = null;
   let _capReason = null;
   let _capHints = null;
+  let _capGateReason = null;
+  let _capNeedsInfo = null;
   let _capScreenCtx = null;
   if (intent === 0) {
     const { guessedIntent: _gateGuess } = intentGuesser.guess(classifyText, { hasSelectionContext });
@@ -690,6 +796,8 @@ async function processMessage(args) {
       intent = 6; intentName = 'planning'; confidence = 0.9;
       classifySource = 'capability_gap';
       _capHints = gate.hints || null;
+      _capGateReason = gate.planning;
+      _capNeedsInfo = gate.needsInfo || null;
       _capScreenCtx = gate.screenCtx || null;
     } else if (gate?.pin) {
       logger.info('[Process] capability pin', { agentId: gate.pin, reason: gate.reason || '' });
@@ -908,13 +1016,17 @@ async function processMessage(args) {
           // (skipped for fresh-draft requests so "plan a party" doesn't
           // inherit an unrelated paused plan).
           planId: planning?.planId || _resumePlanId
-            || (classifySource === 'planning_phrase_guard' ? null : (_openPlan ? _openPlan.planId : null)),
+            || (_openPlan && _resumeish && classifySource !== 'planning_phrase_guard' ? _openPlan.planId : null),
           name: planning?.name || null,
           startedExplicit: planning?.startedExplicit === true || classifySource === 'planning_pinned',
           // Capability-gap turns are NEW capability requests — they must not
           // inherit (and mutate) the session's bound finalized plan. planning.cjs
           // honors this by only reusing a bound session that's still drafting.
-          preferFresh: classifySource === 'capability_gap',
+          // Capability-gap turns are NEW capability requests — same for any
+          // non-resume-shaped prompt. Without this the _activePlanId fallback
+          // in planning.cjs merges unrelated tasks into the last open plan.
+          preferFresh: classifySource === 'capability_gap' || (!_resumeish && !planning?.planId),
+          forceNewPlan: !_resumeish && !planning?.planId && classifySource !== 'planning_pinned',
         },
         source,
         // Planning entered mid-conversation — the routed session's recent
@@ -926,6 +1038,11 @@ async function processMessage(args) {
         // Capability-gap re-route carried verified candidates — inject them
         // into the planning prompt so <choices> lists real, vetted options.
         capabilityHints: _capHints,
+        // 'capability_options' — planning shows the verified options list
+        // first; 'needsInfo' means a detail (e.g. recipient) must be asked
+        // after the user picks a route.
+        gateReason: _capGateReason,
+        needsInfo: _capNeedsInfo,
         // Screen context the gate already fetched for ambient prompts — the
         // planning lane opens with eyes instead of asking "what's on screen".
         screenContext: _capScreenCtx,

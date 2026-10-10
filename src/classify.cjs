@@ -257,10 +257,26 @@ async function classify(englishText, conversationContext, opts = {}) {
     return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'conversation_recall_guard' };
   }
 
+  // Generated deliverables — slideshows, 3D scenes, resumes/docs — are
+  // composed artifacts, not literal screen output. They belong in planning:
+  // preview/draft → confirm → run. Literal displays ("show X on my screen",
+  // "pie chart: a 5 b 3") still fast-path via the screen-output guard below.
+  if (/\b(?:slideshow|slide\s*deck|slide\s*show)\b|\b3d\s*(?:model|scene)\b|\b(?:build|create|make|write|draft|generate|put\s+together)\s+(?:me\s+)?(?:a|an|the|some|my|new)\s+[\w\s-]{0,40}\b(?:deck|slideshow|scene|report|resume|doc|document|pdf)\b/i.test(englishText)) {
+    logger.info('[Classify] Deliverable guard → planning', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 6, intentName: 'planning', confidence: 0.9, source: 'deliverable_guard' };
+  }
+
   // Screen-output commands ("show it on the screen", "make it rain on my
   // screen", "clear the screen") drive the GhostLayer display channel in the
   // stategraph — never let them land in general_quick or control_signal.
-  if (/\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(englishText)) {
+  // …but not when the prompt also names a personal account/service — "check
+  // my inbox … and put a summary on my screen" is a gather+display compound
+  // that needs the service lane (nylas/gmail) first. Let it reach the
+  // capability gate instead of display-short-circuiting the whole prompt.
+  const _serviceRef = /\b(?:inbox|e-?mails?|gmail|outlook|slack|discord|calendar|notion|drive|spotify|whatsapp|imessage|messages|reminders|contacts|files?|photos?)\b/i.test(englishText);
+  if (!_serviceRef && /\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(englishText)) {
     logger.info('[Classify] Screen-output guard → handoff', {
       inputPreview: englishText.substring(0, 60),
     });

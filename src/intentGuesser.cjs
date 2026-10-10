@@ -196,7 +196,11 @@ const INTENT_PATTERNS = [
     intent: 'web_search',
     test: (text) => {
       // Explicit web search / lookup verbs
-      if (/\b(search|google|look\s+up|look\s+for|find\s+(me\s+)?(online|on\s+the\s+(web|internet)|info|information|details|a|an|the|some))\b/i.test(text)) return true;
+      // 'google' counts as a lookup verb only when it isn't naming a Google
+      // service — "google the address" is a search, "my Google Calendar" is a
+      // service referent.
+      if (/\b(search|look\s+up|look\s+for|find\s+(me\s+)?(online|on\s+the\s+(web|internet)|info|information|details|a|an|the|some))\b/i.test(text)) return true;
+      if (/\bgoogle\b(?!\s+(calendar|drive|docs|doc|sheets|sheet|slides|maps|photos?|meet|workspace|account|mail|gemini|cloud|play|home|translate|keep|forms?|tasks?|voice|fi|pay|wallet))/i.test(text)) return true;
       // Image/media display: "show me a thinking emoji", "find pictures of cats"
       if (/\b(show|find|get|display|pull\s+up|give)\s+(me\s+)?(a\s+|an\s+|the\s+|some\s+)?[\w-]{0,15}[\w\s-]{0,20}?\s*(image|images|picture|pictures|photo|photos|pic|pics|emoji|emojis|icon|icons|logo|logos|gif|gifs|meme|memes|thumbnail|thumbnails|wallpaper|wallpapers|video|videos)\b/i.test(text)) return true;
       if (/\bwhat\s+(does|do)\s+.{0,50}?\s+look\s+like\b/i.test(text)) return true;

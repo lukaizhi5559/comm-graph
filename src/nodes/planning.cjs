@@ -302,6 +302,12 @@ function _loadSgPrompt(name) {
 
 function _pickStepgenAppendix(task) {
   const agents = task.agents || [];
+  // GhostLayer deliverable — screen.display isn't a service-map agent, but the
+  // screen appendix is the ONLY canon that knows the scene/chart/deck contract.
+  // Without it the LLM falls back to synthesize→save HTML→open-in-browser.
+  if (agents.some(a => /^(screen\.display|screen_display)$/.test(String(a)))) {
+    return 'plan-skills-screen.md';
+  }
   let hasBrowser = false;
   let hasCli = false;
   for (const a of agents) {
@@ -335,6 +341,35 @@ function _stepgenSystemPrompt(task) {
 }
 
 async function _generateTaskSteps(task) {
+  // Deterministic fast path — a screen.display scene/3D task needs no LLM
+  // stepgen: the code is written at RUNTIME by the synthesize step (full task
+  // prompt, full token budget), then referenced via {{synthesisAnswer}}.
+  // Asking the stepgen LLM to carry any part of that code/spec inside the
+  // plan's JSON fence truncates on every provider cap.
+  if ((task.agents || []).some(a => /^(screen\.display|screen_display)$/.test(String(a)))
+      && /\b(3d|three\.?js|scene|model|orbit|spin|rotat|webgl|animation)\b/i.test(task.prompt || '')) {
+    const spec = task.prompt || task.title || 'the requested scene';
+    return [
+      {
+        skill: 'synthesize',
+        args: {
+          prompt: `Write the raw JavaScript body of build(THREE, ctx) for this scene: ${spec}\n\n` +
+            'The harness provides scene/camera/renderer via ctx, and ctx.controls is a ready ' +
+            'OrbitControls instance (drag-orbit + wheel-zoom already wired; call controls.update() ' +
+            'each frame if you change damping). Build all geometry procedurally — no imports, ' +
+            'fetch, or eval. Return { tick(t) } for per-frame animation. ' +
+            'Output ONLY the JavaScript — no markdown fence, no explanation.',
+          outputSchema: { type: 'STRING' },
+        },
+        description: 'Generate the three.js scene body at runtime',
+      },
+      {
+        skill: 'screen.display',
+        args: { kind: 'scene', scene: { js: '{{synthesisAnswer}}', libs: ['three'] }, blocking: true },
+        description: 'Render the generated scene on the GhostLayer',
+      },
+    ];
+  }
   const agents = (task.agents || []).join(' | ') || 'auto';
   const userMsg =
     `TASK AGENTS: ${agents}\n` +
@@ -345,7 +380,9 @@ async function _generateTaskSteps(task) {
     const { text } = await ask([
       { role: 'system', content: _stepgenSystemPrompt(task) },
       { role: 'user', content: userMsg },
-    ], { maxTokens: 900, temperature: 0.2, timeoutMs: 45000, taskType: 'planning' });
+    // Scene-step replies carry an inline three.js body — a 900-token cap
+    // truncates the fence mid-code and the whole list unparseable.
+    ], { maxTokens: 4096, temperature: 0.2, timeoutMs: 45000, taskType: 'planning' });
     const m = String(text || '').match(/```(?:json)?\s*\n?([\s\S]*?)```/);
     let steps = null;
     try { steps = m ? JSON.parse(m[1].trim()) : null; }
@@ -353,7 +390,10 @@ async function _generateTaskSteps(task) {
       logger.warn('[Planning] Step JSON parse failed', { taskNum: task.num, error: e.message });
     }
     if (!Array.isArray(steps) || !steps.length) {
-      logger.warn('[Planning] Step generation produced no steps', { taskNum: task.num, preview: String(text || '').slice(0, 120) });
+      logger.warn('[Planning] Step generation produced no steps', {
+        taskNum: task.num, replyChars: String(text || '').length,
+        tail: String(text || '').slice(-200), preview: String(text || '').slice(0, 120),
+      });
       return null;
     }
     const valid = steps.every(s => s && typeof s.skill === 'string' && s.skill);
@@ -864,8 +904,13 @@ async function _toolScreenPreview(query) {
   } else if (kind === 'three') {
     payload.three = { scene: (body || 'starfield').toLowerCase() };
   } else if (kind === 'scene') {
-    payload.scene = { name: body };
     if (!body) return 'screen.preview scene needs a registered scene name or generated markup.';
+    // Multi-word body = generated three.js markup the planner wrote itself —
+    // pass it through as scene.js (libs: ['three']) so a parametric scene can
+    // be previewed live during planning, not just named presets.
+    payload.scene = /^[\w-]+$/.test(body)
+      ? { name: body }
+      : { js: body, libs: ['three'] };
   } else {
     if (!body && !title) return 'screen.preview needs content, e.g. screen.preview("text | Title | body text").';
     payload.text = body;
@@ -907,7 +952,7 @@ function _ptyCmdText(r) {
   return r ? _ptyCleanDelta(r.delta) : '';
 }
 
-async function _runTools(text, sessionId) {
+async function _runTools(text, sessionId, opts = {}) {
   const calls = [];
   _TOOL_RE.lastIndex = 0;
   let m;
@@ -936,8 +981,12 @@ async function _runTools(text, sessionId) {
       out = await _toolScreenRead(call.query);
     }
     else if (call.tool === 'capability.search') {
-      await _ptyNote(`looking up capabilities for "${call.query}"…`);
-      out = await _toolCapabilitySearch(call.query);
+      if (opts.optionsTurn) {
+        out = 'SKIPPED — a verified route-options list was already shown for this turn. Do not re-search; ask the user to pick from the list.';
+      } else {
+        await _ptyNote(`looking up capabilities for "${call.query}"…`);
+        out = await _toolCapabilitySearch(call.query);
+      }
     }
     else if (call.tool === 'capability.probe') {
       // Read-only probe runs VISIBLY in the diagnosis pane — same command the
@@ -1121,7 +1170,10 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             pairs; deck = slides split by "--";
                                             doc = markdown; three = preset name
                                             (starfield/particles/wave/cube/knot/
-                                            globe).
+                                            globe); scene = a registered scene
+                                            name. Do NOT try to pass generated
+                                            scene code — the arg is one quoted
+                                            string and cannot carry code.
   <tool>url.open("https://…")</tool>       — open a page in the user's browser.
                                             Use when they must personally sign
                                             up, log in, verify, approve scopes,
@@ -1197,9 +1249,31 @@ RULES for tasks:
 AGENTS — every Task's Agents line uses ONLY names from the REGISTERED AGENTS
 catalog injected below — never invent an agent id (e.g. "doc.agent" when the
 registry says "google_docs.agent"). Generic surfaces — browser.agent,
-web.agent, edit.agent, shell, cli.agent — are execution lanes, not services;
-a task whose deliverable lives on a registered service names that service's
-agent.
+web.agent, edit.agent, shell, cli.agent, screen.display — are execution
+lanes, not services; a task whose deliverable lives on a registered service
+names that service's agent.
+
+SCREEN DELIVERABLES — the GhostLayer IS the render surface for visual
+artifacts. screen.display (a task's Agents name) paints natively on the
+user's screen — NO html files, NO "open in browser", NO python/image tooling.
+Kinds: text | image | chart | deck | doc | scene | three | effect | emoji |
+alert. Chart = antV (pie/donut/bar/line/area/stat with real data). Deck =
+slideshow with controls. Doc = editable markdown card. Scene = GENERATED
+three.js code — parametric 3D models (a car, a molecule, a diagram),
+custom animations, anything a preset can't express; the scene model writes
+the code at run time, so the task Prompt must carry the full visual spec
+(dimensions, parts, materials, colors) AND the interaction words the user
+asked for ("orbitable", "drag to rotate") — pointer capture keys off them.
+Three = instant presets: starfield | particles | wave | cube | knot | globe
+— fine for generic ambient 3D, NOT for a specific object (a sedan is a
+scene). For literal-data visuals (chart/deck/doc/text) you MAY preview first
+with <tool>screen.preview("kind | title | content")</tool> so the user
+approves a real draft — but NEVER preview a scene: the preview tool arg is a
+single quoted string and cannot carry generated code, and the code doesn't
+exist until run time anyway. Either way the final Task still ends with
+screen.display as the delivery step. Example for a 3D car: Task "Render the
+parametric sedan scene on screen" with Agents: screen.display and a Prompt
+that says screen.display kind=scene with the full spec + "orbitable via drag".
 
 ROUTING PREFERENCE — prefer type:cli/api/mcp agents over type:browser agents
 when both could satisfy the deliverable. Deterministic CLIs/APIs are faster
@@ -1503,7 +1577,7 @@ function _applyPlanMarkers(text, sess, unknownAgents) {
  *   (marker blocks are filtered out before chunks reach this)
  * @returns {Promise<{text, fullText, metadata}>}
  */
-async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null, screenContext: passedScreenContext = null }) {
+async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null, gateReason = null, needsInfo = null, screenContext: passedScreenContext = null }) {
   const startedExplicit = planning.startedExplicit === true;
 
   // ── Fresh-draft escape — "none of these — start a new plan" (the dismiss
@@ -1537,7 +1611,12 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   const unnamedResume = _isUnnamedResume(englishText);
 
   let boundId = planning.planId || _sessionToPlan.get(sessionId) || (planning.active ? _activePlanId : null);
-  if (planning.preferFresh && boundId && !referentHit && !unnamedResume) {
+  if (planning.forceNewPlan && boundId && !referentHit && !unnamedResume) {
+    // Non-resume-shaped prompt — never absorb into any open plan, drafting
+    // or not. Replies that should continue a plan are short/resume-shaped
+    // and never reach this flag.
+    boundId = null;
+  } else if (planning.preferFresh && boundId && !referentHit && !unnamedResume) {
     // A capability_gap turn is a new capability request — inheriting the
     // session's bound FINALIZED plan would let this prompt rewrite its tasks
     // (observed: a file-count prompt overwrote the nylas plan). Only a session
@@ -1671,12 +1750,35 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     };
   }
 
+  // Route-options context persists on the session — the diverted turn carries
+  // gateReason/hints, but the user's pick reply arrives as planning_pinned
+  // with neither. Keep the verified list + missing-info flag alive until the
+  // pick resolves into a task.
+  if (gateReason === 'capability_options' && Array.isArray(capabilityHints) && capabilityHints.length) {
+    sess._routeOptions = capabilityHints;
+    sess._needsInfo = needsInfo || null;
+  }
+  if (sess.tasks.length) { sess._routeOptions = null; sess._needsInfo = null; }
+  const _optsTurn = gateReason === 'capability_options' || !!sess._routeOptions;
+  const _optionsList = sess._routeOptions || (gateReason === 'capability_options' ? capabilityHints : null);
+  const _missingInfo = sess._needsInfo || needsInfo;
+
   const sysContent = (systemPrompt || '') + PLANNING_DIRECTIVE
     + `\n\nREGISTERED AGENTS (the ONLY agent names allowed in Tasks):\n`
     + _renderAgentCatalog()
     + `\n\nCURRENT PLAN STATE (planId ${sess.planId}, file already saved — update it with <plan_update> when it changes):\n`
     + _renderPlanState(sess)
-    + (Array.isArray(capabilityHints) && capabilityHints.length
+    + (Array.isArray(_optionsList) && _optionsList.length && _optsTurn
+      ? `\n\nROUTE OPTIONS — an options card listing these verified routes is shown to the user automatically. Do NOT emit <choices> or list them yourself; do NOT call capability.search (the list is already verified and complete). ` +
+        `Ask ONE short conversational question: which route do they want? If one is marked ready/recommended, say it's the suggested one. ` +
+        `Do NOT ask about sign-in state, credentials, or setup yet — that comes after they pick. ` +
+        `After they pick: (a) if the pick isn't a registered agent, call <tool>capability.select("<name>")</tool> to get its agentId; ` +
+        (_missingInfo === 'recipient'
+          ? `(b) ask for the missing recipient detail (phone number / contact) — ONE short question; (c) when both route and recipient are known, immediately <plan_update> the task with the agentId and details baked in — no confirmation loops.`
+          : `(b) if any required detail is still missing, ask ONE short question; (c) when the route and details are known, immediately <plan_update> the task with the agentId baked in — no confirmation loops.`) +
+        ` If the pick needs setup, call <tool>setup.start("<name>")</tool> AFTER collecting missing details.\n\nOptions:\n`
+        + _optionsList.map(h => `- ${h.label || h.id}${h.ready ? ' — READY (installed/registered)' : ' — needs setup'}${h.setupSummary ? `, setup: "${h.setupSummary}"` : ''}${h.eta ? `, eta: ${h.eta}` : ''}${h.authEnv?.length ? `, needs keys: ${h.authEnv.join(', ')}` : ''}`).join('\n')
+      : Array.isArray(capabilityHints) && capabilityHints.length
       ? `\n\nVERIFIED CANDIDATES (existence confirmed by the capability index — prefer these in <choices> over your own suggestions, ordered easiest-setup first):\n`
         + capabilityHints.map(h =>
             `- ${h.label || h.id}: kind=${h.kind || '?'}, setup="${h.setupSummary || ''}", eta="${h.eta || ''}"${h.installed ? ', already installed' : ''}${h.installCmd ? `, install: ${h.installCmd}` : ''}${h.detail ? ` — ${h.detail}` : ''}`).join('\n')
@@ -1740,7 +1842,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     if (_applyPlanMarkers(cleanText, sess, unknownAgents)) planChanged = true;
     if (/<plan_run\s*\/?\s*>/.test(cleanText)) planRunSeen = true;
 
-    const toolResults = await _runTools(cleanText, sessionId);
+    const toolResults = await _runTools(cleanText, sessionId, { optionsTurn: _optsTurn });
     if (toolResults && round < MAX_TOOL_ROUNDS) {
       // Record the assistant's tool-call turn, then feed results back.
       sess.history.push({ role: 'assistant', content: cleanText });
@@ -1861,11 +1963,30 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       logger.warn('[Planning] Malformed <choices> block ignored', { error: err.message });
     }
   }
+  // Route-options turns — the verified list is shown EVERY time (the user's
+  // pick, not the LLM's prose). Grouped: ready routes first, then setup.
+  if (_optsTurn && Array.isArray(_optionsList) && _optionsList.length && !sess.tasks.length && !sess._routeOptionsShown) {
+    sess._routeOptionsShown = true;
+    choices = {
+      question: 'Which route should I use? Verified options:',
+      options: _optionsList.slice(0, 8).map(h => ({
+        label: h.label || h.id,
+        description: [
+          h.ready ? 'ready now' : 'needs setup',
+          h.setupSummary && !/^(ready|installed|none|no setup needed)$/i.test(h.setupSummary) ? h.setupSummary : null,
+          h.eta || null,
+          h.authEnv?.length ? `keys: ${h.authEnv.join(', ')}` : null,
+        ].filter(Boolean).join(' · ').slice(0, 200),
+        primary: !!h.ready && h === _optionsList.find(x => x.ready),
+      })),
+    };
+    logger.info('[Planning] Route options card', { planId: sess.planId, options: choices.options.length });
+  }
   // Deterministic backstop — the capability gate already ranked verified
   // candidates; the selection surface must never depend on the LLM emitting
   // a <choices> marker. Synthesize the card from capabilityHints when the
   // turn arrived via a capability lane and the model dropped the block.
-  if (!choices && Array.isArray(capabilityHints) && capabilityHints.length && !sess.tasks.length) {
+  else if (!choices && Array.isArray(capabilityHints) && capabilityHints.length && !sess.tasks.length) {
     choices = {
       question: 'How should I handle this? These are the verified options:',
       options: capabilityHints.slice(0, 6).map(h => ({
@@ -1885,6 +2006,13 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       : (planRunSeen
         ? "The plan is still empty — nothing to run. Tell me the tasks you want in it, or say 'exit planning'."
         : "The plan is empty — tell me what you want it to do."));
+
+  // A clarifying question during drafting must mark the session awaiting input —
+  // otherwise findOpenPlan() sees an empty plan as closed and the user's answer
+  // ("metallic blue, dark wheels") dispatches as a brand-new handoff task.
+  if (!sess.tasks.length && /\?\s*$/.test(spoken.trim())) {
+    sess._needsInfo = sess._needsInfo || 'clarify';
+  }
 
   return {
     text: spoken,
@@ -1920,7 +2048,7 @@ function _renderAgentCatalog() {
       (a.cliTool ? ` cli:${a.cliTool}` : '') +
       (a.secrets && a.secrets.length ? ` secrets:[${a.secrets.join(', ')}]` : '')
     ).join('\n')
-      + '\nGeneric surfaces (execution lanes, not services): browser.agent | web.agent | web.crawl | edit.agent | shell | none';
+      + '\nGeneric surfaces (execution lanes, not services): browser.agent | web.agent | web.crawl | edit.agent | shell | screen.display | none';
   } catch (_) { return '(registry unavailable — use generic surfaces only)'; }
 }
 
@@ -1985,10 +2113,16 @@ function findOpenPlan(sessionId) {
   const TASK_TERMINAL = new Set([planFormat.TASK_STATUS.DONE, planFormat.TASK_STATUS.SKIPPED]);
 
   const _openFromSess = (sess) => {
-    if (!sess || !Array.isArray(sess.tasks) || !sess.tasks.length) return null;
+    if (!sess || !Array.isArray(sess.tasks)) return null;
     if (TERMINAL.has(String(sess.status || '').toLowerCase())) return null;
     const pending = sess.tasks.filter(t => !TASK_TERMINAL.has(t.status));
-    if (!pending.length) return null;
+    // A session awaiting a route pick / missing detail is still open even
+    // with zero tasks — the user's reply ("Messages", "555-0134") must be
+    // able to resume it instead of dispatching as a new task. A plan with no
+    // tasks at all is mid-clarification by definition (status 'drafting').
+    const awaitingInput = !!(sess._routeOptions?.length || sess._needsInfo)
+      || (sess.tasks.length === 0 && String(sess.status || '').toLowerCase() === 'drafting');
+    if (!pending.length && !awaitingInput) return null;
     return {
       planId: sess.planId,
       title: sess.title || sess.planId,
@@ -1996,6 +2130,7 @@ function findOpenPlan(sessionId) {
       totalTasks: sess.tasks.length,
       taskTitles: sess.tasks.map(t => t.title || '').filter(Boolean),
       filePath: sess.filePath,
+      awaitingInput,
     };
   };
 
