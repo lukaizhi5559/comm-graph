@@ -41,7 +41,7 @@ const { toEnglish, fromEnglish, normalizeLanguage } = require('./translate.cjs')
 const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona.cjs');
 const { classify, INTENTS, GRAPH_ONLY_INTENTS } = require('./classify.cjs');
 const { sanitizeContext, isRoutingPromise, stripRoutingPromises } = require('./refusal.cjs');
-const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE } = require('../../shared/text-patterns.cjs');
+const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE } = require('../../shared/text-patterns.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
 const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
@@ -51,6 +51,7 @@ const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const { execute: handoff, complete: handoffComplete, remove: handoffRemove, startRetrySweep: startHandoffRetrySweep } = require('./handoff.cjs');
 const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
 const intentGuesser = require('./intentGuesser.cjs');
+const { isPlanAnswerShape, shouldPinGate } = require('./planReply.cjs');
 const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = require('./screen-context.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
@@ -217,6 +218,25 @@ async function _capabilityGate(text) {
         const needsInfo = /(?:\+?\d[\d\s().-]{6,}\d)|@\S+|[\w.+-]+@[\w-]+\.\w+/.test(text)
           ? null
           : (MISSING_INFO_RE.test(text) ? 'recipient' : null);
+        // Exact+ready pick and nothing missing → pin the agent and hand off.
+        // decideGate only returns 'pin' on fit:exact + verified installed/
+        // low-friction, so the options card would be ceremony for a choice
+        // that isn't real. needsInfo keeps the options flow — the pick
+        // exists but a required detail (recipient) is still uncollected.
+        if (shouldPinGate(decision, needsInfo)) {
+          const candId = sel?.pick?.id || sel?.pick?.agentId || null;
+          // Materialize first — confirms registered picks and converts
+          // unregistered ones into a draft descriptor resolveAgent can bind.
+          // Bare use of a .agent-suffixed unregistered id would pin a phantom.
+          let pinned = candId ? await _materializePin(candId) : null;
+          if (!pinned) pinned = sel?.pick?.agentId || null;
+          if (pinned) {
+            logger.info('[capability-gate] exact ready route → pin + handoff', { agentId: pinned, pick: candId });
+            return { pin: pinned, reason: sel?.reason || 'exact+ready' };
+          }
+          // Materialization failed — fall through to options/clarify so the
+          // user still gets a real choice instead of a silent dead-end.
+        }
         // The selector's pick + alternatives are the vetted ready pool —
         // raw matchScore is too noisy (generic tokens like "text"/"my"
         // match catt/vscode/pandoc keyword lists). Augment with ready
@@ -676,7 +696,20 @@ async function processMessage(args) {
   // 0-sentinel self-corrects to shouldHandoff when tools are genuinely needed.
   let intent, intentName, confidence, classifySource;
   let _openPlan = null, _resumePlanId = null;
-  if (planning && planning.active === true) {
+  // Stale-pin escape — a UI pin on a finished plan must not keep trapping
+  // new prompts in the lane ("planning mode not being handed off"). The pin
+  // releases on run-start/cancel/exit markers, but a plan that reached a
+  // terminal state without one can linger. An unresolvable planId is left
+  // alone — it may be a fresh draft the pin is about to create.
+  let _pinTerminal = false;
+  if (planning && planning.active === true && planning.planId) {
+    try {
+      const _pinnedSess = planningNode.getPlanSession(planning.planId);
+      _pinTerminal = !!_pinnedSess
+        && ['done', 'failed', 'cancelled'].includes(String(_pinnedSess.status || '').toLowerCase());
+    } catch (_) { _pinTerminal = false; }
+  }
+  if (planning && planning.active === true && !_pinTerminal) {
     // Planning mode pinned by the UI (toggle / continue-plan) — bypass the
     // classifier entirely so "yes", edits, and questions stay in the lane.
     intent = 6;
@@ -736,8 +769,13 @@ async function processMessage(args) {
   if (!_resumePlanId && _openPlan && intent !== 6) {
     const _ansText = String(classifyText || '').trim();
     const _words = _ansText.split(/\s+/).length;
-    const _hasVerb = /\b(send|add|create|check|show|tell|text|call|open|search|find|get|set|make|remind|schedule|summarize|give|what|how|when|where|who|why)\b/i.test(_ansText);
-    if (_ansText.length <= 60 && _words <= 6 && (!_hasVerb || _openPlan.awaitingInput)) {
+    // Answer-shaped only — verb-free phrases, route-option labels, ordinals
+    // answer a pending question; a command with an action verb + new target
+    // ("goto john 1", "exodus 4 show on my screen") classifies on its own
+    // merits. Only a plan bound to THIS session may capture short replies —
+    // a foreign open plan must not swallow fresh commands here.
+    if (_openPlan.boundToSession !== false && _ansText.length <= 60 && _words <= 6
+        && isPlanAnswerShape(_ansText, _openPlan)) {
       intent = 6;
       intentName = 'planning';
       confidence = 0.9;
@@ -770,7 +808,7 @@ async function processMessage(args) {
   // Skipped when a selection supplies the referent — "this on the page" then
   // points at the highlighted text, not the live DOM (generalQuick may still
   // sentinel→handoff if it really needs the page).
-  if (intent !== 0 && intent !== 6 && !hasSelectionContext && /\b(?:this|the|current|open)\s+(?:page|tab|site|website)\b|\bon\s+this\s+(?:page|site|website)\b/i.test(classifyText)) {
+  if (intent !== 0 && intent !== 6 && !hasSelectionContext && (LIVE_PAGE_REF_RE.test(classifyText) || /\bthe\s+screen\b/i.test(classifyText))) {
     logger.info('[Process] live-page referent — forcing handoff', { was: intentName });
     intent = 0;
     intentName = 'handoff';

@@ -103,6 +103,31 @@ const UPDATE = `<plan_update>
     `taskCount=${r3.metadata.taskCount}`);
   check('mid-loop update applied → taskCount 1', r3.metadata.taskCount === 1);
 
+  // ── Scenario 4: hallucinated watch?v= URL never survives plan_update ──────
+  // The observed failure: model wrote a memorized dQw4w9WgXcQ URL into a cast
+  // task without ever calling media.resolve — the executor silently casts the
+  // wrong video. Ungrounded URLs must be stripped from persisted prompts.
+  const CAST_UPDATE = `<plan_update>
+## Task 1 — Cast the show
+- **Prompt**: Cast the YouTube video at https://www.youtube.com/watch?v=dQw4w9WgXcQ (Goof Troop S2E1) to the user's Chromecast using catt.
+- **Agents**: catt.agent
+- **Depends on**: —
+- **Mode**: sequential
+</plan_update>`;
+  SCRIPT = [CAST_UPDATE];
+  calls.length = 0;
+  const r4 = await planning.execute({
+    englishText: 'cast the show',
+    systemPrompt: '',
+    sessionId: 'test-gate-media',
+    planning: { active: true },
+  });
+  const disk4 = r4.metadata.planFile ? fs.readFileSync(r4.metadata.planFile, 'utf8') : '';
+  check('ungrounded watch?v= stripped from persisted task', !/dQw4w9WgXcQ/.test(disk4),
+    disk4.slice(0, 300));
+  check('resolve-at-runtime note appended', /resolve the video URL at run time/i.test(disk4),
+    disk4.slice(0, 300));
+
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed) { console.log('failures:', failures.join('; ')); process.exit(1); }
   process.exit(0);

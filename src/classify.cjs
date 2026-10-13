@@ -126,7 +126,7 @@ function _lastAssistantTurn(conversationContext) {
 // ── Planning-detection guards ────────────────────────────────────────────────
 // Explicit "let's plan / brainstorm / come up with a plan" phrasing → planning
 // lane deterministically (the LLM slips these to general_quick or handoff).
-const PLANNING_PHRASE_RE = /\b(?:let'?s|lets|help me|i want to|i need to|we need to|can we|wanna)\s+(?:make|create|build|come up with|work out|draft|do|start)\s+(?:a\s+|an\s+|the\s+|some\s+|up\s+a\s+)?plan\b|\bcome up with a plan\b|\bplan (?:out|for|to)\b|\bmake a plan\b|\bcreate a plan\b|\bdraft a plan\b|\bplanning mode\b|\bbrainstorm\b|\bwork out a plan\b|\bplanning session\b/i;
+const PLANNING_PHRASE_RE = /\b(?:let'?s|lets|help me|i want to|i need to|we need to|can we|wanna)\s+(?:make|create|build|come up with|work out|draft|do|start)\s+(?:a\s+|an\s+|the\s+|some\s+|up\s+a\s+)?plan\b|\bcome up with a plan\b|\bplan (?:out|for|to)\b|\bmake a plan\b|\bcreate a plan\b|\bdraft a plan\b|\bplanning mode\b|\bbrainstorm\b|\bwork out a plan\b|\bplanning session\b|\b(?:let'?s|lets)\s+plan\b|\bwork\s+out\s+(?:an?\s+|the\s+)?(?:idea|approach|plan|strategy)\b|\bthink\s+(?:it|this|that|things)\s+through\b|\bthink\s+through\s+(?:an?\s+idea|this|the\s+\w+)\b|\bfigure\s+out\s+(?:an?\s+|the\s+)?(?:approach|idea|plan|strategy|way\s+forward)\b|\bhash\s+out\s+(?:the\s+|some\s+)?(?:details|idea|ideas|plan|approach)\b|\bmap\s+out\s+(?:a\s+|an\s+|the\s+)?(?:plan|idea|approach|strategy|roadmap)\b|\bpick\s+your\s+brain\b/i;
 
 // Plan-resume vocabulary — fires only when an open (paused) plan exists, so
 // the false-positive surface is bounded. Approval words are deliberately
@@ -190,9 +190,13 @@ function _complexityPlanningScore(text) {
   // matter — "create a doc, then a calendar event and a spreadsheet" is three
   // deliverables under one verb). One service with many sequenced actions, or
   // a long multi-step ask (>35 words, 3+ actions), also benefits from a draft.
+  // ≥2 distinct canonical services → multi-deliverable (the verb count doesn't
+  // matter — "create a doc, then a calendar event and a spreadsheet" is three
+  // deliverables under one verb). Single-service prompts stay handoff no
+  // matter how long or sequenced they are — the stategraph's decomposePromptV2
+  // already handles in-app multi-step; prompt length is not a routing signal.
   const multiDeliverable = services.size >= 2;
-  const longSequential = (sequenced && actions.size >= 3) || (words > 35 && actions.size >= 3 && services.size >= 1);
-  return { score: (multiDeliverable || longSequential) ? 1 : 0, services: services.size, actions: actions.size, sequenced, words };
+  return { score: multiDeliverable ? 1 : 0, services: services.size, actions: actions.size, sequenced, words };
 }
 
 async function classify(englishText, conversationContext, opts = {}) {

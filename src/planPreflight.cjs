@@ -65,6 +65,27 @@ function _canonAgent(agentId) {
   return a;
 }
 
+// Registered-agent types that never authenticate to a web account.
+const _NO_AUTH_AGENT_TYPES = new Set(['cli', 'app', 'mcp']);
+
+// Descriptor consult — service-map knows type/secrets without any probing.
+// Advisory only: a resolution failure must not change behavior.
+function _describeAgentSafe(agentId) {
+  try {
+    return require('../../shared/service-map.cjs').describeAgent(agentId);
+  } catch (_) {
+    return null;
+  }
+}
+
+// True when the registry says this agent can never need account sign-in —
+// a local cli/app/mcp agent that declares no secrets.
+function _descriptorNeedsNoAuth(agentId) {
+  const desc = _describeAgentSafe(agentId);
+  return !!(desc && _NO_AUTH_AGENT_TYPES.has(desc.type)
+    && (!Array.isArray(desc.secrets) || desc.secrets.length === 0));
+}
+
 /**
  * Assess a single agent's auth state from the ledger.
  * @param {string} agentId
@@ -81,11 +102,26 @@ function assessAgent(agentId, bypassed = new Set()) {
   if (bypassed.has(a)) return { agent: a, auth: 'bypassed' };
 
   const entry = _loadLedger()[a] || _loadLedger()[a.replace(/\.agent$/, '')] || null;
-  if (!entry) return { agent: a, auth: 'unknown' };
+  if (!entry) {
+    // No ledger evidence — but a registered cli/app/mcp agent that declares
+    // no secrets needs no account sign-in (e.g. catt controls Chromecast
+    // over the LAN; app agents drive local apps). Without this, 'unknown'
+    // dead-ends every first-run local tool on an auth wall that can never
+    // be cleared — there is no login to perform.
+    if (_descriptorNeedsNoAuth(a)) return { agent: a, auth: 'none-required' };
+    return { agent: a, auth: 'unknown' };
+  }
   if (entry.authed === true && !entry.lastAuthFailedAt) return { agent: a, auth: 'authed' };
-  if (entry.authed === false || entry.needsAuth === true || entry.lastAuthFailedAt) {
+  // needsAuth is recorded by the 0/1 LLM classifier as a NUMBER — `=== true`
+  // alone never matched it, so recorded "needs sign-in" silently fell to
+  // 'unknown' and recorded "no login needed" was ignored entirely.
+  if (entry.authed === false || entry.needsAuth === true || entry.needsAuth === 1 || entry.lastAuthFailedAt) {
     return { agent: a, auth: 'needs sign-in', reason: entry.lastAuthFailedReason || null };
   }
+  if (entry.needsAuth === 0) return { agent: a, auth: 'none-required' };
+  // Same rule for stale/inconclusive ledger entries — a no-secrets local
+  // agent must never sit at 'unknown' (the run gate would block it forever).
+  if (_descriptorNeedsNoAuth(a)) return { agent: a, auth: 'none-required' };
   return { agent: a, auth: 'unknown' };
 }
 
@@ -150,4 +186,42 @@ function assessRunGate(tasks, bypassed = new Set()) {
   return { ok: blockers.length === 0, blockers };
 }
 
-module.exports = { assessAgent, assessTasks, assessRunGate };
+/**
+ * Async run gate — same sync gate, then resolves declared `secrets:` for any
+ * remaining 'unknown' NON-BROWSER blockers. A credential-backed CLI agent is
+ * authed when its env keys are actually stored; when they're missing the
+ * blocker stays but gains a concrete reason. Browser 'unknown' is untouched
+ * — there is no such signal to resolve. (Sync assessRunGate remains for
+ * info-render call sites that can't await.)
+ */
+async function assessRunGateAsync(tasks, bypassed = new Set()) {
+  const gate = assessRunGate(tasks, bypassed);
+  if (gate.ok) return gate;
+  let resolveAgentSecrets = null;
+  try {
+    ({ resolveAgentSecrets } = require('../../shared/secret-resolve.cjs'));
+  } catch (_) {}
+  const blockers = [];
+  for (const b of gate.blockers) {
+    if (b.state !== 'unknown' || !resolveAgentSecrets) { blockers.push(b); continue; }
+    try {
+      const desc = _describeAgentSafe(b.agentId);
+      if (desc && desc.type !== 'browser'
+          && Array.isArray(desc.secrets) && desc.secrets.length > 0) {
+        const res = await resolveAgentSecrets(b.agentId, desc.secrets);
+        if (res && res.missing && res.missing.length === 0) continue;
+        blockers.push({
+          ...b,
+          reason: `missing env keys: ${(res?.missing || desc.secrets).join(', ')}`,
+        });
+      } else {
+        blockers.push(b);
+      }
+    } catch (_) {
+      blockers.push(b);
+    }
+  }
+  return { ok: blockers.length === 0, blockers };
+}
+
+module.exports = { assessAgent, assessTasks, assessRunGate, assessRunGateAsync };

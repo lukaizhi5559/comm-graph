@@ -577,6 +577,64 @@ async function _toolMediaResolve(query) {
     .join('\n');
 }
 
+// ── Media-URL grounding ─────────────────────────────────────────────────────
+// Video-watch URLs a task prompt may carry must come from a tool — the model
+// will otherwise write its most-memorized watch?v= link (dQw4w9WgXcQ) into a
+// "cast the show" task and the executor silently casts the wrong video.
+const _MEDIA_URL_RE = /https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?[^\s"'<>]+|youtu\.be\/[^\s"'<>]+|vimeo\.com\/\d+[^\s"'<>]*)/gi;
+
+function _mediaId(url) {
+  const m = String(url).match(/[?&]v=([\w-]{5,})|youtu\.be\/([\w-]{5,})|vimeo\.com\/(\d+)/);
+  return m ? (m[1] || m[2] || m[3]) : null;
+}
+
+// Every URL in tool output joins the session's observed set — media.resolve
+// lists them explicitly and web.search results embed them too.
+function _recordObservedMedia(sess, toolResults) {
+  if (!toolResults) return;
+  const obs = sess.observedMedia ||= { ids: new Set(), urls: [] };
+  for (const u of (String(toolResults).match(_MEDIA_URL_RE) || [])) {
+    obs.urls.push(u);
+    const id = _mediaId(u);
+    if (id) obs.ids.add(id);
+  }
+}
+
+// Rewrite task prompts that carry ungrounded watch?v=/youtu.be/vimeo links:
+// substitute the top observed candidate, or — when nothing was ever resolved —
+// strip the URL so the run resolves the link itself instead of casting a
+// random memorized video. Both the canonical `prompt` field and the verbatim
+// `body` blob get scanned — either can carry a URL the executor reads.
+function _groundTaskMediaUrls(tasks, sess) {
+  const obs = sess.observedMedia;
+  for (const t of tasks) {
+    if (!t) continue;
+    let _stripped = false;
+    for (const field of ['prompt', 'body']) {
+      if (!t[field]) continue;
+      t[field] = String(t[field]).replace(_MEDIA_URL_RE, (url) => {
+        const id = _mediaId(url);
+        if (id && obs && obs.ids.has(id)) return url; // tool-returned — keep
+        const candidate = obs && obs.urls[0];
+        if (candidate) {
+          logger.info(`[Planning] Media URL grounding — task ${t.num}: replaced ungrounded ${url} with resolved ${candidate}`);
+          (sess.risks ||= []).push(`Auto-corrected media URL in task ${t.num}: ${url} → ${candidate}`);
+          return candidate;
+        }
+        _stripped = true;
+        logger.info(`[Planning] Media URL grounding — task ${t.num}: stripped ungrounded ${url} (no resolved candidates)`);
+        return '';
+      });
+      t[field] = t[field].replace(/[ \t]{2,}/g, ' ');
+    }
+    if (_stripped) {
+      const note = ' (resolve the video URL at run time via search before casting)';
+      if (t.prompt) t.prompt = t.prompt.trim() + note;
+      else if (t.body) t.body = t.body.trimEnd() + note;
+    }
+  }
+}
+
 // Read-only look at the user's live screen — recent OCR text + active app.
 // The planner's eyes: call this whenever the task refers to "this", "my
 // screen", "this app/site/tool" instead of asking the user to describe it.
@@ -1536,6 +1594,9 @@ function _applyPlanMarkers(text, sess, unknownAgents) {
         }
       }
       sess.tasks = newTasks;
+      // Task prompts may only carry media URLs a tool actually returned —
+      // an ungrounded watch?v= gets the wrong video cast silently.
+      try { _groundTaskMediaUrls(newTasks, sess); } catch (_) {}
       changed = true;
     }
     const risks = _extractTag(update, 'risks');
@@ -1843,6 +1904,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     if (/<plan_run\s*\/?\s*>/.test(cleanText)) planRunSeen = true;
 
     const toolResults = await _runTools(cleanText, sessionId, { optionsTurn: _optsTurn });
+    _recordObservedMedia(sess, toolResults);
     if (toolResults && round < MAX_TOOL_ROUNDS) {
       // Record the assistant's tool-call turn, then feed results back.
       sess.history.push({ role: 'assistant', content: cleanText });
@@ -2131,6 +2193,13 @@ function findOpenPlan(sessionId) {
       taskTitles: sess.tasks.map(t => t.title || '').filter(Boolean),
       filePath: sess.filePath,
       awaitingInput,
+      // Route options the session is waiting on — lets callers shape what
+      // counts as an answer (a label/ordinal pick) vs a new command.
+      routeOptions: sess._routeOptions || null,
+      // boundToSession set by the caller below — whether this plan belongs
+      // to the routed conversation. Short-reply capture only applies to
+      // session-bound plans; cross-session plans need explicit referents.
+      boundToSession: undefined,
     };
   };
 
@@ -2140,14 +2209,17 @@ function findOpenPlan(sessionId) {
     ? (_planSessions.get(bound) || _loadPlanFromDisk(bound))
     : null;
   const hit = _openFromSess(boundSess);
-  if (hit) return hit;
+  if (hit) { hit.boundToSession = true; return hit; }
 
   // Most recently touched in-memory plan.
   const activeSess = _activePlanId
     ? (_planSessions.get(_activePlanId) || _loadPlanFromDisk(_activePlanId))
     : null;
   const activeHit = _openFromSess(activeSess);
-  if (activeHit) return activeHit;
+  if (activeHit) {
+    activeHit.boundToSession = !!(sessionId && activeSess.sessionId === sessionId);
+    return activeHit;
+  }
 
   // Disk scan — newest open task plan wins.
   try {
@@ -2161,7 +2233,10 @@ function findOpenPlan(sessionId) {
       const planId = f.replace(/\.md$/, '');
       const sess = _loadPlanFromDisk(planId);
       const open = _openFromSess(sess);
-      if (open) return open;
+      if (open) {
+        open.boundToSession = !!(sessionId && sess.sessionId === sessionId);
+        return open;
+      }
     }
   } catch (_) {}
   return null;

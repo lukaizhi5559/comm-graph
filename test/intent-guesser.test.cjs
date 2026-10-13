@@ -33,10 +33,22 @@ describe('intentGuesser — screen_analysis hints', () => {
     expect('what are you seeing', 'screen_analysis');
     expect('can you see my screen', 'screen_analysis');
     expect('what this about on the screen', 'screen_analysis');
+    // scan/read/check-verb + live surface, incl. scan-then-report compounds —
+    // observed miss: "scan the screen and tell me the best price" hinted
+    // web_search → the stategraph decomposed it into two Brave queries.
+    expect('scan the screen and tell me the best price', 'screen_analysis');
+    expect('scan the page and tell me the best price', 'screen_analysis');
+    expect('read this tab and tell me the cheapest option', 'screen_analysis');
+    expect('check this page and tell me what it says', 'screen_analysis');
   });
   it('does not fire on imperative screen actions', () => {
     // "click the button on my screen" is automation, not observation
     assert.equal(guess('click the button on my screen').guessedIntent !== 'screen_analysis', true);
+  });
+  it('does not fire on non-surface nouns', () => {
+    // "scan the images" is file/image analysis, not a live-screen read —
+    // the surface noun (screen/page/tab/site/website/window) is required.
+    assert.equal(guess('scan the images and tell me what they are').guessedIntent !== 'screen_analysis', true);
   });
 });
 
