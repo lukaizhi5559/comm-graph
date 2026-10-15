@@ -87,6 +87,8 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
       ...(planMeta && planMeta.preflightAuthBypass?.length ? { preflightAuthBypass: planMeta.preflightAuthBypass } : {}),
       ...(planMeta && Array.isArray(planMeta.deterministicPlan) && planMeta.deterministicPlan.length
         ? { deterministicPlan: planMeta.deterministicPlan } : {}),
+      ...(planMeta && Array.isArray(planMeta.priorResults) && planMeta.priorResults.length
+        ? { priorResults: planMeta.priorResults } : {}),
     });
     const req = http.request({
       hostname: '127.0.0.1',
@@ -118,11 +120,11 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
  * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, capabilityReason = null }) {
+async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, capabilityReason = null }) {
   // Plan-dispatched tasks carry the task's canonical agentId so the lock key
   // is the shared session (google_*.agent → google.agent), not prompt text.
   const agentId = pinnedAgentId || detectAgent(englishPrompt);
-  const planMeta = planId ? { planId, planTaskNum, planTask, preflightAuthBypass, deterministicPlan } : null;
+  const planMeta = planId ? { planId, planTaskNum, planTask, preflightAuthBypass, deterministicPlan, priorResults } : null;
 
   // Create task in journal
   const taskId = createTask({

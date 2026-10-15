@@ -275,6 +275,8 @@ Available skills:
 - synthesize: {} — final summary step (always last).
 - shell.run: {command} — local shell command.
 - fs.read: {path} — read a local file (writes go through edit.agent/shell.run).
+- doc.read: {path} — extract text from documents (pdf/docx/xlsx/pptx/…) —
+  ALWAYS prefer this over shell CLIs like pandoc/pdftotext for documents.
 - edit.agent: {goal} — edit project files.
 - cli.agent: {tool, args} — a configured CLI.
 
@@ -1287,6 +1289,10 @@ RULES for tasks:
 - Prompt must stand alone: include titles, dates, column names — the run has
   no memory of this conversation. If it needs an earlier result, say so in
   Depends on and phrase it as "the result of the previous step".
+- Never prescribe specific binaries or tools in a Prompt (no "using pandoc",
+  "run pdftotext", "via curl"). Name the file/goal ("extract the text from
+  <path>") — the runtime's registered skills (e.g. doc.read for documents)
+  pick the actual tool, and a named binary may not even support the format.
 - Mode: parallel only for tasks with NO dependency and different services.
 - Keep task count honest — do not split trivially.
 - Content stored IN a service (a Doc, Sheet, event, email) is its own Task

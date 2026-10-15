@@ -1339,6 +1339,9 @@ const server = http.createServer(async (req, res) => {
         // Pre-generated task steps — stategraph adopts them as
         // _deterministicPlan and skips the LLM planning pass.
         deterministicPlan: Array.isArray(body.deterministicPlan) ? body.deterministicPlan : null,
+        // Upstream task results — seeded into the child run so cross-task
+        // {{synthesisAnswer}}/prior-output refs resolve to real data.
+        priorResults: Array.isArray(body.priorResults) ? body.priorResults : null,
         // Plan-runner pins the canonical agent — lock key = shared session.
         agentId: body.agentId || null,
       });
