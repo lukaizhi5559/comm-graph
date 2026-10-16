@@ -41,8 +41,9 @@ const { toEnglish, fromEnglish, normalizeLanguage } = require('./translate.cjs')
 const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona.cjs');
 const { classify, INTENTS, GRAPH_ONLY_INTENTS } = require('./classify.cjs');
 const { sanitizeContext, isRoutingPromise, stripRoutingPromises } = require('./refusal.cjs');
-const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE } = require('../../shared/text-patterns.cjs');
+const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE, isLocalFileEdit } = require('../../shared/text-patterns.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
+const webSearchExpress = require('./nodes/webSearchExpress.cjs');
 const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
 const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
 const planningNode = require('./nodes/planning.cjs');
@@ -55,6 +56,7 @@ const { isPlanAnswerShape, shouldPinGate } = require('./planReply.cjs');
 const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = require('./screen-context.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
+const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT } = require('./route-decision.cjs');
 
 // ── Thought engine prompt producer ─────────────────────────────────────────────
 // Fire-and-forget POST of each user prompt to personality-service so the
@@ -151,7 +153,7 @@ function _loadMerge() {
   return _mergeRouteOptions;
 }
 
-async function _capabilityGate(text) {
+async function _capabilityGate(text, opts = {}) {
   try {
     // "cast/mirror <app|screen|overlay>" is ambiguous (media-cast vs window
     // mirroring) — always clarify in planning even when a cast agent exists.
@@ -163,6 +165,13 @@ async function _capabilityGate(text) {
 
     // Purely local file chores need no service either — native fs tools.
     if (LOCAL_FS_RE.test(text) && !/\b(?:upload|download|fetch|search|look\s+up)\b/i.test(text)) return null;
+
+    // File-CONTENT edits — "add X to this file", "append to notes.rtf", or an
+    // edit verb riding a [File:] chip — are local fs jobs too. Keeps the gate
+    // (and its infer call) out of obvious file chores; retrieval's generic-
+    // token filter is the deeper fix for the same misroute class.
+    if (isLocalFileEdit(text, { hasFileRef: opts.hasFileRef })
+        && !/\b(?:upload|download|fetch|search|look\s+up|email|share)\b/i.test(text)) return null;
 
     // Screen-referring prompts ("use this on my screen to…") resolve their
     // target from live screen context — OCR text + active app — so the gate
@@ -739,6 +748,59 @@ async function processMessage(args) {
     // "paused plan exists" line in the classify prompt so continuation
     // phrasings route semantically, not just on regex hits.
     _openPlan = planningNode.findOpenPlan(routedSessionId);
+
+    // ── Web-search express lane ─────────────────────────────────────────────
+    // A standalone public lookup (regex-guessed web_search AND context-free)
+    // doesn't need classify + the stategraph — the same web.search service
+    // answers it here in ~1.5s with identical overlay cards. Strict gates:
+    // any ambiguity (pronouns, continuation markers, selection, open plan,
+    // thought-card reply, file/screen referents) falls through to classify →
+    // handoff unchanged.
+    {
+      const _eg = intentGuesser.guess(classifyText, { hasSelectionContext }).guessedIntent;
+      if (_eg === 'web_search' && !thoughtContext
+          && webSearchExpress.isEligible(classifyText, {
+            hasSelectionContext,
+            // Only a plan bound to THIS session and awaiting input vetoes —
+            // a dormant or cross-session draft must not disable the lane
+            // for every fresh lookup (disk scan finds stale plans forever).
+            openPlan: (_openPlan?.awaitingInput && _openPlan?.boundToSession) ? _openPlan : null,
+            hasAttachment: /\[File:|\[Folder:/i.test(englishText),
+          })) {
+        const _er = await webSearchExpress.execute({
+          englishText, originalText, detectedLanguage, context,
+        });
+        if (_er) {
+          logger.info('[Process] Search express answered — skipping classify + handoff', {
+            items: (_er.metadata?.items || []).length,
+            sources: (_er.metadata?.sources || []).length,
+          });
+          _notifyThoughtEngine('prompt', {
+            text: classifyText,
+            sessionId: routedSessionId,
+            intentName: 'search_express',
+          });
+          // Translate-back + record + return — same tail as the shared path.
+          let _fx = _er.fullText || _er.text;
+          const _sl = require('./translate.cjs').detectScriptLanguage(_fx || '');
+          if (wasTranslated && detectedLanguage !== 'en' && _fx && _fx.trim() && _sl !== detectedLanguage) {
+            try { _fx = await fromEnglish(_fx, detectedLanguage); } catch (_) {}
+          }
+          _addTurn(englishText, _fx, 1);
+          _logConversationTurn(englishText, _fx, 'search_express', routedSessionId);
+          return {
+            text: _fx,
+            fullText: _fx,
+            intent: 1,
+            intentName: 'search_express',
+            detectedLanguage,
+            wasTranslated,
+            metadata: { ..._er.metadata, latencyMs: Date.now() - startTime },
+          };
+        }
+      }
+    }
+
     ({ intent, intentName, confidence, source: classifySource, resumePlanId: _resumePlanId } =
       await classify(classifyText, context, { hasSelectionContext, openPlan: _openPlan }));
   }
@@ -814,21 +876,54 @@ async function processMessage(args) {
     intentName = 'handoff';
   }
 
+  // ── RouteDecision — the single classification envelope ─────────────────────
+  // For handoff-bound prompts, classifyTask (the same schema the execution
+  // graph consumes) runs ONCE here at ingress; the decision rides the handoff
+  // into state._routeDecision so resolveReferencesV2 consumes it instead of
+  // re-classifying — the two layers can no longer disagree about what the
+  // prompt is. When the envelope says the prompt isn't a task at all (a
+  // question, a memory op), demote to the right lane rather than dispatch a
+  // doomed task — this is the "what's the absolute path" → WebSearch-about-
+  // "user" bug class. Cheap triage above still covers non-task prompts; this
+  // call only ever runs for prompts already bound for the graph, so latency
+  // is unchanged (the same call simply moves earlier in the run).
+  let _routeDecision = null;
+  if (intent === 0) {
+    _routeDecision = await classifyRoute(englishText, convHistory);
+    const _demoteTo = (_routeDecision && _routeDecision.lane !== 'handoff')
+      ? LANE_BY_INTENT[_routeDecision.lane] : undefined;
+    if (_demoteTo !== undefined) {
+      logger.info('[Process] RouteDecision demotes handoff → ' + _routeDecision.lane, {
+        taskType: _routeDecision.taskType, suggestedIntent: _routeDecision.suggestedIntent || null,
+      });
+      intent = _demoteTo;
+      intentName = _routeDecision.lane;
+      classifySource = 'route_decision';
+    }
+  }
+
   // ── Capability-gap guard ──────────────────────────────────────────────────
   // Before handing a prompt to the stategraph, consult the capability index:
   // a ready registered agent gets pinned (deterministic resolution, skips the
   // LLM picker); a goal whose capabilities all need setup — or a setup-flavored
   // prompt with no match — routes to the planning lane so the user clarifies
-  // and approves setup BEFORE anything executes.
+  // and approves setup BEFORE anything executes. A RouteDecision whose
+  // taskType names no service short-circuits the gate on structure — the
+  // regex fast-paths above only remain as latency savers.
   let _capPin = null;
   let _capReason = null;
   let _capHints = null;
   let _capGateReason = null;
   let _capNeedsInfo = null;
   let _capScreenCtx = null;
+  let _capRecommended = null;
   if (intent === 0) {
     const { guessedIntent: _gateGuess } = intentGuesser.guess(classifyText, { hasSelectionContext });
-    const gate = _GATE_SKIP_INTENTS.has(_gateGuess) ? null : await _capabilityGate(classifyText);
+    const gate = (_GATE_SKIP_INTENTS.has(_gateGuess) || canSkipCapabilityGate(_routeDecision))
+      ? null
+      : await _capabilityGate(classifyText, {
+        hasFileRef: /\[File:|\[Folder:/i.test(englishText),
+      });
     if (gate?.planning) {
       logger.info('[Process] capability-gap → planning lane', { reason: gate.planning, hints: (gate.hints || []).length });
       intent = 6; intentName = 'planning'; confidence = 0.9;
@@ -837,6 +932,7 @@ async function processMessage(args) {
       _capGateReason = gate.planning;
       _capNeedsInfo = gate.needsInfo || null;
       _capScreenCtx = gate.screenCtx || null;
+      _capRecommended = gate.recommended || null;
     } else if (gate?.pin) {
       logger.info('[Process] capability pin', { agentId: gate.pin, reason: gate.reason || '' });
       _capPin = gate.pin;
@@ -936,6 +1032,7 @@ async function processMessage(args) {
         thoughtContext,
         agentId: _capPin || undefined,
         capabilityReason: _capReason || undefined,
+        routeDecision: serializeDecision(_routeDecision),
       });
 
       // Generate intent-aware handoff phrase (LLM for command_automate, static pool for others)
@@ -973,6 +1070,7 @@ async function processMessage(args) {
           detectedLanguage,
           guessedIntent: _gi1,
           sessionId: routedSessionId,
+          routeDecision: serializeDecision(_routeDecision),
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi1);
         // Preserve the lane's task-specific ack (routing sentences stripped) —
@@ -1012,6 +1110,7 @@ async function processMessage(args) {
           detectedLanguage,
           guessedIntent: _gi2,
           sessionId: routedSessionId,
+          routeDecision: serializeDecision(_routeDecision),
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi2);
         const handoffText = handoffResult.parked
@@ -1081,6 +1180,9 @@ async function processMessage(args) {
         // after the user picks a route.
         gateReason: _capGateReason,
         needsInfo: _capNeedsInfo,
+        // The selector's own pick — planning marks it RECOMMENDED on the
+        // options card instead of defaulting to the first ready option.
+        recommended: _capRecommended,
         // Screen context the gate already fetched for ambient prompts — the
         // planning lane opens with eyes instead of asking "what's on screen".
         screenContext: _capScreenCtx,
@@ -1107,6 +1209,7 @@ async function processMessage(args) {
           detectedLanguage,
           guessedIntent: _gi5,
           sessionId: routedSessionId,
+          routeDecision: serializeDecision(_routeDecision),
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi5);
         const handoffText = handoffResult.parked
@@ -1156,6 +1259,7 @@ async function processMessage(args) {
       guessedIntent: _giQ,
       sessionId: routedSessionId,
       thoughtContext,
+      routeDecision: serializeDecision(_routeDecision),
     });
     const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _giQ);
     // Keep the lane's task-specific ack minus the routing sentences when one

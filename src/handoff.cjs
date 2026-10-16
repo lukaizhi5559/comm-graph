@@ -67,7 +67,7 @@ function detectAgent(englishPrompt) {
  * @param {object|null} [thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<boolean>} true if notification was sent
  */
-function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planMeta = null, detectedLanguage = null, capabilityReason = null) {
+function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planMeta = null, detectedLanguage = null, capabilityReason = null, routeDecision = null) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       taskId,
@@ -81,6 +81,9 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
       userApproved: userApproved === true,
       thoughtContext: thoughtContext || null,
       ...(capabilityReason ? { capabilityReason } : {}),
+      // RouteDecision envelope — the single upstream classification;
+      // resolveReferencesV2 consumes it instead of re-classifying.
+      ...(routeDecision ? { routeDecision } : {}),
       ...(planMeta && planMeta.planId ? { planId: planMeta.planId } : {}),
       ...(planMeta && planMeta.planTaskNum ? { planTaskNum: planMeta.planTaskNum } : {}),
       ...(planMeta && planMeta.planTask ? { planTask: true } : {}),
@@ -120,7 +123,7 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
  * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, capabilityReason = null }) {
+async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, capabilityReason = null, routeDecision = null }) {
   // Plan-dispatched tasks carry the task's canonical agentId so the lock key
   // is the shared session (google_*.agent → google.agent), not prompt text.
   const agentId = pinnedAgentId || detectAgent(englishPrompt);
@@ -138,6 +141,7 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
     planMeta,
     originalPrompt,
     detectedLanguage,
+    routeDecision,
   });
 
   // Try to acquire agent lock
@@ -146,7 +150,7 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
   if (acquired) {
     // Lock acquired — notify main.js to spawn stategraph run
     updateTask(taskId, 'queued');
-    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext, planMeta, detectedLanguage, capabilityReason);
+    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext, planMeta, detectedLanguage, capabilityReason, routeDecision);
     if (!notified) {
       logger.warn('[Handoff] Failed to notify main.js — task will be picked up on retry', { taskId });
     }
@@ -188,7 +192,7 @@ function complete(taskId, agentId, status, result, items, sessionId = null, plan
       // Skip tasks cancelled while parked (plan cancel hits every taskId).
       if (task && task.status !== 'cancelled') {
         const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
-        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, task.originalPrompt || null, guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null, task.detectedLanguage || null)
+        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, task.originalPrompt || null, guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null, task.detectedLanguage || null, null, task.routeDecision || null)
           .catch(() => {});
       }
     }
@@ -215,7 +219,7 @@ function remove(taskId) {
       // spawn the ones we just cancelled).
       if (nextTask && nextTask.status !== 'cancelled') {
         const guessedIntent = require('./intentGuesser.cjs').guess(nextTask.prompt).guessedIntent;
-        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, nextTask.originalPrompt || null, guessedIntent, nextTask.sessionId, nextTask.userApproved === true, nextTask.thoughtContext || null, nextTask.planMeta || null, nextTask.detectedLanguage || null)
+        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, nextTask.originalPrompt || null, guessedIntent, nextTask.sessionId, nextTask.userApproved === true, nextTask.thoughtContext || null, nextTask.planMeta || null, nextTask.detectedLanguage || null, null, nextTask.routeDecision || null)
           .catch(() => {});
       }
     }
@@ -259,7 +263,7 @@ function startRetrySweep() {
       try {
         const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
         const ok = await _notifyMain(task.id, task.prompt, task.agentId, task.source, task.originalPrompt || null,
-          guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null, task.detectedLanguage || null);
+          guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null, task.detectedLanguage || null, null, task.routeDecision || null);
         if (ok) _notifyAttempts.delete(task.id);
       } catch (_) { /* next sweep */ }
     }

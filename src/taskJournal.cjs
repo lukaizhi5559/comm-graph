@@ -116,7 +116,7 @@ function setOnTerminal(fn) {
  * @param {string|null} [opts.sessionId] - Conversation session the task belongs to (for recall)
  * @returns {string} task id
  */
-function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null, userApproved = false, thoughtContext = null, planMeta = null, originalPrompt = null, detectedLanguage = null }) {
+function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text', sessionId = null, userApproved = false, thoughtContext = null, planMeta = null, originalPrompt = null, detectedLanguage = null, routeDecision = null }) {
   const id = _uid();
   /** @type {TaskEntry} */
   const task = {
@@ -147,6 +147,9 @@ function createTask({ prompt, agentId = null, intent = 'handoff', source = 'text
     // keep searching in the user's language, not its English translation.
     originalPrompt: originalPrompt || null,
     detectedLanguage: detectedLanguage || null,
+    // RouteDecision envelope — persisted so parked/queued replays keep the
+    // upstream classification instead of forcing the stategraph to re-derive it.
+    routeDecision: routeDecision || null,
   };
   _tasks.set(id, task);
   _save();

@@ -118,6 +118,17 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
   check('fallback → not pin', shouldPinGate('fallback', null) === false);
   check('none → not pin', shouldPinGate('none', null) === false);
 
+  // ── Route-card RECOMMENDED maps to the selector's pick, not first-ready ────
+  // Regression (2026-10-16): RECOMMENDED landed on say.agent (first ready
+  // option) while the gate's actual pick was mcp.filesystem — the field was
+  // computed then dropped before planning.
+  const { _isRecommended } = require('../src/nodes/planning.cjs');
+  check('recommended id → match', _isRecommended({ id: 'mcp.filesystem.agent' }, 'mcp.filesystem.agent'));
+  check('recommended id → service slug match', _isRecommended({ service: 'filesystem', id: 'mcp.filesystem.agent' }, 'filesystem'));
+  check('recommended id → .agent suffix normalized', _isRecommended({ id: 'twilio.agent' }, 'twilio'));
+  check('unrelated option → no match', !_isRecommended({ id: 'say.agent', service: 'say' }, 'mcp.filesystem.agent'));
+  check('null recommended → false', !_isRecommended({ id: 'say.agent' }, null));
+
   // ── Verb table sanity ────────────────────────────────────────────────────
 
   check('"show" is a verb (was the awaitingInput bypass verb)', PLAN_REPLY_VERB_RE.test('show exodus 4 on my screen'));

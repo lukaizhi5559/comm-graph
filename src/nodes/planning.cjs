@@ -532,7 +532,48 @@ async function _toolMemorySearch(query) {
   }, MCP_API_KEY, 4000);
   const results = res?.data?.results || res?.data || [];
   if (!Array.isArray(results) || !results.length) return 'No relevant memories found.';
-  return results.map(r => (r.text || r.content || r.value || '')).filter(Boolean).slice(0, 3).join('\n');
+  // Each line carries [memoryId] so the model can reconcile conflicting facts
+  // via memory.update / memory.delete once the user picks the right value.
+  return results.map(r => {
+    const text = (r.text || r.content || r.value || '');
+    return r.id ? `[${r.id}] ${text}` : text;
+  }).filter(s => s && s.trim()).slice(0, 3).join('\n');
+}
+
+// memory.update("<memoryId>|<corrected text>") — rewrite a stored fact. The
+// id comes from a memory.search result's [id] prefix.
+async function _toolMemoryUpdate(arg) {
+  const pipe = String(arg || '').indexOf('|');
+  if (pipe < 1) return 'Usage: memory.update("<memoryId>|<corrected text>") — get the id from a memory.search result.';
+  const memoryId = String(arg).slice(0, pipe).trim();
+  const text = String(arg).slice(pipe + 1).trim();
+  if (!text) return 'Usage: memory.update("<memoryId>|<corrected text>") — the new text is required.';
+  const res = await _postJson(MEMORY_PORT, '/memory.update', {
+    version: 'mcp.v1', service: 'user-memory', action: 'memory.update',
+    payload: { memoryId, updates: { text } },
+    context: { userId: 'local_user' },
+    requestId: 'cg_plan_memu_' + Date.now(),
+  }, MCP_API_KEY, 8000);
+  if (res?.status === 'error' || res?.error) {
+    return `memory.update failed: ${res?.error?.message || res?.error?.code || res?.message || 'unknown error'}`;
+  }
+  return `Memory ${memoryId} updated to: "${text}"`;
+}
+
+// memory.delete("<memoryId>") — remove a stale/wrong fact by id.
+async function _toolMemoryDelete(arg) {
+  const memoryId = String(arg || '').trim();
+  if (!memoryId) return 'Usage: memory.delete("<memoryId>") — get the id from a memory.search result.';
+  const res = await _postJson(MEMORY_PORT, '/memory.delete', {
+    version: 'mcp.v1', service: 'user-memory', action: 'memory.delete',
+    payload: { memoryId },
+    context: { userId: 'local_user' },
+    requestId: 'cg_plan_memd_' + Date.now(),
+  }, MCP_API_KEY, 8000);
+  if (res?.status === 'error' || res?.error) {
+    return `memory.delete failed: ${res?.error?.message || res?.error?.code || res?.message || 'unknown error'}`;
+  }
+  return `Memory ${memoryId} deleted.`;
 }
 
 async function _toolWebSearch(query) {
@@ -562,7 +603,7 @@ async function _toolWebSearch(query) {
     .join('\n');
 }
 
-const _TOOL_RE = /<tool>\s*(memory\.search|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select|plan\.find|plan\.open|plan\.status|plan\.cancel|journal\.recent|url\.open|setup\.start|screen\.preview|system\.map|logs\.tail|logs\.head|logs\.grep|logs\.range)(?:\s*\(\s*(?:"([^"]*)")?\s*\))?\s*<\/tool>/g;
+const _TOOL_RE = /<tool>\s*(memory\.search|memory\.update|memory\.delete|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select|plan\.find|plan\.open|plan\.status|plan\.cancel|journal\.recent|url\.open|setup\.start|screen\.preview|system\.map|logs\.tail|logs\.head|logs\.grep|logs\.range)(?:\s*\(\s*(?:"([^"]*)")?\s*\))?\s*<\/tool>/g;
 
 const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const COMMAND_API_KEY = process.env.MCP_COMMAND_API_KEY || process.env.MCP_API_KEY || '';
@@ -1012,6 +1053,13 @@ function _ptyCmdText(r) {
   return r ? _ptyCleanDelta(r.delta) : '';
 }
 
+// Tools allowed on the route-pick turn (capability_options arrival) — the
+// verified options list is already on screen and the reply this turn must be
+// the route question. Lookup tools wait until after the user picks (an
+// unrestricted memory.search once produced a wife's-name question riding
+// beside the route card — two unrelated questions in one reply).
+const ROUTE_PICK_TOOLS = new Set(['capability.select', 'setup.start', 'plan.cancel', 'plan.find', 'plan.open', 'plan.status']);
+
 async function _runTools(text, sessionId, opts = {}) {
   const calls = [];
   _TOOL_RE.lastIndex = 0;
@@ -1024,9 +1072,22 @@ async function _runTools(text, sessionId, opts = {}) {
   for (const call of calls.slice(0, 3)) {
     logger.info('[Planning] Tool call', { tool: call.tool, query: call.query });
     let out;
+    if (opts.routePickTurn && !ROUTE_PICK_TOOLS.has(call.tool)) {
+      out = 'SKIPPED — the verified route-options list is already on screen. Ask which route the user wants; other lookups wait until after they pick.';
+      results.push(`${call.tool}("${call.query || ''}") →\n${out}`);
+      continue;
+    }
     if (call.tool === 'memory.search') {
       await _ptyNote(`searching memory for "${call.query}"…`);
       out = await _toolMemorySearch(call.query);
+    }
+    else if (call.tool === 'memory.update') {
+      await _ptyNote('updating stored memory…');
+      out = await _toolMemoryUpdate(call.query);
+    }
+    else if (call.tool === 'memory.delete') {
+      await _ptyNote('deleting stored memory…');
+      out = await _toolMemoryDelete(call.query);
     }
     else if (call.tool === 'web.search') {
       await _ptyNote(`searching the web for "${call.query}"…`);
@@ -1136,7 +1197,11 @@ you will NOT execute anything yourself. Your job is to (1) gather the context
 needed to make the plan correct, and (2) maintain the plan's Task list.
 
 TOOLS — when you need facts about the user or the world, emit ONE of:
-  <tool>memory.search("query")</tool>       — the user's stored facts/preferences
+  <tool>memory.search("query")</tool>       — the user's stored facts/preferences;
+                                            each result line starts with its
+                                            [memoryId] for update/delete calls
+  <tool>memory.update("id|new text")</tool> — rewrite a stored fact by memoryId
+  <tool>memory.delete("id")</tool>          — remove a stale/wrong fact by memoryId
   <tool>web.search("query")</tool>          — live web research (results include URLs)
   <tool>media.resolve("name")</tool>        — find a playable video/song by name via
                                             YouTube search (yt-dlp). Returns real
@@ -1441,6 +1506,14 @@ Question about the user → memory.search ALWAYS first — even "what do you
 remember about me". If a tool fails, report the failure; never fill the gap
 with a plausible-sounding answer.
 
+CONFLICTING MEMORY — when memory.search returns contradictory values for the
+same fact (e.g. two different names for "my wife"), do NOT pick one silently
+and do NOT fold the question into a plan draft. Ask the user via <choices>
+with each stored value as an option plus "Neither — let me tell you". After
+the user answers, reconcile immediately: call memory.update("<id>|<corrected
+text>") to fix the stale entry or memory.delete("<id>") to remove it, then
+continue with the task. The [id] prefix on each result line is the memoryId.
+
 NO EXECUTION FROM THIS LANE — you cannot dispatch work: no handoff, no
 background task, no "let me run that" — there is no mechanism. The only run
 lever is <plan_run/> (the WHOLE approved plan). When the user asks to just
@@ -1631,6 +1704,16 @@ function _applyPlanMarkers(text, sess, unknownAgents) {
   return changed;
 }
 
+/** Match a route-options entry to the gate's recommended pick id — compares
+ * against id/service/label with .agent suffix and punctuation normalized. */
+function _isRecommended(h, recommendedId) {
+  if (!recommendedId || !h) return false;
+  const norm = (s) => String(s || '').toLowerCase().replace(/\.agent$/, '').replace(/[^a-z0-9]+/g, '');
+  const rec = norm(recommendedId);
+  if (!rec) return false;
+  return [h.id, h.service, h.label, h.tool].some(v => norm(v) === rec);
+}
+
 /**
  * Handle a prompt while planning mode is active.
  *
@@ -1644,7 +1727,7 @@ function _applyPlanMarkers(text, sess, unknownAgents) {
  *   (marker blocks are filtered out before chunks reach this)
  * @returns {Promise<{text, fullText, metadata}>}
  */
-async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null, gateReason = null, needsInfo = null, screenContext: passedScreenContext = null }) {
+async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null, gateReason = null, needsInfo = null, recommended = null, screenContext: passedScreenContext = null }) {
   const startedExplicit = planning.startedExplicit === true;
 
   // ── Fresh-draft escape — "none of these — start a new plan" (the dismiss
@@ -1824,11 +1907,15 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   if (gateReason === 'capability_options' && Array.isArray(capabilityHints) && capabilityHints.length) {
     sess._routeOptions = capabilityHints;
     sess._needsInfo = needsInfo || null;
+    sess._routeRecommended = recommended || null;
   }
-  if (sess.tasks.length) { sess._routeOptions = null; sess._needsInfo = null; }
+  if (sess.tasks.length) { sess._routeOptions = null; sess._needsInfo = null; sess._routeRecommended = null; }
   const _optsTurn = gateReason === 'capability_options' || !!sess._routeOptions;
   const _optionsList = sess._routeOptions || (gateReason === 'capability_options' ? capabilityHints : null);
   const _missingInfo = sess._needsInfo || needsInfo;
+  // The gate's recommended pick (selector verdict) — drives the card's
+  // RECOMMENDED badge. Falls back to first-ready only when absent.
+  const _recommendedId = sess._routeRecommended || recommended || null;
 
   const sysContent = (systemPrompt || '') + PLANNING_DIRECTIVE
     + `\n\nREGISTERED AGENTS (the ONLY agent names allowed in Tasks):\n`
@@ -1837,14 +1924,14 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     + _renderPlanState(sess)
     + (Array.isArray(_optionsList) && _optionsList.length && _optsTurn
       ? `\n\nROUTE OPTIONS — an options card listing these verified routes is shown to the user automatically. Do NOT emit <choices> or list them yourself; do NOT call capability.search (the list is already verified and complete). ` +
-        `Ask ONE short conversational question: which route do they want? If one is marked ready/recommended, say it's the suggested one. ` +
-        `Do NOT ask about sign-in state, credentials, or setup yet — that comes after they pick. ` +
+        `Your reply this turn is ONLY the route question — one short conversational sentence asking which route they want. Do NOT call other tools (memory.search, web.search, etc.) and do NOT ask about anything else — sign-in, credentials, missing details, or unrelated questions all come AFTER they pick. ` +
+        `If one is marked ready/recommended, say it's the suggested one. ` +
         `After they pick: (a) if the pick isn't a registered agent, call <tool>capability.select("<name>")</tool> to get its agentId; ` +
         (_missingInfo === 'recipient'
           ? `(b) ask for the missing recipient detail (phone number / contact) — ONE short question; (c) when both route and recipient are known, immediately <plan_update> the task with the agentId and details baked in — no confirmation loops.`
           : `(b) if any required detail is still missing, ask ONE short question; (c) when the route and details are known, immediately <plan_update> the task with the agentId baked in — no confirmation loops.`) +
         ` If the pick needs setup, call <tool>setup.start("<name>")</tool> AFTER collecting missing details.\n\nOptions:\n`
-        + _optionsList.map(h => `- ${h.label || h.id}${h.ready ? ' — READY (installed/registered)' : ' — needs setup'}${h.setupSummary ? `, setup: "${h.setupSummary}"` : ''}${h.eta ? `, eta: ${h.eta}` : ''}${h.authEnv?.length ? `, needs keys: ${h.authEnv.join(', ')}` : ''}`).join('\n')
+        + _optionsList.map(h => `- ${h.label || h.id}${h.ready ? ' — READY (installed/registered)' : ' — needs setup'}${_isRecommended(h, _recommendedId) ? ' — RECOMMENDED' : ''}${h.setupSummary ? `, setup: "${h.setupSummary}"` : ''}${h.eta ? `, eta: ${h.eta}` : ''}${h.authEnv?.length ? `, needs keys: ${h.authEnv.join(', ')}` : ''}`).join('\n')
       : Array.isArray(capabilityHints) && capabilityHints.length
       ? `\n\nVERIFIED CANDIDATES (existence confirmed by the capability index — prefer these in <choices> over your own suggestions, ordered easiest-setup first):\n`
         + capabilityHints.map(h =>
@@ -1909,7 +1996,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     if (_applyPlanMarkers(cleanText, sess, unknownAgents)) planChanged = true;
     if (/<plan_run\s*\/?\s*>/.test(cleanText)) planRunSeen = true;
 
-    const toolResults = await _runTools(cleanText, sessionId, { optionsTurn: _optsTurn });
+    const toolResults = await _runTools(cleanText, sessionId, { optionsTurn: _optsTurn, routePickTurn: gateReason === 'capability_options' });
     _recordObservedMedia(sess, toolResults);
     if (toolResults && round < MAX_TOOL_ROUNDS) {
       // Record the assistant's tool-call turn, then feed results back.
@@ -2045,7 +2132,9 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
           h.eta || null,
           h.authEnv?.length ? `keys: ${h.authEnv.join(', ')}` : null,
         ].filter(Boolean).join(' · ').slice(0, 200),
-        primary: !!h.ready && h === _optionsList.find(x => x.ready),
+        primary: _recommendedId
+          ? _isRecommended(h, _recommendedId)
+          : (!!h.ready && h === _optionsList.find(x => x.ready)),
       })),
     };
     logger.info('[Planning] Route options card', { planId: sess.planId, options: choices.options.length });
@@ -2287,4 +2376,4 @@ function retrySteps(planId, taskNum) {
   return { ok: true };
 }
 
-module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, releaseSession, retrySteps, findOpenPlan };
+module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, releaseSession, retrySteps, findOpenPlan, _isRecommended };
