@@ -122,9 +122,17 @@ async function classifyRoute(userMessage, conversationHistory) {
   const classifyTask = _getClassifyTask();
   if (!classifyTask || !userMessage) return null;
   try {
+    // classifyTask wants [{role, content}] turns; callers pass the formatted
+    // "User: …\nAssistant: …" string. Coerce — string history is still useful
+    // context, just in the wrong shape.
+    const convArr = Array.isArray(conversationHistory)
+      ? conversationHistory
+      : String(conversationHistory || '').split('\n').filter(Boolean).map(l =>
+          /^Assistant:/i.test(l) ? { role: 'assistant', content: l.replace(/^Assistant:\s*/i, '') }
+                                 : { role: 'user', content: l.replace(/^User:\s*/i, '') });
     const tc = await classifyTask(
       userMessage,
-      conversationHistory || [],
+      convArr,
       _llmBackend,
       logger,
       null, // priorScreenSummary — not gathered at ingress; screen follow-ups default to handoff anyway

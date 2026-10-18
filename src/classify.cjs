@@ -385,7 +385,10 @@ async function classify(englishText, conversationContext, opts = {}) {
     // would send the literal "he" to Google and answer about the wrong
     // person (observed: follow-up to a Trump answer returned a Biden
     // overview). Keyword adoption is blocked no matter which path led here.
-    if (isContextDependent(englishText)) {
+    // Control signals are exempt: "cancel that"/"stop it" act on the ambient
+    // running task — the pronoun is their object, not a referent the
+    // resolver must bind. Blocking these sends an abort request to handoff.
+    if (isContextDependent(englishText) && keywordHit.intent !== 4) {
       logger.info('[Classify] Context-dependent prompt — keyword veto blocked', {
         wouldBe: keywordHit.intentName, reason,
         inputPreview: englishText.substring(0, 60),

@@ -30,6 +30,8 @@ const {
   EPISODIC_RE: _EPISODIC_RE,
   NAMED_APP_RE: _NAMED_APP_RE,
   ACTION_VERB_RE: _ACTION_VERB_RE,
+  NAV_VERB_START_RE: _NAV_VERB_START_RE,
+  PAGE_ITEM_REF_RE: _PAGE_ITEM_REF_RE,
   SCREEN_OBSERVATION_RE,
   DEICTIC_CONTINUATION_RE,
   DEVICE_STATE_RE: _DEVICE_STATE_RE,
@@ -116,6 +118,16 @@ const INTENT_PATTERNS = [
       if (_EPISODIC_RE.test(text) && !/\b(remind|reminder|alarm|timer|schedule)\b/i.test(text)) return false;
       // Named app with an action verb → command_automate
       if (_NAMED_APP_RE.test(text) && _ACTION_VERB_RE.test(text)) return true;
+      // Nav-verb-led prompt — "goto biblegateway", "open trello", "pull up
+      // figma". Command-shaped even when the destination is neither a listed
+      // app nor a TLD'd domain (the rules below can't enumerate every site).
+      if (_NAV_VERB_START_RE.test(text)) return true;
+      // Ordinal page-item referent — "tell me the price of the first three
+      // items", "read the second listing". The referent is an element of a
+      // page in the user's browser; the task pipeline resolves it against
+      // the bound session (observed: ebay follow-up stole into web_search →
+      // answered about an unrelated screw multipack).
+      if (_PAGE_ITEM_REF_RE.test(text)) return true;
       // Action verb + specific site (e.g. "go to amazon.com")
       if (/\b(go\s+to|navigate\s+to|open|launch|visit|browse\s+to)\s+\S+\.(com|org|net|io|ai|co|app|gov|edu)\b/i.test(text)) return true;
       // Scheduling/reminders — ACTION phrasing only ("remind me to/at/in"),
@@ -178,11 +190,18 @@ const INTENT_PATTERNS = [
       if (/\b(next|previous|prev|skip)\s+(track|song|episode|video|chapter)\b/i.test(text)) return true;
       // Screenshots & screen recording
       if (/\b(take|capture|grab|snap)\s+(a\s+|an\s+)?(screenshot|screen\s*shot|screen\s*(recording|capture|grab)|photo\s+of\s+(my|the)\s+screen|picture\s+of\s+(my|the)\s+screen)\b|\bscreenshot\s+(this|my|the)\b|\bscreen\s*record/i.test(text)) return true;
-      // Inbox/calendar checks that require opening an app: "check my email"
-      if (/\b(check|read|open|show|pull\s+up|look\s+at)\s+(my\s+)?(email|e-?mail|inbox|gmail|messages|texts|dms|calendar|schedule|notifications?|voicemail|slack|teams)\b/i.test(text)) return true;
+      // Inbox/calendar checks that require opening an app: "check my email",
+      // "search my gmail", "goto my inbox" — in-app lookups are automation,
+      // never public web search ("search" isn't an ACTION_VERB by design).
+      if (/\b(check|read|open|show|pull\s+up|look\s+(at|for|through)|search|find|scan|filter|sort|go\s+to|goto|navigate|browse)\s+(my\s+)?(email|e-?mail|inbox|gmail|messages|texts|dms|calendar|schedule|notifications?|voicemail|slack|teams)\b/i.test(text)) return true;
+      // Search targeting an app's own surface: "search gmail for X",
+      // "find X in my inbox" — the target lives inside a named app.
+      if (/\b(search|find|scan|filter)\s+(for\s+)?[\w\s]{0,40}?\b(in|inside|within|on)\s+(my\s+)?(gmail|inbox|mail|outlook|slack|whatsapp|telegram|discord|messages|texts|dms|calendar|notion|drive)\b/i.test(text)) return true;
       // Device telemetry: "what's my battery percentage", "check disk space",
       // "is my wifi on" — these need an OS probe; there is no text answer.
-      if (_DEVICE_STATE_RE.test(text)) return true;
+      // Public-release phrasing ("latest macOS version", "newest ipad") is a
+      // web question about Apple's lineup, not this machine's state.
+      if (_DEVICE_STATE_RE.test(text) && !/\b(latest|newest|upcoming|next[-\s]?gen)\b/i.test(text)) return true;
       // Browser automation keywords
       if (/\b(click|type\s+into|fill\s+(out|in)|submit|press\s+(the\s+)?(button|key|enter))\b/i.test(text)) return true;
       return false;

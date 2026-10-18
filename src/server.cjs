@@ -41,7 +41,7 @@ const { toEnglish, fromEnglish, normalizeLanguage } = require('./translate.cjs')
 const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona.cjs');
 const { classify, INTENTS, GRAPH_ONLY_INTENTS } = require('./classify.cjs');
 const { sanitizeContext, isRoutingPromise, stripRoutingPromises } = require('./refusal.cjs');
-const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE, isLocalFileEdit } = require('../../shared/text-patterns.cjs');
+const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE, isLocalFileEdit, NAMED_APP_RE } = require('../../shared/text-patterns.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const webSearchExpress = require('./nodes/webSearchExpress.cjs');
 const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
@@ -153,11 +153,46 @@ function _loadMerge() {
   return _mergeRouteOptions;
 }
 
+// Cached /ext.status probe — the ThinkDrop Chrome extension is the zero-setup
+// authenticated path into the user's real browser. The gate must know it is
+// available before offering integration-setup options for named sites.
+let _extCache = { at: 0, connected: false };
+async function _extConnected() {
+  if (Date.now() - _extCache.at < 15000) return _extCache.connected;
+  try {
+    const r = await fetch(`http://127.0.0.1:${COMMAND_PORT}/ext.status`, { signal: AbortSignal.timeout(400) });
+    const j = await r.json();
+    _extCache = { at: Date.now(), connected: !!j?.connected };
+  } catch (_) { _extCache.at = Date.now(); /* keep last verdict */ }
+  return _extCache.connected;
+}
+
+// Named-app + navigation verb — the user explicitly chose the browser surface
+// ("goto gmail", "open amazon", "visit youtube"). That's a browser task, not
+// a service-integration gap — it must reach the browser agents, never nylas/
+// MCP setup planning. Unconditional: public sites need no auth even when the
+// extension is disconnected (engine path reports needsAuth for the rest).
+const _BROWSER_NAV_VERB_RE = /\b(?:goto|go\s+to|open|visit|navigate|browse|launch|pull\s+up|bring\s+up|log\s*in|sign\s*in)\b/i;
+
+// A capability.search hit is "ready" when installed with low setup friction —
+// the same test the options-extras filter uses.
+function _hasReadyResult(results) {
+  return (results || []).some(r => r && r.installed !== false && (r.friction ?? 9) <= 2);
+}
+
 async function _capabilityGate(text, opts = {}) {
   try {
     // "cast/mirror <app|screen|overlay>" is ambiguous (media-cast vs window
     // mirroring) — always clarify in planning even when a cast agent exists.
     if (AMBIGUOUS_CAST_RE.test(text)) return { planning: 'capability_gap' };
+
+    // Explicit named-app navigation → handoff → browser agents (extension
+    // first, engine fallback). Integration planning is not what "goto X" means.
+    if (NAMED_APP_RE.test(text) && _BROWSER_NAV_VERB_RE.test(text)) {
+      logger.info('[capability-gate] named-app navigation → browser route (gate skipped)');
+      return null;
+    }
+    const _namedApp = NAMED_APP_RE.test(text);
 
     // Screen-output deliverables bypass the gate — painting a chart/effect
     // onto the screen needs no external service.
@@ -193,6 +228,24 @@ async function _capabilityGate(text, opts = {}) {
     });
     const results = (await res.json())?.results || [];
 
+    // ── Extension-aware fact correction ────────────────────────────────────
+    // The index scores browser agents by their Playwright-profile auth state
+    // (friction 4-5 = "sign-in may be needed") — it can't see that the
+    // ThinkDrop extension's REAL Chrome session is already authenticated.
+    // When the extension is connected, correct those facts: browser-session
+    // candidates become zero-friction and carry the chrome-extension marker
+    // the ext-aware SELECT rules weigh (capability-index.cjs).
+    const _extOn = await _extConnected();
+    if (_extOn) {
+      for (const r of results) {
+        if (r && r.authType === 'browser-session') {
+          r.friction = 0;
+          r.setupSummary = 'ready — real Chrome session (extension connected)';
+          r.detail = `chrome-extension — drives the user's real signed-in browser. ${r.detail || ''}`.trim();
+        }
+      }
+    }
+
     // ── Semantic selection + external discovery (parallel) ─────────────────
     // A capability hit means this is a service task — the user always sees the
     // real options list in planning (installed routes first, discovered
@@ -200,23 +253,31 @@ async function _capabilityGate(text, opts = {}) {
     // the list and flags whether the prompt is missing required details.
     if (results.length) {
       const inferBody = JSON.stringify({ query, screenText: screenCtx?.ocrText || null });
-      const [sel, inf] = await Promise.all([
-        fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.select-best`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query, screenText: screenCtx?.ocrText || null, candidates: results }),
-          signal: AbortSignal.timeout(12000),
-        }).then(r => r.json()).catch(() => null),
-        fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.infer`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: inferBody,
-          signal: AbortSignal.timeout(25000),
-        }).then(r => r.json()).catch(() => null),
-      ]);
+      // select-best awaited immediately; infer runs in background and is only
+      // awaited by branches that consume it (options/clarify). The pin path
+      // used to block on Promise.all for up to the 25s infer budget.
+      const _selP = fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.select-best`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, screenText: screenCtx?.ocrText || null, candidates: results, extConnected: _extOn }),
+        signal: AbortSignal.timeout(12000),
+      }).then(r => r.json()).catch(() => null);
+      const _infP = fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.infer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: inferBody,
+        signal: AbortSignal.timeout(25000),
+      }).then(r => r.json()).catch(() => null);
 
+      const sel = await _selP;
       const decision = (sel && sel.ok === false) ? 'fallback' : (sel?.decision || 'fallback');
-      const inferred = inf?.candidates || [];
+      // Memoized lazy await — pin/early-return paths never pay infer's
+      // 25s budget; options/setup branches resolve it once on demand.
+      let _inferred = null;
+      const _infer = async () => {
+        if (_inferred === null) _inferred = (await _infP)?.candidates || [];
+        return _inferred;
+      };
 
       // 'none' means the selector saw hits but judged them irrelevant — not a
       // capability task at all (named-site scrapes, weather, chat). Fall
@@ -271,8 +332,17 @@ async function _capabilityGate(text, opts = {}) {
         const merged = [...pool, ...extras];
         const options = _loadMerge()(
           merged.length ? merged : results.filter(r => (r.matchScore || 0) >= 2),
-          inferred, sel?.pick);
+          await _infer(), sel?.pick);
         if (options.length) {
+          // Extension-first for named sites: when nothing on offer is actually
+          // ready (all setup/config), the user's real browser can just do the
+          // task — asking them to configure an integration is strictly worse
+          // than driving the page they named. A ready integration still wins
+          // structured ops (send/create/post) through the normal options flow.
+          if (_namedApp && !_hasReadyResult(results) && await _extConnected()) {
+            logger.info('[capability-gate] named-app task, setup-only options → browser route (extension connected)');
+            return null;
+          }
           logger.info('[capability-gate] service task → planning options', {
             decision, options: options.length, needsInfo,
           });
@@ -280,15 +350,24 @@ async function _capabilityGate(text, opts = {}) {
         }
         // Empty options but selector had a pick — keep old clarify behavior.
         if (decision === 'clarify' || decision === 'needs_setup' || decision === 'fallback') {
+          if (_namedApp && await _extConnected()) {
+            logger.info('[capability-gate] named-app clarify → browser route (extension connected)');
+            return null;
+          }
           const hints = sel ? [sel.pick, ...(sel.alternatives || [])].filter(Boolean).slice(0, 5) : results.slice(0, 5);
           if (hints.length) return { planning: 'capability_clarify', hints, screenCtx };
         }
       }
       // 'none' with no service signal — fall through to infer/stategraph
-      if (!inferred.length) return null;
+      const _inf = await _infer();
+      if (!_inf.length) return null;
       // no-hit path continues below with the already-fetched infer results
-      if (inferred.length && !inferred.some(c => c.installed && (c.friction ?? 9) <= 1)) {
-        return { planning: 'capability_needs_setup', hints: inferred.slice(0, 5), screenCtx };
+      if (_inf.length && !_inf.some(c => c.installed && (c.friction ?? 9) <= 1)) {
+        if (_namedApp && await _extConnected()) {
+          logger.info('[capability-gate] named-app needs_setup → browser route (extension connected)');
+          return null;
+        }
+        return { planning: 'capability_needs_setup', hints: _inf.slice(0, 5), screenCtx };
       }
       return null;
     }
@@ -311,6 +390,10 @@ async function _capabilityGate(text, opts = {}) {
     // decision. Only when EVERY candidate needs install/auth is planning's
     // clarify warranted ("ls is installed" ≠ "you need a provider").
     if (inferred.length && !inferred.some(c => c.installed && (c.friction ?? 9) <= 1)) {
+      if (_namedApp && await _extConnected()) {
+        logger.info('[capability-gate] named-app infer needs_setup → browser route (extension connected)');
+        return null;
+      }
       return { planning: 'capability_needs_setup', hints: inferred.slice(0, 5), screenCtx };
     }
 

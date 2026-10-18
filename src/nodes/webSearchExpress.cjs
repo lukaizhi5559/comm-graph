@@ -24,19 +24,19 @@
 
 const http = require('http');
 const logger = require('../logger.cjs');
-const { askEarly, buildMessages } = require('../llm-providers.cjs');
 const {
   isContextDependent,
   FILE_PATH_RE,
   LOCAL_FS_PROBE_RE,
   SCREEN_OBSERVATION_RE,
   LIVE_PAGE_REF_RE,
+  PAGE_ITEM_REF_RE,
+  NAMED_APP_RE,
+  NAV_VERB_START_RE,
 } = require('../../../shared/text-patterns.cjs');
 
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
-const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
-const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
 const SERP_TIMEOUT_MS = parseInt(process.env.WEB_SEARCH_EXPRESS_TIMEOUT_MS || '12000', 10);
 const EXPRESS_ENABLED = process.env.WEB_SEARCH_EXPRESS !== '0';
 
@@ -52,7 +52,17 @@ const VIDEO_HINT_RE = /\b(videos?|clips?|trailers?|tutorials?|episodes?)\b/i;
 const FOLLOWUP_SHAPE_RE = /^(?:yes|yeah|yep|ok(?:ay)?|sure|please|now|then|again|more|another|same|also|too|and|next|continue|go\s+ahead|what\s+about|how\s+about)\b|\b(?:too|again|instead|as\s+well|this\s+time|as\s+before|the\s+same)\s*[.?!]?\s*$/i;
 
 // Personal/local referents — a web SERP cannot answer these.
-const PERSONAL_DATA_RE = /\bmy\s+(notes?|files?|folders?|documents?|downloads?|desktop|inbox|e?-?mails?|calendar|contacts?|bookmarks?|photos?|reminders?|history|saved)\b|\b(?:saved|bookmarked|stored)\s+(?:in|on|to)\s+(?:my|the)\b/i;
+const PERSONAL_DATA_RE = /\bmy\s+(notes?|files?|folders?|documents?|downloads?|desktop|inbox|gmail|google\s*mail|e?-?mails?|outlook|messages?|texts?|chats?|dms|voicemails?|calendar|contacts?|bookmarks?|photos?|reminders?|history|saved|notifications?)\b|\b(?:saved|bookmarked|stored)\s+(?:in|on|to)\s+(?:my|the)\b/i;
+
+// Automation-shaped action verbs — a named app + one of these means the user
+// wants the app DRIVEN, not a SERP about it. Kept deliberately narrow (no
+// bare "search"/"find" — "search YouTube for X" is still a content lookup).
+const APP_ACTION_VERB_RE = /\b(go\s+to|goto|navigate|open|launch|visit|log\s*in|sign\s*in|check|read|post|send|compose|reply|upload|download|scroll|click|fill|submit|play|watch|browse)\b/i;
+
+// Nav-verb LEADING the prompt — "goto biblegateway", "open trello", "launch
+// figma". A command-shaped prompt is never a SERP lookup, and NAMED_APP_RE
+// can't enumerate every site the user might name — the verb's position is
+// the signal that doesn't depend on the list. (Shared: NAV_VERB_START_RE.)
 
 /**
  * @param {string} text         - English prompt (selection chips stripped)
@@ -68,10 +78,23 @@ function isEligible(text, opts = {}) {
   if (isContextDependent(t)) return false;
   if (FOLLOWUP_SHAPE_RE.test(t)) return false;
   if (PERSONAL_DATA_RE.test(t)) return false;
+  // Named app + action verb → the user wants the app driven (command_automate),
+  // not a SERP about it. "goto youtube", "open gmail", "check my netflix" all
+  // fall through to the real classifier — express only claims pure lookups.
+  if (NAMED_APP_RE.test(t) && APP_ACTION_VERB_RE.test(t)) return false;
+  // Nav-verb-led command ("goto biblegateway…") — command-shaped regardless
+  // of whether the destination is a listed app. Fail closed: the real
+  // classifier decides what it is; express just doesn't claim it.
+  if (NAV_VERB_START_RE.test(t)) return false;
   // File paths, local-fs probes, and live screen/page referents can never be
   // answered by a public SERP — the stategraph owns those.
   if (FILE_PATH_RE.test(t) || LOCAL_FS_PROBE_RE.test(t)) return false;
   if (SCREEN_OBSERVATION_RE.test(t) || LIVE_PAGE_REF_RE.test(t)) return false;
+  // Ordinal page-item referents ("the first three items", "the second
+  // listing") — context-dependent by definition; the bound tab owns the
+  // answer, a SERP can only answer wrong (observed: ebay follow-up →
+  // screw-multipack prices).
+  if (PAGE_ITEM_REF_RE.test(t)) return false;
   return true;
 }
 
@@ -102,23 +125,16 @@ function _hostname(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch (_) { return ''; }
 }
 
-// Semantic memory search — runs in parallel with the SERP fetch so memory
-// blending costs ~0 added latency. Hits only fold into the synth prompt.
-function _memorySearch(query) {
-  if (!MEM_API_KEY) return Promise.resolve(null);
-  return _postJson(MEMORY_PORT, '/memory.search', {
-    version: 'mcp.v1', service: 'user-memory', action: 'memory.search',
-    payload: { query, limit: 3, minSimilarity: 0.3 },
-    requestId: 'cg_wsx_mem_' + Date.now(),
-  }, MEM_API_KEY, 3000).then((parsed) => {
-    const results = parsed?.data?.results || parsed?.data || [];
-    if (!Array.isArray(results) || !results.length) return null;
-    return results
-      .map(r => r.text || r.content || r.value || '')
-      .filter(s => s.length > 4)
-      .slice(0, 2)
-      .join('\n') || null;
-  });
+// Strip command-shaped preamble before sending to SERP — "goto google and
+// search X" → "X". The raw command phrasing degrades results and suppresses
+// AI Overview generation. Falls back to the raw query if stripping empties it.
+function _cleanQuery(q) {
+  const cleaned = String(q || '')
+    .replace(/\b(?:goto|go\s+to|navigate\s+to|open|visit|launch|browse)\s+(?:to\s+)?[\w.-]+(?:\.[a-z]{2,})?\s*(?:and|then|for\s+me)?\s*/gi, ' ')
+    .replace(/\b(?:look\s+up|search\s+for|search)\s+/gi, ' ')
+    .replace(/\bfor\s+me\b/gi, ' ')
+    .replace(/\s{2,}/g, ' ').trim();
+  return cleaned.length >= 4 ? cleaned : String(q || '').trim();
 }
 
 // Normalize a raw result to the stategraph's contextDoc shape (webSearch.js
@@ -172,25 +188,23 @@ async function execute(opts) {
   try {
     // Search in the user's own language (mirrors the webSearch node's
     // original-language logic); the media hint comes from the translation.
-    const query = (detectedLanguage && detectedLanguage !== 'en' && originalText)
-      ? originalText.trim() : englishText.trim();
+    const query = _cleanQuery(
+      (detectedLanguage && detectedLanguage !== 'en' && originalText)
+        ? originalText.trim() : englishText.trim());
     const mediaHint = VIDEO_HINT_RE.test(englishText) ? 'video'
       : IMAGE_HINT_RE.test(englishText) ? 'image' : null;
 
-    const [serp, memoryCtx] = await Promise.all([
-      _postJson(WEB_SEARCH_PORT, '/web.search', {
-        version: 'mcp.v1', service: 'web-search', action: 'web.search',
-        payload: {
-          query,
-          limit: mediaHint ? 8 : 5,
-          ...(mediaHint ? { maxResults: 8, intent: mediaHint } : {}),
-          ...(detectedLanguage && detectedLanguage !== 'en' ? { lang: detectedLanguage } : {}),
-        },
-        requestId: 'cg_wsx_' + Date.now(),
-        context: { userId: 'local_user' },
-      }, WS_API_KEY, SERP_TIMEOUT_MS),
-      _memorySearch(englishText),
-    ]);
+    const serp = await _postJson(WEB_SEARCH_PORT, '/web.search', {
+      version: 'mcp.v1', service: 'web-search', action: 'web.search',
+      payload: {
+        query,
+        limit: mediaHint ? 8 : 5,
+        ...(mediaHint ? { maxResults: 8, intent: mediaHint } : {}),
+        ...(detectedLanguage && detectedLanguage !== 'en' ? { lang: detectedLanguage } : {}),
+      },
+      requestId: 'cg_wsx_' + Date.now(),
+      context: { userId: 'local_user' },
+    }, WS_API_KEY, SERP_TIMEOUT_MS);
 
     const data = serp?.data || serp;
     const results = Array.isArray(data?.results) ? data.results : [];
@@ -228,21 +242,10 @@ async function execute(opts) {
       // Google's AI Overview IS the answer — zero LLM calls.
       text = overview;
     } else {
-      // One-shot synthesis grounded on fresh snippets (+ any memory hits).
-      const snippets = results.slice(0, 5)
-        .map(r => `- ${r.title || ''}: ${r.snippet || r.description || ''}`.trim())
-        .filter(s => s.length > 6);
-      let synthPrompt = 'You are answering a web search query. Answer in 1-3 short sentences using ONLY the fresh results below — do not invent facts. If the results do not answer the question, say what you found instead.';
-      if (snippets.length) synthPrompt += `\n\nRESULTS:\n${snippets.join('\n')}`;
-      if (memoryCtx) synthPrompt += `\n\nUSER CONTEXT (personal memories — use only if relevant):\n${memoryCtx}`;
-      try {
-        const { firstSentence, fullText } = await askEarly(
-          buildMessages(englishText, synthPrompt, context),
-          { maxTokens: 220, temperature: 0.5 },
-        );
-        text = (fullText || firstSentence || '').trim();
-      } catch (_) { text = ''; }
-      if (!text) text = "Here's what I found:"; // cards carry the answer
+      // No overview → cards + sources carry the answer. A synthesized
+      // paragraph would be an LLM guess — worse than none (observed: it
+      // hallucinated "I don't have the ability to browse the web").
+      text = "Here's what I found:";
     }
 
     logger.info('[SearchExpress] answered', {
