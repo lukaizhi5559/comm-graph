@@ -23,7 +23,9 @@
  */
 
 const http = require('http');
+const https = require('https');
 const logger = require('../logger.cjs');
+const { standaloneSearchQuery } = require('../query-context.cjs');
 const {
   isContextDependent,
   FILE_PATH_RE,
@@ -33,6 +35,7 @@ const {
   PAGE_ITEM_REF_RE,
   NAMED_APP_RE,
   NAV_VERB_START_RE,
+  SCRIPTURE_REF_RE,
 } = require('../../../shared/text-patterns.cjs');
 
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
@@ -121,6 +124,29 @@ function _postJson(port, urlPath, payload, apiKey, timeoutMs) {
   });
 }
 
+// Scripture lookup fast path — bible-api.com (free, no key). Google's AI
+// Overview only returns verse fragments for full-chapter asks; the API
+// returns the complete passage deterministically in <1s. Returns the
+// "Reference\nPassage" text on success, null on any failure (SERP fallback).
+function _fetchBiblePassage(ref, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const url = `https://bible-api.com/${encodeURIComponent(String(ref).trim().slice(0, 40))}`;
+    const req = https.get(url, { timeout: timeoutMs }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          if (j.error || !j.text) return resolve(null);
+          resolve(`${(j.reference || ref).trim()}\n\n${j.text.trim()}`);
+        } catch (_) { resolve(null); }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+  });
+}
+
 function _hostname(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch (_) { return ''; }
 }
@@ -188,9 +214,49 @@ async function execute(opts) {
   try {
     // Search in the user's own language (mirrors the webSearch node's
     // original-language logic); the media hint comes from the translation.
-    const query = _cleanQuery(
+    let query = _cleanQuery(
       (detectedLanguage && detectedLanguage !== 'en' && originalText)
         ? originalText.trim() : englishText.trim());
+    // The eligibility gates are regex — a no-pronoun follow-up ("who has
+    // ALS?" after a Chris Johnson lookup) reads as context-free to them but
+    // not to a SERP. With conversation history on hand, rewrite the query to
+    // standalone form before sending; null = referent unresolvable → abstain.
+    if (context && String(context).trim()) {
+      const contextual = await standaloneSearchQuery(query, context, null);
+      if (contextual === null) {
+        logger.warn('[SearchExpress] abstained — follow-up referent unresolvable', {
+          queryPreview: query.substring(0, 60),
+        });
+        return null;
+      }
+      query = contextual;
+    }
+
+    // Scripture lookup → bible-api.com fast path. "look up john 1" deserves
+    // the complete chapter, not Google's fragmentary AI Overview.
+    const scriptureRef = query.match(SCRIPTURE_REF_RE);
+    if (scriptureRef) {
+      const passage = await _fetchBiblePassage(scriptureRef[0]);
+      if (passage) {
+        logger.info('[SearchExpress] answered via bible-api', {
+          latencyMs: Date.now() - t0, ref: scriptureRef[0],
+        });
+        return {
+          text: passage,
+          fullText: passage,
+          metadata: {
+            source: 'bible-api',
+            provider: 'bible-api.com',
+            intent: 1,
+            guessedIntent: 'web_search',
+            sources: [],
+            items: [],
+          },
+        };
+      }
+      logger.warn('[SearchExpress] bible-api miss — falling through to SERP', { ref: scriptureRef[0] });
+    }
+
     const mediaHint = VIDEO_HINT_RE.test(englishText) ? 'video'
       : IMAGE_HINT_RE.test(englishText) ? 'image' : null;
 
