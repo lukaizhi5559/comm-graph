@@ -197,6 +197,11 @@ const INTENT_PATTERNS = [
       // Search targeting an app's own surface: "search gmail for X",
       // "find X in my inbox" — the target lives inside a named app.
       if (/\b(search|find|scan|filter)\s+(for\s+)?[\w\s]{0,40}?\b(in|inside|within|on)\s+(my\s+)?(gmail|inbox|mail|outlook|slack|whatsapp|telegram|discord|messages|texts|dms|calendar|notion|drive)\b/i.test(text)) return true;
+      // "search <service> for X" — searching INSIDE a named web service is
+      // automation on that service's page, not a public web search
+      // (observed: "search youtube for lo-fi beats" → SearchExpress
+      // answered with channel links instead of driving YouTube).
+      if (/\b(search|find|look\s+for|browse)\s+(youtube|spotify|netflix|amazon|ebay|etsy|reddit|github|tiktok|twitch|hulu|pinterest|wikipedia|imdb|soundcloud|bandcamp|apple\s+music|google\s+(?:maps|flights|shopping|scholar|news|images))\s+(for|to\s+find)\b/i.test(text)) return true;
       // Device telemetry: "what's my battery percentage", "check disk space",
       // "is my wifi on" — these need an OS probe; there is no text answer.
       // Public-release phrasing ("latest macOS version", "newest ipad") is a

@@ -36,6 +36,15 @@ const serviceMap = require('../../../shared/service-map.cjs');
 const sysMap = require('../../../shared/system-map.cjs');
 const { PLAN_CONFIRM_RE, PLAN_RUN_RE, PLAN_RUN_NEG_RE } = require('../../../shared/plan-check-phrases.cjs');
 
+// Tolerant LLM-JSON parse for step generation — repairs unfenced replies,
+// dangling commas, unterminated strings and truncated arrays (the last step
+// may be partial; callers drop entries that fail the skill check). Same
+// cross-module require pattern route-decision.cjs uses for classifyTask.
+let _parseLlmJson = null;
+try {
+  _parseLlmJson = require(path.resolve(__dirname, '../../../stategraph-module/src/utils/parseLlmJson.js')).parseLlmJson;
+} catch (_) {}
+
 // ── Paths / services ─────────────────────────────────────────────────────────
 
 function _plansDir() {
@@ -178,6 +187,11 @@ function _refreshSessionFromDisk(sess) {
       if (p && p.prompt === t.prompt) {
         if (p._stepsHash != null) t._stepsHash = p._stepsHash;
         if (p._normalized) t._normalized = p._normalized;
+        if (p._failedHash != null) t._failedHash = p._failedHash;
+      } else if (p && String(t.stepsStatus || '').toLowerCase() === 'failed') {
+        // Prompt edited on disk since the failure — a stale 'failed' would
+        // suppress regeneration for a prompt that was never attempted.
+        t.stepsStatus = null;
       }
     }
     sess.tasks = fresh;
@@ -385,11 +399,20 @@ async function _generateTaskSteps(task) {
     // Scene-step replies carry an inline three.js body — a 900-token cap
     // truncates the fence mid-code and the whole list unparseable.
     ], { maxTokens: 4096, temperature: 0.2, timeoutMs: 45000, taskType: 'planning' });
-    const m = String(text || '').match(/```(?:json)?\s*\n?([\s\S]*?)```/);
     let steps = null;
-    try { steps = m ? JSON.parse(m[1].trim()) : null; }
-    catch (e) {
-      logger.warn('[Planning] Step JSON parse failed', { taskNum: task.num, error: e.message });
+    if (_parseLlmJson) {
+      // Multi-attempt parse (fence strip → balanced array → brace repair →
+      // jsonrepair). A provider-truncated reply salvages as a partial array —
+      // the tail step can carry filler/partial args and is filtered out below.
+      steps = _parseLlmJson(text, logger, 'Planning:StepGen');
+      if (steps && !Array.isArray(steps) && Array.isArray(steps.steps)) steps = steps.steps;
+      if (!Array.isArray(steps)) steps = null;
+    } else {
+      const m = String(text || '').match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+      try { steps = m ? JSON.parse(m[1].trim()) : null; }
+      catch (e) {
+        logger.warn('[Planning] Step JSON parse failed', { taskNum: task.num, error: e.message });
+      }
     }
     if (!Array.isArray(steps) || !steps.length) {
       logger.warn('[Planning] Step generation produced no steps', {
@@ -398,10 +421,16 @@ async function _generateTaskSteps(task) {
       });
       return null;
     }
-    const valid = steps.every(s => s && typeof s.skill === 'string' && s.skill);
-    if (!valid) {
+    // Keep well-formed steps; a repair-salvaged tail step (skill:null or cut
+    // mid-object) is dropped rather than rejecting the whole list.
+    const beforeFilter = steps.length;
+    steps = steps.filter(s => s && typeof s.skill === 'string' && s.skill);
+    if (!steps.length) {
       logger.warn('[Planning] Step list malformed (missing skill field)', { taskNum: task.num });
       return null;
+    }
+    if (steps.length < beforeFilter) {
+      logger.info('[Planning] Dropped malformed step entries', { taskNum: task.num, kept: steps.length, dropped: beforeFilter - steps.length });
     }
     // One normalization rule shared with planRunner's dispatch path:
     // url steps → owning service agent; session-bound steps → task's lane.
@@ -422,13 +451,28 @@ function _notifyPlanUpdated(planId) {
 }
 
 function _scheduleStepGen(sess) {
-  if (!sess.tasks.length || _stepGenInFlight.has(sess.planId)) return;
+  if (!sess.tasks.length) return;
+  if (_stepGenInFlight.has(sess.planId)) {
+    // A loop is already running over the task array captured at start —
+    // tasks appended/replaced mid-flight (_applyPlanMarkers swaps sess.tasks
+    // wholesale) would never generate and sit 'pending' forever, blocking the
+    // plan-check card. Queue one trailing pass instead of dropping it.
+    sess._stepGenPending = true;
+    return;
+  }
   _stepGenInFlight.add(sess.planId);
   setImmediate(async () => {
     try {
       for (const task of sess.tasks) {
         if (Array.isArray(task.steps) && task.steps.length
             && task._stepsHash === _promptHash(task.prompt)) continue;
+        // A 'failed' generation is sticky per prompt — the same prompt will
+        // almost always fail again (e.g. provider token cap), and each doomed
+        // re-attempt holds the check card 'pending' so the run can't start.
+        // Regen only happens on a prompt change (stepsStatus reset) or an
+        // explicit "Retry generation" (retrySteps clears the status).
+        if (String(task.stepsStatus || '').toLowerCase() === 'failed'
+            && (!task._failedHash || task._failedHash === _promptHash(task.prompt))) continue;
         const promptAtGen = task.prompt;
         // Bounded retry — a single malformed/unfenced response used to leave
         // the task pending forever. Two attempts, then mark it failed so the
@@ -443,7 +487,10 @@ function _scheduleStepGen(sess) {
               fs.writeFileSync(sess.filePath,
                 planFormat.updateTaskStepsStatus(onDisk, task.num, 'failed'), 'utf8');
               const live = sess.tasks.find(t => t.num === task.num);
-              if (live) live.stepsStatus = 'failed';
+              if (live) {
+                live.stepsStatus = 'failed';
+                live._failedHash = _promptHash(promptAtGen);
+              }
               _notifyPlanUpdated(sess.planId);
             }
           } catch (err) {
@@ -487,6 +534,7 @@ function _scheduleStepGen(sess) {
               live.steps = steps;
               live.stepsStatus = null;
               live._stepsHash = _promptHash(promptAtGen);
+              live._failedHash = null;
             }
             _notifyPlanUpdated(sess.planId);
             logger.info('[Planning] Steps generated', { planId: sess.planId, taskNum: task.num, count: steps.length });
@@ -497,6 +545,10 @@ function _scheduleStepGen(sess) {
       }
     } finally {
       _stepGenInFlight.delete(sess.planId);
+      if (sess._stepGenPending) {
+        sess._stepGenPending = false;
+        _scheduleStepGen(sess);
+      }
     }
   });
 }
@@ -1667,9 +1719,16 @@ function _applyPlanMarkers(text, sess, unknownAgents) {
           t.status = prev.status;
           t.result = prev.result;
         }
-        if (prev && prev.steps && prev.prompt === t.prompt) {
-          t.steps = prev.steps;
-          t._stepsHash = prev._stepsHash;
+        if (prev && prev.prompt === t.prompt) {
+          if (prev.steps) {
+            t.steps = prev.steps;
+            t._stepsHash = prev._stepsHash;
+          }
+          // 'failed' is sticky while the prompt is unchanged — otherwise a
+          // plan_update rewrite would reset it to null and the next
+          // _scheduleStepGen pass would re-run the same doomed generation.
+          if (prev.stepsStatus != null) t.stepsStatus = prev.stepsStatus;
+          if (prev._failedHash != null) t._failedHash = prev._failedHash;
         }
       }
       sess.tasks = newTasks;
@@ -2376,4 +2435,4 @@ function retrySteps(planId, taskNum) {
   return { ok: true };
 }
 
-module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, releaseSession, retrySteps, findOpenPlan, _isRecommended };
+module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, releaseSession, retrySteps, findOpenPlan, _isRecommended, _generateTaskSteps, _scheduleStepGen };

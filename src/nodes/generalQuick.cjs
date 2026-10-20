@@ -27,6 +27,7 @@ const { askEarly, buildMessages } = require('../llm-providers.cjs');
 const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
 const { isCannedRefusal, isPromptEcho, isRoutingPromise, stripRoutingPromises } = require('../refusal.cjs');
 const { isContextDependent } = require('../../../shared/text-patterns.cjs');
+const { standaloneSearchQuery } = require('../query-context.cjs');
 
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
 const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
@@ -214,10 +215,16 @@ async function execute(englishText, systemPrompt, conversationContext, opts = {}
     // lives on the user's screen, not on the SERP).
     let serpSnippets = null;
     if (SERP_FIRST_ENABLED && !opts.hasSelectionContext && _isKnowledgeQuestion(englishText)) {
-      const _searchQuery = (opts.detectedLanguage && opts.detectedLanguage !== 'en' && opts.originalPrompt)
+      // Attach conversation context so follow-up questions ("who has ALS?"
+      // after a Chris Johnson lookup) reach the SERP as a standalone query —
+      // the web-search service is stateless, so the caller must enrich it.
+      // null = unresolved follow-up referent → skip SERP entirely rather than
+      // answer off-context; the LLM path below still sees conversationContext.
+      const _rawQuery = (opts.detectedLanguage && opts.detectedLanguage !== 'en' && opts.originalPrompt)
         ? opts.originalPrompt : englishText;
+      const _searchQuery = await standaloneSearchQuery(_rawQuery, conversationContext, opts.routeDecision);
       try {
-        const serp = await _serpAnswer(_searchQuery, opts.detectedLanguage);
+        const serp = _searchQuery === null ? null : await _serpAnswer(_searchQuery, opts.detectedLanguage);
         if (serp?.answer) {
           logger.info('[GeneralQuick] serp_overview — skipping LLM', {
             chars: serp.answer.length, lang: opts.detectedLanguage || 'en',
