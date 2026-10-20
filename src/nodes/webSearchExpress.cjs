@@ -180,6 +180,10 @@ function _toItem(r) {
   const item = {
     title: r.title || undefined,
     imageUrl: imageUrl || undefined,
+    // Engine-proxied thumb — fast, always reachable; the card tries it
+    // before the (often hotlink-blocked) original imageUrl.
+    thumbnail: (typeof r.thumbnail === 'string' ? r.thumbnail : r.thumbnail?.src) || undefined,
+    originalUrl: r.originalUrl || r.metadata?.properties?.originalUrl || undefined,
     url: itemUrl || undefined,
     snippet: r.snippet || r.description || undefined,
     // Real destination host from the SERP cite row — r.url is often a wrapped
@@ -247,6 +251,7 @@ async function execute(opts) {
           metadata: {
             source: 'bible-api',
             provider: 'bible-api.com',
+            engine: 'bible-api',
             intent: 1,
             guessedIntent: 'web_search',
             sources: [],
@@ -325,6 +330,7 @@ async function execute(opts) {
       metadata: {
         source: 'search_express',
         provider: 'web-search',
+        engine: typeof data?.provider === 'string' ? data.provider : undefined,
         intent: 1,
         guessedIntent: 'web_search',
         sources,

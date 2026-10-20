@@ -174,30 +174,80 @@ function _postJson(port, urlPath, payload, apiKey, timeoutMs) {
   });
 }
 
+// SSE variant of _postJson for /web.search stream:true — parses
+// `data: {...}` lines, forwards {type:'answer'} deltas to onChunk, resolves
+// with the {type:'done'} payload.
+function _postSse(port, urlPath, payload, apiKey, timeoutMs, onChunk) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const req = http.request({
+      hostname: '127.0.0.1', port, path: urlPath, method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      timeout: timeoutMs,
+    }, (res) => {
+      let buf = '';
+      res.on('data', (c) => {
+        buf += c;
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          for (const line of block.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            try {
+              const ev = JSON.parse(line.slice(5));
+              if (ev.type === 'answer' && ev.text && onChunk) onChunk(ev.text);
+              else if (ev.type === 'done') { req.destroy(); resolve(ev.data); return; }
+            } catch (_) {}
+          }
+        }
+      });
+      res.on('end', () => resolve(null));
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
+
 // Returns { answer, sources } when the SERP captured a usable AI Overview,
 // else null. Never throws — any failure falls through to the LLM path.
-async function _serpAnswer(query, lang) {
+async function _serpAnswer(query, lang, onChunk = null) {
   if (!WS_API_KEY) return null;
-  const res = await _postJson(WEB_SEARCH_PORT, '/web.search', {
+  const reqBody = {
     version: 'mcp.v1', service: 'web-search', action: 'web.search',
     payload: { query, maxResults: 3, ...(lang && lang !== 'en' ? { lang } : {}) },
     requestId: 'cg_gq_ws_' + Date.now(),
     context: { userId: 'local_user' },
-  }, WS_API_KEY, SERP_TIMEOUT_MS);
+  };
+  // Streaming caller: ask the service to emit the provider's answer deltas
+  // (Bing Copilot writes itself over ~10s) — the UI shows it typing instead
+  // of a silent spinner. Generation needs a longer budget than a plain SERP.
+  const res = onChunk
+    ? await _postSse(WEB_SEARCH_PORT, '/web.search', { ...reqBody, payload: { ...reqBody.payload, stream: true } }, WS_API_KEY, 35000, onChunk)
+    : await _postJson(WEB_SEARCH_PORT, '/web.search', reqBody, WS_API_KEY, SERP_TIMEOUT_MS);
   const data = res?.data || res;
+  // Real serving engine (google-serp/bing-copilot/bing-serp/…). Surfaced as
+  // the transparency chip on the reply card — not the MCP service name.
+  const engine = typeof data?.provider === 'string' ? data.provider : null;
   const overview = typeof data?.aiOverview === 'string' ? data.aiOverview.trim() : '';
   if (overview.length > 40) {
     const sources = (data?.results || [])
       .filter(r => r.url && r.url.startsWith('http')).slice(0, 5)
       .map(r => ({ url: r.url, title: r.title || '', hostname: (() => { try { return new URL(r.url).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })() }));
-    return { answer: overview, sources };
+    return { answer: overview, sources, engine };
   }
   // No overview — return whatever snippets exist so the caller can ground the
   // LLM call on fresh results instead of stale training knowledge.
   const snippets = (data?.results || []).slice(0, 3)
     .map(r => `- ${r.title || ''}: ${r.snippet || r.description || ''}`.trim())
     .filter(s => s.length > 4);
-  return snippets.length ? { snippets } : null;
+  return snippets.length ? { snippets, engine } : (engine ? { engine } : null);
 }
 
 /**
@@ -214,6 +264,7 @@ async function execute(englishText, systemPrompt, conversationContext, opts = {}
     // entirely. Selection-context prompts are excluded (the highlighted text
     // lives on the user's screen, not on the SERP).
     let serpSnippets = null;
+    let serpEngine = null;
     if (SERP_FIRST_ENABLED && !opts.hasSelectionContext && _isKnowledgeQuestion(englishText)) {
       // Attach conversation context so follow-up questions ("who has ALS?"
       // after a Chris Johnson lookup) reach the SERP as a standalone query —
@@ -224,7 +275,7 @@ async function execute(englishText, systemPrompt, conversationContext, opts = {}
         ? opts.originalPrompt : englishText;
       const _searchQuery = await standaloneSearchQuery(_rawQuery, conversationContext, opts.routeDecision);
       try {
-        const serp = _searchQuery === null ? null : await _serpAnswer(_searchQuery, opts.detectedLanguage);
+        const serp = _searchQuery === null ? null : await _serpAnswer(_searchQuery, opts.detectedLanguage, opts.onReplyChunk);
         if (serp?.answer) {
           logger.info('[GeneralQuick] serp_overview — skipping LLM', {
             chars: serp.answer.length, lang: opts.detectedLanguage || 'en',
@@ -233,10 +284,11 @@ async function execute(englishText, systemPrompt, conversationContext, opts = {}
           return {
             text: serp.answer,
             fullText: serp.answer,
-            metadata: { source: 'serp_overview', provider: 'web-search', intent: 1, sources: serp.sources },
+            metadata: { source: 'serp_overview', provider: 'web-search', intent: 1, sources: serp.sources, engine: serp.engine },
           };
         }
         serpSnippets = serp?.snippets || null;
+        serpEngine = serp?.engine || null;
       } catch (e) {
         logger.warn('[GeneralQuick] SERP-first failed — falling through to LLM', { error: e.message });
       }
@@ -299,7 +351,7 @@ async function execute(englishText, systemPrompt, conversationContext, opts = {}
     return {
       text: response,
       fullText: fullText || response,
-      metadata: { source: 'general_quick', provider, intent: 1 },
+      metadata: { source: 'general_quick', provider, intent: 1, ...(serpEngine ? { engine: serpEngine } : {}) },
     };
   } catch (err) {
     // LLM call threw — hand off to main state graph

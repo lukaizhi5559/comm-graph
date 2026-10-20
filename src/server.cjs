@@ -1142,7 +1142,7 @@ async function processMessage(args) {
     }
 
     case 1: { // general_quick
-      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext, originalPrompt: originalText, detectedLanguage, routeDecision: _routeDecision });
+      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext, originalPrompt: originalText, detectedLanguage, routeDecision: _routeDecision, onReplyChunk });
       // If generalQuick couldn't answer (LLM failed), handoff to main state graph
       if (result.metadata.shouldHandoff) {
         const { guessedIntent: _gi1 } = intentGuesser.guess(classifyText, { hasSelectionContext });
@@ -1317,7 +1317,7 @@ async function processMessage(args) {
 
     default: {
       // Unknown intent — default to general_quick
-      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext, originalPrompt: originalText, detectedLanguage, routeDecision: _routeDecision });
+      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext, originalPrompt: originalText, detectedLanguage, routeDecision: _routeDecision, onReplyChunk });
     }
   }
 
