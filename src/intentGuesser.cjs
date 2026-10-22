@@ -263,6 +263,11 @@ const INTENT_PATTERNS = [
       if (/\b(who\s+is\s+the\s+current|who\s+is\s+the\s+\w+\s+right\s+now|what\s+is\s+the\s+latest|price\s+of|stock\s+price)\b/i.test(text)) return true;
       // General factual question that needs live data
       if (/\b(how\s+many\s+(people|users|countries)|what\s+is\s+the\s+population|what\s+is\s+happening)\b/i.test(text)) return true;
+      // Bare media-noun queries — "pictures of batman", "videos of cats" —
+      // the noun IS the request; no show/find verb needed.
+      if (/^(pictures?|photos?|images?|pics?|videos?|clips?|wallpapers?|memes?|gifs?|thumbnails?)\s+(of|for)\b/i.test(text)) return true;
+      // Trailing-noun form — "captain america pictures", "batman wallpaper".
+      if (/^[\w\s'&.-]{2,45}\s(pictures?|photos?|images?|pics?|videos?|wallpapers?|memes?|gifs?)\s*$/i.test(text)) return true;
       return false;
     },
   },
