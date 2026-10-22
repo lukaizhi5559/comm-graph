@@ -37,6 +37,7 @@ const {
   NAV_VERB_START_RE,
   SCRIPTURE_REF_RE,
 } = require('../../../shared/text-patterns.cjs');
+const { toItem: _toItem, hostnameOf: _hostname } = require('../../../shared/serp-item.cjs');
 
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
 const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
@@ -190,9 +191,7 @@ function _fetchBiblePassage(ref, timeoutMs = 5000) {
   });
 }
 
-function _hostname(url) {
-  try { return new URL(url).hostname.replace(/^www\./, ''); } catch (_) { return ''; }
-}
+
 
 // Strip command-shaped preamble before sending to SERP — "goto google and
 // search X" → "X". The raw command phrasing degrades results and suppresses
@@ -206,44 +205,7 @@ function _cleanQuery(q) {
   return cleaned.length >= 4 ? cleaned : String(q || '').trim();
 }
 
-// Normalize a raw result to the stategraph's contextDoc shape (webSearch.js
-// :130-172) then project to the renderer's item contract (answer.js :826-846).
-function _toItem(r) {
-  const url = r.url || r.link || null;
-  const isImage = r.type === 'image-result' || r.type === 'image';
-  const isVideo = r.type === 'video-result' || r.type === 'video';
-  const imageUrl = isImage
-    ? (r.metadata?.properties?.url || r.thumbnail || r.imageUrl || null)
-    : isVideo
-      ? (r.metadata?.thumbnail?.src || r.thumbnail?.src || r.metadata?.properties?.thumbnail
-          || (typeof r.thumbnail === 'string' ? r.thumbnail : null))
-      : (r.metadata?.thumbnail?.src || (typeof r.thumbnail === 'string' ? r.thumbnail : null));
-  const itemUrl = (url && url.startsWith('http')) ? url
-    : (isImage ? (r.metadata?.properties?.originalUrl || r.originalUrl || null) : null);
-  const item = {
-    title: r.title || undefined,
-    imageUrl: imageUrl || undefined,
-    // Engine-proxied thumb — fast, always reachable; the card tries it
-    // before the (often hotlink-blocked) original imageUrl.
-    thumbnail: (typeof r.thumbnail === 'string' ? r.thumbnail : r.thumbnail?.src) || undefined,
-    originalUrl: r.originalUrl || r.metadata?.properties?.originalUrl || undefined,
-    url: itemUrl || undefined,
-    snippet: r.snippet || r.description || undefined,
-    // Real destination host from the SERP cite row — r.url is often a wrapped
-    // google.com/goto link whose derived hostname would render 'google.com'.
-    hostname: r.displayDomain || _hostname(itemUrl || imageUrl || '') || undefined,
-    // Structured rich-snippet fields (google-serp extraction); the card also
-    // parses item.snippet as fallback for providers that don't emit them.
-    rating: r.rating !== undefined ? r.rating : undefined,
-    ratingMax: r.ratingMax !== undefined ? r.ratingMax : undefined,
-    reviewCount: r.reviewCount !== undefined ? r.reviewCount : undefined,
-    priceRange: r.priceRange || undefined,
-    mediaType: isVideo ? 'video' : undefined,
-    duration: isVideo ? (r.metadata?.duration || r.duration || undefined) : undefined,
-    channel: isVideo ? (r.metadata?.channel || r.channel || undefined) : undefined,
-  };
-  return (item.imageUrl || item.url) ? item : null;
-}
+
 
 /**
  * Attempt the express answer. Returns a result object on success, null to
@@ -316,8 +278,8 @@ async function execute(opts) {
       version: 'mcp.v1', service: 'web-search', action: 'web.search',
       payload: {
         query,
-        limit: mediaHint ? 8 : 5,
-        ...(mediaHint ? { maxResults: 8, intent: mediaHint } : {}),
+        limit: mediaHint ? 16 : 5,
+        ...(mediaHint ? { maxResults: 16, intent: mediaHint } : {}),
         ...(detectedLanguage && detectedLanguage !== 'en' ? { lang: detectedLanguage } : {}),
         ...(onReplyChunk ? { stream: true } : {}),
       },
@@ -333,13 +295,16 @@ async function execute(opts) {
             const items = ev.items.map(_toItem).filter(Boolean);
             if (items.length) onReplyChunk('\x00ITEMS\x00' + JSON.stringify(items));
           }
-          const srcs = Array.isArray(ev.sources) && ev.sources.length ? ev.sources
+          const srcs = (Array.isArray(ev.sources) && ev.sources.length ? ev.sources
             : (Array.isArray(ev.items) ? ev.items : [])
               .filter(r => (r.url || r.link || '').startsWith('http'))
               .map(r => {
                 const url = r.url || r.link;
                 return { url, hostname: r.displayDomain || _hostname(url), title: r.title || '' };
-              });
+              }))
+            // google.com/goto wrappers and bare google.com hosts aren't
+            // sources — they're un-unwrapped SERP plumbing.
+            .filter(s => s.hostname && s.hostname !== 'google.com');
           if (srcs.length) onReplyChunk('\x00SOURCES\x00' + JSON.stringify(srcs));
         }
       } catch (_) {}
@@ -412,8 +377,8 @@ async function execute(opts) {
         };
       })
       .filter(s => s.hostname && !seenHosts.has(s.hostname) && seenHosts.add(s.hostname))
-      .slice(0, 10);
-    const items = renderable.map(_toItem).filter(Boolean).slice(0, 24);
+      .slice(0, 14);
+    const items = renderable.map(_toItem).filter(Boolean).slice(0, 32);
 
     let text;
     if (overview.length > 40) {

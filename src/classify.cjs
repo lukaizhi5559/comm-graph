@@ -36,7 +36,7 @@ const INTENTS = {
   // to a node that can't serve them.
   4: { name: 'control_signal',    description: 'Cancel, stop, or abort a running task' },
   5: { name: 'memory_store',      description: 'Storing a general memory, note, appointment, or event — NOT a personal profile fact. E.g., "i have a dentist appt next week", "remember I have a meeting at 3pm", "note: buy milk tomorrow"' },
-  6: { name: 'planning',          description: 'Requests that need a multi-task plan drafted BEFORE execution — brainstorming, "let\'s plan X", or multiple distinct deliverables/services in one request (e.g. doc + calendar + sheet, add to cart then email me). NOT single quick actions.' },
+  6: { name: 'planning',          description: 'Requests that need a multi-task plan drafted BEFORE execution — brainstorming, "let\'s plan X", building/creating a new skill, app, agent, workflow, automation, or script, or multiple distinct deliverables/services in one request (e.g. doc + calendar + sheet, add to cart then email me). NOT single quick actions.' },
 };
 
 // ── Load classification prompt ─────────────────────────────────────────────────
@@ -272,7 +272,12 @@ async function classify(englishText, conversationContext, opts = {}) {
   // composed artifacts, not literal screen output. They belong in planning:
   // preview/draft → confirm → run. Literal displays ("show X on my screen",
   // "pie chart: a 5 b 3") still fast-path via the screen-output guard below.
-  if (/\b(?:slideshow|slide\s*deck|slide\s*show)\b|\b3d\s*(?:model|scene)\b|\b(?:build|create|make|write|draft|generate|put\s+together)\s+(?:me\s+)?(?:a|an|the|some|my|new)\s+[\w\s-]{0,40}\b(?:deck|slideshow|scene|report|resume|doc|document|pdf)\b/i.test(englishText)) {
+  // Composed-deliverable requests also include ThinkDrop buildables —
+  // "put a skill together", "build me an app", "create a workflow". These
+  // are the planning lane's bread and butter: draft a .md plan → readiness
+  // check → approved run, never a single blind handoff. Mere references to
+  // an app/skill stay on their own merits (no build verb → no match).
+  if (/\b(?:slideshow|slide\s*deck|slide\s*show)\b|\b3d\s*(?:model|scene)\b|\b(?:build|create|make|write|draft|generate|put\s+together|do|develop|design|program|code|spin\s+up|set\s+up)\s+(?:me\s+)?(?:a|an|the|some|my|new|up)\s+[\w\s-]{0,40}\b(?:deck|slideshow|scene|report|resume|doc|document|pdf|plans?|skills?|apps?|agents?|workflows?|automations?|extensions?|integrations?|bots?|scripts?|projects?|prototypes?|tools?|websites?)\b|\bput\s+(?:a|an|the|some|my|new)\s+[\w\s-]{0,40}\b(?:plans?|skills?|apps?|agents?|workflows?|automations?|extensions?|integrations?|bots?|scripts?|projects?|prototypes?|tools?|websites?|deck|slideshow|report)\b[\w\s-]{0,20}\btogether\b/i.test(englishText)) {
     logger.info('[Classify] Deliverable guard → planning', {
       inputPreview: englishText.substring(0, 60),
     });

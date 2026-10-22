@@ -52,7 +52,7 @@ const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const { execute: handoff, complete: handoffComplete, remove: handoffRemove, startRetrySweep: startHandoffRetrySweep } = require('./handoff.cjs');
 const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
 const intentGuesser = require('./intentGuesser.cjs');
-const { isPlanAnswerShape, shouldPinGate } = require('./planReply.cjs');
+const { isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply } = require('./planReply.cjs');
 const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = require('./screen-context.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
@@ -947,14 +947,13 @@ async function processMessage(args) {
   // "text my wife" still routes on its own merits.
   if (!_resumePlanId && _openPlan && intent !== 6) {
     const _ansText = String(classifyText || '').trim();
-    const _words = _ansText.split(/\s+/).length;
     // Answer-shaped only — verb-free phrases, route-option labels, ordinals
     // answer a pending question; a command with an action verb + new target
     // ("goto john 1", "exodus 4 show on my screen") classifies on its own
-    // merits. Only a plan bound to THIS session may capture short replies —
-    // a foreign open plan must not swallow fresh commands here.
-    if (_openPlan.boundToSession !== false && _ansText.length <= 60 && _words <= 6
-        && isPlanAnswerShape(_ansText, _openPlan)) {
+    // merits. Only a plan bound to THIS session AND actually awaiting input
+    // may capture short replies — a mid-run plan (pending tasks, no pending
+    // question) must not swallow fresh commands like "pictures of Batman".
+    if (shouldCaptureShortReply(_openPlan, _ansText)) {
       intent = 6;
       intentName = 'planning';
       confidence = 0.9;
@@ -1557,7 +1556,10 @@ const server = http.createServer(async (req, res) => {
       const { guessedIntent } = intentGuesser.guess(body.prompt);
       const result = await handoff({
         englishPrompt: body.prompt,
-        source: 'proactive',
+        // Plan-runner dispatches get their own source so run cards don't get
+        // bucketed with brain "Thoughts" in the feed — everything else on
+        // this endpoint is a proactive thought.
+        source: body.planTask === true ? 'plan' : 'proactive',
         originalPrompt: body.prompt,
         guessedIntent,
         sessionId: body.sessionId || null,
@@ -1688,6 +1690,10 @@ const server = http.createServer(async (req, res) => {
       return _send(res, 400, { error: 'taskId is required' });
     }
     taskJournal.updateProgress(body.taskId, body.progress || {});
+    // Heartbeat the run lane (user-facing tasks all hold __run__) and the
+    // service-agent lock when the task carries one — either may be the key
+    // this task is parked under / holding.
+    agentLock.heartbeat(agentLock.RUN_LOCK_KEY, body.taskId);
     if (body.agentId) {
       agentLock.heartbeat(body.agentId, body.taskId);
     }

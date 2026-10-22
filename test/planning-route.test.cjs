@@ -20,7 +20,7 @@
  */
 const assert = require('assert');
 const { classify, _complexityPlanningScore } = require('../src/classify.cjs');
-const { isPlanAnswerShape, shouldPinGate, PLAN_REPLY_VERB_RE } = require('../src/planReply.cjs');
+const { isPlanAnswerShape, shouldPinGate, PLAN_REPLY_VERB_RE, shouldCaptureShortReply } = require('../src/planReply.cjs');
 const providers = require('../src/llm-providers.cjs');
 
 const realAsk = providers.ask;
@@ -59,6 +59,50 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
     await withAsk(async () => { throw new Error('LLM must not be called — phrase guard fires first'); }, async () => {
       const r = await classify(p);
       check(`"${p}" → planning (phrase guard)`, r.intent === 6 && r.source === 'planning_phrase_guard');
+    });
+  }
+
+  // ── Buildable deliverables → planning (deliverable guard) ────────────────
+  // "I want to do a skill / build an app / create a workflow" must open the
+  // planning lane and produce a durable .md — the key ThinkDrop feature.
+  // Regression: "let's put a skill together" routed to a generic handoff and
+  // ran a git-commit task instead of drafting a plan.
+
+  const buildablePhrases = [
+    "let's put a skill together so I can use git to commit",
+    'I want to do a skill',
+    'build me an app',
+    'create a workflow for my morning routine',
+    'make a new agent for linear',
+    'I want to create a plan',
+    'write me a script to organize downloads',
+    'design an automation that archives my mail',
+    'put a bot together for slack replies',
+    'spin up a project scaffold',
+  ];
+  for (const p of buildablePhrases) {
+    await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+      const r = await classify(p);
+      check(`"${p}" → planning (deterministic guard: ${r.source})`,
+        r.intent === 6 && (r.source === 'deliverable_guard' || r.source === 'planning_phrase_guard'));
+    });
+  }
+
+  // ── Mere references must NOT trigger planning ────────────────────────────
+
+  const mereReferences = [
+    'open the app',
+    'use this skill',
+    'run the plan',
+    'install the extension',
+    'launch the workflow',
+    'what is this agent doing',
+  ];
+  for (const p of mereReferences) {
+    await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+      const r = await classify(p);
+      check(`"${p}" → not planning-phrase/deliverable (${r.source})`,
+        !(r.intent === 6 && (r.source === 'planning_phrase_guard' || r.source === 'deliverable_guard')));
     });
   }
 
@@ -108,6 +152,22 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
   check('"option 2" → ordinal pick', isPlanAnswerShape('option 2', openPlan));
   check('"go to amazon and look up bibles" → command', !isPlanAnswerShape('go to amazon and look up bibles', openPlan));
   check('empty reply → not answer-shaped', !isPlanAnswerShape('', openPlan));
+
+  // ── shouldCaptureShortReply — the open_plan_reply gate ───────────────────
+  // Regression: a plan mid-run (pending tasks, awaitingInput:false) swallowed
+  // "pictures of Batman" into the planning lane as an answer.
+
+  const awaitingPlan = { planId: 'p2', awaitingInput: true, boundToSession: true, pendingCount: 1, routeOptions: [] };
+  const runningPlan  = { planId: 'p3', awaitingInput: false, boundToSession: true, pendingCount: 2, routeOptions: [] };
+  const foreignPlan  = { planId: 'p4', awaitingInput: true, boundToSession: false, pendingCount: 0, routeOptions: [{ label: 'nylas' }] };
+
+  check('awaiting plan + verb-free reply → captured', shouldCaptureShortReply(awaitingPlan, 'metallic blue'));
+  check('running plan must NOT capture "pictures of Batman"', !shouldCaptureShortReply(runningPlan, 'pictures of Batman'));
+  check('running plan must NOT capture "is there anything wrong"', !shouldCaptureShortReply(runningPlan, 'is there anything wrong'));
+  check('foreign plan must NOT capture "nylas" (not bound to session)', !shouldCaptureShortReply(foreignPlan, 'nylas'));
+  check('awaiting plan captures option label', shouldCaptureShortReply(foreignPlan && { ...foreignPlan, boundToSession: true }, 'nylas'));
+  check('long reply → not captured even when awaiting', !shouldCaptureShortReply(awaitingPlan, 'can you also look up the weather in denver tomorrow morning'));
+  check('no plan → not captured', !shouldCaptureShortReply(null, 'yes'));
 
   // ── Capability gate pin mapping ───────────────────────────────────────────
 

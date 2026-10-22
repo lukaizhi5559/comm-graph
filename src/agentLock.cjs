@@ -22,6 +22,21 @@ const { updateTask } = require('./taskJournal.cjs');
 
 const LOCK_TTL_MS = parseInt(process.env.AGENT_LOCK_TTL_MS || '600000', 10); // 10 min default
 
+/**
+ * Global run-lane lock key. Every user-facing task (text/voice prompts AND
+ * dispatched plan tasks) acquires this key, so at most ONE interactive
+ * stategraph run executes at a time — subsequent tasks park FIFO and resume
+ * via _resumeNext. Background thought dispatches (source 'proactive' without
+ * a planTask flag) keep per-agent locking so the Brain can work while the
+ * user does.
+ */
+const RUN_LOCK_KEY = '__run__';
+
+/** Display label for lock keys (the raw key leaks into /comms.locks + UI). */
+function _lockLabel(key) {
+  return key === RUN_LOCK_KEY ? 'run lane' : key;
+}
+
 // ── Lock state ─────────────────────────────────────────────────────────────────
 /**
  * @type {Map<string, { taskId: string, acquiredAt: number, lastProgressAt: number }>}
@@ -111,7 +126,12 @@ function tryAcquire(agentId, taskId) {
   logger.info('[AgentLock] Parked — waiting for agent', {
     agentId, taskId, behind: lockHolder.taskId,
   });
-  updateTask(taskId, 'waiting-for-agent', { agentId });
+  // __run__ is a scheduling lane, not a service agent — never stamp it on
+  // task.agentId (handoff._releaseTask releases task.lockKey + task.agentId,
+  // so the queued lane is still found via the union). lockKey is owned by
+  // handoff.execute's 'queued' stamp — leave it untouched here.
+  updateTask(taskId, 'waiting-for-agent',
+    agentId === RUN_LOCK_KEY ? {} : { agentId });
   _broadcastLockState();
   return { acquired: false, waitingBehind: lockHolder.taskId };
 }
@@ -173,7 +193,8 @@ function _resumeNext(agentId) {
   });
 
   logger.info('[AgentLock] Resumed waiting task', { agentId, taskId: nextTaskId });
-  updateTask(nextTaskId, 'queued', { agentId });
+  updateTask(nextTaskId, 'queued',
+    agentId === RUN_LOCK_KEY ? {} : { agentId });
   return nextTaskId;
 }
 
@@ -195,8 +216,8 @@ function heartbeat(agentId, taskId) {
  */
 function getLockState() {
   return {
-    locks: Array.from(_locks.entries()).map(([agentId, info]) => ({ agentId, ...info })),
-    waiting: Array.from(_waiting.entries()).map(([agentId, ids]) => ({ agentId, count: ids.length, taskIds: [...ids] })),
+    locks: Array.from(_locks.entries()).map(([agentId, info]) => ({ agentId: _lockLabel(agentId), ...info })),
+    waiting: Array.from(_waiting.entries()).map(([agentId, ids]) => ({ agentId: _lockLabel(agentId), count: ids.length, taskIds: [...ids] })),
   };
 }
 
@@ -229,6 +250,7 @@ function getWaitingCount(agentId) {
 }
 
 module.exports = {
+  RUN_LOCK_KEY,
   tryAcquire,
   release,
   heartbeat,

@@ -45,4 +45,24 @@ function shouldPinGate(decision, needsInfo) {
   return decision === 'pin' && !needsInfo;
 }
 
-module.exports = { PLAN_REPLY_VERB_RE, isPlanAnswerShape, shouldPinGate };
+/**
+ * Should a short reply be captured as an open plan's pending answer?
+ * Requires ALL of:
+ *   - the plan is bound to THIS conversation session (a foreign/dormant plan
+ *     must not swallow fresh commands)
+ *   - the plan is actually AWAITING input (route pick / needsInfo / drafting)
+ *     — a plan with merely-pending tasks is mid-run, and short verb-free
+ *     prompts like "pictures of Batman" are new commands, not plan answers
+ *   - the text is short and answer-shaped (verb-free phrase, option label,
+ *     ordinal pick)
+ */
+function shouldCaptureShortReply(openPlan, ansText) {
+  if (!openPlan) return false;
+  const t = String(ansText || '').trim();
+  if (!t || t.length > 60 || t.split(/\s+/).length > 6) return false;
+  if (openPlan.boundToSession === false) return false;
+  if (openPlan.awaitingInput !== true) return false;
+  return isPlanAnswerShape(t, openPlan);
+}
+
+module.exports = { PLAN_REPLY_VERB_RE, isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply };

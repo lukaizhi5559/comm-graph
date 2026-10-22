@@ -27,6 +27,7 @@ const { askEarly, buildMessages } = require('../llm-providers.cjs');
 const { getRandomHandoffPhrase } = require('../handoffPhrases.cjs');
 const { isCannedRefusal, isPromptEcho, isRoutingPromise, stripRoutingPromises } = require('../refusal.cjs');
 const { isContextDependent } = require('../../../shared/text-patterns.cjs');
+const { toItem: toSerpItem } = require('../../../shared/serp-item.cjs');
 const { standaloneSearchQuery } = require('../query-context.cjs');
 
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
@@ -249,9 +250,12 @@ async function _serpAnswer(query, lang, onChunk = null) {
   const overview = typeof data?.aiOverview === 'string' ? data.aiOverview.trim() : '';
   if (overview.length > 40) {
     const sources = (data?.results || [])
-      .filter(r => r.url && r.url.startsWith('http')).slice(0, 5)
+      .filter(r => r.url && r.url.startsWith('http')).slice(0, 14)
       .map(r => ({ url: r.url, title: r.title || '', hostname: (() => { try { return new URL(r.url).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })() }));
-    return { answer: overview, sources, engine };
+    // Card items ride the done-time \x00ITEMS\x00 sentinel — without them the
+    // answer lands bare even though the SERP carried a full result set.
+    const items = (data?.results || []).map(toSerpItem).filter(Boolean).slice(0, 32);
+    return { answer: overview, sources, engine, items };
   }
   // No overview — return whatever snippets exist so the caller can ground the
   // LLM call on fresh results instead of stale training knowledge.
@@ -300,7 +304,7 @@ async function execute(englishText, systemPrompt, conversationContext, opts = {}
           return {
             text: serp.answer,
             fullText: serp.answer,
-            metadata: { source: 'serp_overview', provider: 'web-search', intent: 1, sources: serp.sources, engine: serp.engine },
+            metadata: { source: 'serp_overview', provider: 'web-search', intent: 1, sources: serp.sources, engine: serp.engine, ...(serp.items?.length ? { items: serp.items } : {}) },
           };
         }
         serpSnippets = serp?.snippets || null;

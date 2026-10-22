@@ -15,8 +15,8 @@
 
 const http = require('http');
 const logger = require('./logger.cjs');
-const { createTask, updateTask } = require('./taskJournal.cjs');
-const { tryAcquire, release, isLocked, getWaitingCount } = require('./agentLock.cjs');
+const { createTask, updateTask, getTask } = require('./taskJournal.cjs');
+const { RUN_LOCK_KEY, tryAcquire, release, isLocked, getWaitingCount } = require('./agentLock.cjs');
 
 const THINKDROP_MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
 
@@ -114,6 +114,54 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
 }
 
 /**
+ * Lock key for a dispatch: user-facing work (text/voice prompts AND plan
+ * tasks) shares the single __run__ lane — one interactive run at a time,
+ * FIFO. Background thought dispatches keep per-agent locking so the Brain
+ * can run while the user works.
+ */
+function _lockKeyFor(source, planTask, agentId) {
+  const isThought = source === 'proactive' && !planTask;
+  return isThought ? agentId : RUN_LOCK_KEY;
+}
+
+/**
+ * Notify main.js for a task that just (re)gained its locks. Re-checks the
+ * task's service agent for non-thought tasks — a thought may hold it, in
+ * which case the task parks on the agent queue while KEEPING the run lane
+ * (lock ordering __run__ → agent is consistent; no deadlock).
+ */
+function _resumeNotify(nextTaskId) {
+  const task = getTask(nextTaskId);
+  if (!task || task.status === 'cancelled') return;
+  const isThought = task.source === 'proactive' && !(task.planMeta && task.planMeta.planTask);
+  if (!isThought && task.agentId) {
+    const r = tryAcquire(task.agentId, nextTaskId);
+    if (!r.acquired) return; // parked on the agent queue — notified on agent release
+  }
+  const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
+  _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, task.originalPrompt || null, guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null, task.detectedLanguage || null, null, task.routeDecision || null)
+    .catch(() => {});
+}
+
+/**
+ * Release every lock a task could hold (run lane + service agent) and resume
+ * whatever was parked behind each.
+ */
+function _releaseTask(taskId, agentIdHint) {
+  const task = getTask(taskId);
+  const keys = new Set();
+  if (task && task.lockKey) keys.add(task.lockKey);
+  else if (task) keys.add(_lockKeyFor(task.source, task.planMeta && task.planMeta.planTask, task.agentId));
+  else if (agentIdHint) keys.add(agentIdHint); // journal miss — caller's hint
+  if (task && task.agentId) keys.add(task.agentId);
+  for (const key of keys) {
+    if (!key) continue;
+    const nextTaskId = release(key, taskId);
+    if (nextTaskId) _resumeNotify(nextTaskId);
+  }
+}
+
+/**
  * Execute a handoff: create task, check lock, notify main.js.
  *
  * @param {Object} args
@@ -130,6 +178,8 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
   // is the shared session (google_*.agent → google.agent), not prompt text.
   const agentId = pinnedAgentId || detectAgent(englishPrompt);
   const planMeta = planId ? { planId, planTaskNum, planTask, preflightAuthBypass, deterministicPlan, priorResults, refs } : null;
+  const isThought = source === 'proactive' && !planTask;
+  const lockKey = _lockKeyFor(source, planTask, agentId);
 
   // Create task in journal
   const taskId = createTask({
@@ -146,21 +196,37 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
     routeDecision,
   });
 
-  // Try to acquire agent lock
-  const { acquired, waitingBehind } = tryAcquire(agentId, taskId);
+  // Persist the lane so complete()/remove() release the right keys even if
+  // the source/planMeta inference ever changes shape.
+  updateTask(taskId, 'queued', { lockKey });
+
+  // Try to acquire the lane lock (null for unagented thoughts → runs free)
+  let acquired = true, waitingBehind = null;
+  if (lockKey) {
+    const r = tryAcquire(lockKey, taskId);
+    acquired = r.acquired; waitingBehind = r.waitingBehind;
+  }
+
+  // An interactive task that owns the run lane still can't collide with a
+  // thought holding its service agent — park on the agent queue while
+  // HOLDING __run__ (everything behind simply waits its turn).
+  if (acquired && !isThought && agentId) {
+    const r = tryAcquire(agentId, taskId);
+    if (!r.acquired) { acquired = false; waitingBehind = r.waitingBehind; }
+  }
 
   if (acquired) {
-    // Lock acquired — notify main.js to spawn stategraph run
+    // Locks acquired — notify main.js to spawn stategraph run
     updateTask(taskId, 'queued');
     const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext, planMeta, detectedLanguage, capabilityReason, routeDecision);
     if (!notified) {
       logger.warn('[Handoff] Failed to notify main.js — task will be picked up on retry', { taskId });
     }
-    logger.info('[Handoff] Dispatched', { taskId, agentId, source });
+    logger.info('[Handoff] Dispatched', { taskId, agentId, source, lane: lockKey });
   } else {
-    // Parked — waiting for agent lock
-    logger.info('[Handoff] Parked — waiting for agent lock', {
-      taskId, agentId, waitingBehind,
+    // Parked — waiting for the lane or its service agent
+    logger.info('[Handoff] Parked — waiting for lock', {
+      taskId, agentId, lane: lockKey, waitingBehind,
     });
   }
 
@@ -184,21 +250,7 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
  */
 function complete(taskId, agentId, status, result, items, sessionId = null, planFile = null, trace = null, artifacts = null) {
   updateTask(taskId, status, { result: result || null, items: items || null, sessionId, ...(planFile ? { planFile } : {}), ...(trace ? { trace } : {}), ...(artifacts ? { artifacts } : {}) });
-  if (agentId) {
-    const nextTaskId = release(agentId, taskId);
-    if (nextTaskId) {
-      // A waiting task was resumed — notify main.js to start it.
-      // Re-guess the intent so the resumed task:created carries it (the guess
-      // is not stored in the journal — task.intent stays 'handoff').
-      const task = require('./taskJournal.cjs').getTask(nextTaskId);
-      // Skip tasks cancelled while parked (plan cancel hits every taskId).
-      if (task && task.status !== 'cancelled') {
-        const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
-        _notifyMain(nextTaskId, task.prompt, task.agentId, task.source, task.originalPrompt || null, guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null, task.detectedLanguage || null, null, task.routeDecision || null)
-          .catch(() => {});
-      }
-    }
-  }
+  _releaseTask(taskId, agentId);
   logger.info('[Handoff] Completed', { taskId, agentId, status });
 }
 
@@ -208,23 +260,14 @@ function complete(taskId, agentId, status, result, items, sessionId = null, plan
  * @returns {boolean}
  */
 function remove(taskId) {
-  const task = require('./taskJournal.cjs').getTask(taskId);
+  const task = getTask(taskId);
   if (!task) return false;
-  // If the task is active or waiting on an agent, release that agent's lock
+  // If the task is active or parked, release its locks — _resumeNotify skips
+  // a next task that was cancelled while parked (e.g. plan cancel hits every
+  // dispatched taskId — a release mid-loop must not spawn them).
   const activeStatuses = ['queued', 'running', 'waiting-for-agent', 'awaiting-approval', 'waiting-for-input'];
-  if (activeStatuses.includes(task.status) && task.agentId) {
-    const nextTaskId = release(task.agentId, taskId);
-    if (nextTaskId) {
-      const nextTask = require('./taskJournal.cjs').getTask(nextTaskId);
-      // Don't resurrect a task that was cancelled while parked (e.g. plan
-      // cancel hits every dispatched taskId — a release mid-loop must not
-      // spawn the ones we just cancelled).
-      if (nextTask && nextTask.status !== 'cancelled') {
-        const guessedIntent = require('./intentGuesser.cjs').guess(nextTask.prompt).guessedIntent;
-        _notifyMain(nextTaskId, nextTask.prompt, nextTask.agentId, nextTask.source, nextTask.originalPrompt || null, guessedIntent, nextTask.sessionId, nextTask.userApproved === true, nextTask.thoughtContext || null, nextTask.planMeta || null, nextTask.detectedLanguage || null, null, nextTask.routeDecision || null)
-          .catch(() => {});
-      }
-    }
+  if (activeStatuses.includes(task.status)) {
+    _releaseTask(taskId, task.agentId);
   }
   const deleted = require('./taskJournal.cjs').deleteTask(taskId);
   logger.info('[Handoff] Removed', { taskId, deleted });
