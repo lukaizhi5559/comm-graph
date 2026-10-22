@@ -78,6 +78,12 @@ const INTENT_PATTERNS = [
       if (/\bthat\s+(thing|article|link|page|site|website|video|song|music|post|tweet|image|picture|photo|meme|file|email|message|recipe|document|tab|window)\b.{0,50}\b(i\s+)?(saw|had|looked|read|watched|opened|visited|saved|copied|sent|received|found)\b/i.test(text)) return true;
       // Time-qualified recall: a past-time marker + recall-ish verb/noun
       if (_EPISODIC_RE.test(text) && /\b(what|did|show|find|was|were|saw|looked|watched|read|played|listened|open|had|screen|activity|doing|working|listening|watching|worked|used|spent|summariz)\b/i.test(text)) return true;
+      // Month-qualified activity recall: "what did I do in October", "show my
+      // screen history from last October". Month names deliberately live here
+      // and not in shared EPISODIC_RE — as a command_automate guard they'd
+      // veto legitimate future actions ("schedule a meeting in November").
+      if (/\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(text)
+          && /\b(what|did|show|find|was|were|saw|looked|watched|read|played|listened|open|had|screen|activity|doing|working|history|captures?|visited|browsed|spent|summariz)\b/i.test(text)) return true;
       // "when did I last mention/say X" — recall questions phrased as
       // time-queries; also "when's the last time I said/told/mentioned"
       if (/\bwhen\s+did\s+i\s+(last\s+)?(mention|say|tell|ask|talk|discuss|bring\s+up|write|note)\b/i.test(text)) return true;
@@ -179,6 +185,10 @@ const INTENT_PATTERNS = [
       // File-path ops: mutation/read verb + a literal POSIX path —
       // "rename /tmp/a.txt to /tmp/b.txt" has no "file" noun but is a file op.
       if (/\b(rename|move|copy|delete|remove|create|write|append|edit|read|open|show|list|find|locate|cat|display|print)\b/i.test(text) && _FILE_PATH_RE.test(text)) return true;
+      // Git ops on local repos: "commit all the changes you did", "find each
+      // repo and commit", "stage my work" — side-effecting local dev work.
+      if (/\b(commit|stage|stash|push|pull|merge|rebase|checkout)\w*\b/i.test(text)
+          && /\b(repo|repository|repositories|changes?|work|branch|git)\b/i.test(text)) return true;
       // System controls: "turn off wifi", "toggle dark mode", "set volume to 50"
       if (/\b(turn|toggle|switch|enable|disable|activate|deactivate)\s+(on|off|up|down)?\s*(the\s+|my\s+)?(wi-?fi|bluetooth|volume|brightness|dark\s*mode|light\s*mode|do\s*not\s*disturb|dnd|airplane(\s*mode)?|night\s*shift|true\s*tone|hotspot|vpn|microphone|mic|camera|location|notifications?|flashlight|low\s*power\s*mode)\b/i.test(text)) return true;
       if (/\b(set|adjust|change|increase|decrease|raise|lower|turn\s+(up|down)|mute|unmute)\s+(the\s+|my\s+)?(volume|brightness|resolution|wallpaper|font\s*size|screen\s*time|keyboard|mouse|trackpad|display|backlight)\b/i.test(text)) return true;
@@ -207,6 +217,10 @@ const INTENT_PATTERNS = [
       // Public-release phrasing ("latest macOS version", "newest ipad") is a
       // web question about Apple's lineup, not this machine's state.
       if (_DEVICE_STATE_RE.test(text) && !/\b(latest|newest|upcoming|next[-\s]?gen)\b/i.test(text)) return true;
+      // In-page navigation on the live tab: "go back on this page",
+      // "go back to my ebay tab", "reload this page" — all act on the browser.
+      if (/\b(go\s+back|navigate\s+back|go\s+forward|reload|refresh)\s*(?:this|the|my|a|one|page|tab|to|for|me|on|previous|last)\b/i.test(text)
+          && !/\bto\s+(?:my\s+|the\s+)?(?!previous\b|last\b|prior\b|same\b|this\b|that\b|current\b|original\b)[\w-]+\s+(?:site|page)\b/i.test(text)) return true;
       // Browser automation keywords
       if (/\b(click|type\s+into|fill\s+(out|in)|submit|press\s+(the\s+)?(button|key|enter))\b/i.test(text)) return true;
       return false;

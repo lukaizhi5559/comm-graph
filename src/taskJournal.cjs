@@ -28,7 +28,11 @@ const _tasks = new Map();
 
 // Terminal states are one-way — a task that reaches one is never reactivated
 // by late-arriving updates from a cancelled/ lingering graph run.
-const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled']);
+// 'needs_plan' and 'plan_update' are terminal for the dispatched task — the
+// loop-back into planning continues the work under a plan, but this task
+// entry is finished. 'awaiting-approval'/'waiting-for-input'/'auth-required'
+// stay non-terminal (still active, waiting on the user).
+const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled', 'needs_plan', 'plan_update']);
 
 // ── Types (JSDoc) ──────────────────────────────────────────────────────────────
 /**
@@ -175,7 +179,8 @@ function updateTask(id, status, extra = {}) {
   }
   const updates = { status, ...extra };
   if (status === 'running' && !task.startedAt) updates.startedAt = Date.now();
-  if (status === 'done' || status === 'failed' || status === 'cancelled') {
+  if (status === 'done' || status === 'failed' || status === 'cancelled'
+      || status === 'needs_plan' || status === 'plan_update') {
     updates.doneAt = Date.now();
     updates.planFile = null; // terminal tasks must not retain reviewable-plan state
   }

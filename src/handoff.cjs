@@ -92,6 +92,8 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
         ? { deterministicPlan: planMeta.deterministicPlan } : {}),
       ...(planMeta && Array.isArray(planMeta.priorResults) && planMeta.priorResults.length
         ? { priorResults: planMeta.priorResults } : {}),
+      ...(planMeta && Array.isArray(planMeta.refs) && planMeta.refs.length
+        ? { refs: planMeta.refs } : {}),
     });
     const req = http.request({
       hostname: '127.0.0.1',
@@ -123,11 +125,11 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
  * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, capabilityReason = null, routeDecision = null }) {
+async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, refs = null, capabilityReason = null, routeDecision = null }) {
   // Plan-dispatched tasks carry the task's canonical agentId so the lock key
   // is the shared session (google_*.agent → google.agent), not prompt text.
   const agentId = pinnedAgentId || detectAgent(englishPrompt);
-  const planMeta = planId ? { planId, planTaskNum, planTask, preflightAuthBypass, deterministicPlan, priorResults } : null;
+  const planMeta = planId ? { planId, planTaskNum, planTask, preflightAuthBypass, deterministicPlan, priorResults, refs } : null;
 
   // Create task in journal
   const taskId = createTask({

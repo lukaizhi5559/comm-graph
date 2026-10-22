@@ -35,6 +35,7 @@ const skillIndex = require('../../../shared/skill-index.cjs');
 const serviceMap = require('../../../shared/service-map.cjs');
 const sysMap = require('../../../shared/system-map.cjs');
 const { PLAN_CONFIRM_RE, PLAN_RUN_RE, PLAN_RUN_NEG_RE } = require('../../../shared/plan-check-phrases.cjs');
+const { extractContextRefs, mergeRefs } = require('../../../shared/context-refs.cjs');
 
 // Tolerant LLM-JSON parse for step generation — repairs unfenced replies,
 // dangling commas, unterminated strings and truncated arrays (the last step
@@ -85,7 +86,7 @@ function _planFileName(planId) {
   return `${planId}.md`;
 }
 
-function _getOrCreateSession({ planId, sessionId, originalPrompt, conversationContext }) {
+function _getOrCreateSession({ planId, sessionId, originalPrompt, conversationContext, refs }) {
   if (planId && _planSessions.has(planId)) return _planSessions.get(planId);
 
   // Continue from disk when the UI names a plan we haven't seen this process.
@@ -120,6 +121,11 @@ function _getOrCreateSession({ planId, sessionId, originalPrompt, conversationCo
     history: [],        // [{role, content}]
     status: 'drafting',
     name: null,
+    // Context refs carried downstream to every task dispatch — the .md's
+    // frontmatter is the durable carrier so a restart re-reads them.
+    refs: Array.isArray(refs) && refs.length
+      ? refs
+      : extractContextRefs(`${originalPrompt || ''}\n${conversationContext || ''}`),
   };
   _planSessions.set(id, sess);
   if (sessionId) _sessionToPlan.set(sessionId, id);
@@ -152,6 +158,7 @@ function _loadPlanFromDisk(planId) {
       history: [],
       status: fm.status || 'drafting',
       name: fm.name || null,
+      refs: planFormat.parseRefs(content),
     };
     _planSessions.set(planId, sess);
     if (sess.sessionId) _sessionToPlan.set(sess.sessionId, planId);
@@ -196,6 +203,7 @@ function _refreshSessionFromDisk(sess) {
     }
     sess.tasks = fresh;
     sess.risks = _parseRisks(content);
+    sess.refs = planFormat.parseRefs(content);
     if (fm.status) sess.status = fm.status;
     if (fm.name) sess.name = fm.name;
     sess._diskMtime = stat.mtimeMs;
@@ -232,6 +240,7 @@ function _writePlanFile(sess) {
       originalPrompt: sess.originalPrompt,
       sessionId: sess.sessionId,
       tasks: sess.tasks,
+      refs: sess.refs,
     });
     if (sess.name) content = planFormat.setFrontmatterField(content, 'name', sess.name);
     if (sess.status && sess.status !== 'drafting') {
@@ -1840,8 +1849,25 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     sessionId,
     originalPrompt: englishText,
     conversationContext,
+    refs: planning.refs,
   });
   if (!sess.originalPrompt) sess.originalPrompt = englishText;
+
+  // Context refs — a dispatch-carried seed (planning.refs) or a mid-run
+  // discovery (planning.addRefs from a task.agent plan_update) merges into
+  // the session and persists to frontmatter on the next write.
+  const _incomingRefs = mergeRefs(planning.refs, planning.addRefs);
+  if (_incomingRefs.length) {
+    const merged = mergeRefs(sess.refs, _incomingRefs);
+    if (merged.length !== (sess.refs || []).length) {
+      sess.refs = merged;
+      sess._refsChanged = true; // persisted by the planChanged write below
+    }
+  }
+  // Escalated turns (needs_plan loop-back, task.agent plan_update) are
+  // machine-dispatched, not user phrasing — mark the session so the run
+  // auto-fires once steps generate instead of parking on the Run-all gate.
+  if (planning.escalated) sess._escalated = true;
 
   // ── Plan referent resolution ────────────────────────────────────────────────
   // "the nylas plan" — a DEFINITE reference to an existing plan. If it names a
@@ -2113,7 +2139,10 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
 
   // <plan_run/> — user confirmed execution. Only meaningful with tasks; the
   // run itself is triggered by main.js from metadata.runPlan below.
-  const runPlan = planRunSeen && sess.tasks.length > 0;
+  // Escalated turns (needs_plan loop-back / task.agent plan_update revisions)
+  // auto-run once the draft has tasks — the user already asked for the work;
+  // a second Run-all gate would just re-stall it.
+  const runPlan = (planRunSeen || sess._escalated === true) && sess.tasks.length > 0;
   if (runPlan && sess.status === 'drafting') {
     sess.status = 'ready';
     planChanged = true;
@@ -2148,8 +2177,9 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     }
   }
 
-  if (planChanged || sess._nameChanged || sess.status === 'drafting') {
+  if (planChanged || sess._nameChanged || sess._refsChanged || sess.status === 'drafting') {
     sess._nameChanged = false;
+    sess._refsChanged = false;
     _writePlanFile(sess);
   }
   // Background: generate execution steps for tasks that lack them — user can

@@ -214,8 +214,10 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
 
   await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
     const r = await classify('[Folder: /Users/x/Desktop/projects/thinkdrop]\n\nExamine the folder and find all uncommitted work explain the status for each repo see what work was done and then commit it and push to the proper repo under ThinkDrop project. Ok? Let me know if you have questions');
-    check('"status for each repo … commit it" → handoff, never status_check',
-      r.intent === 0 && r.intentName === 'handoff');
+    // Folder-anchored multi-entity work now routes to the planning lane —
+    // handoff remains acceptable; status_check is the bug this guards.
+    check('"status for each repo … commit it" → handoff/planning, never status_check',
+      (r.intent === 0 && r.intentName === 'handoff') || r.intentName === 'planning');
   });
 
   await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {

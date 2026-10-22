@@ -124,6 +124,49 @@ function _postJson(port, urlPath, payload, apiKey, timeoutMs) {
   });
 }
 
+// SSE variant of _postJson for /web.search stream:true — parses `data:`
+// lines, calls onEvent(ev) for progress events ({type:'engine'} chain
+// transitions, {type:'items'} partial result sets), resolves with the
+// {type:'done'} payload. 'answer' deltas are ignored — the express lane
+// synthesizes its own text from the overview/cards.
+function _postSse(port, urlPath, payload, apiKey, timeoutMs, onEvent) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const req = http.request({
+      hostname: '127.0.0.1', port, path: urlPath, method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      timeout: timeoutMs,
+    }, (res) => {
+      let buf = '';
+      res.on('data', (c) => {
+        buf += c;
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          for (const line of block.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            try {
+              const ev = JSON.parse(line.slice(5));
+              if (ev.type === 'done') { req.destroy(); resolve(ev.data); return; }
+              if (onEvent) onEvent(ev);
+            } catch (_) {}
+          }
+        }
+      });
+      res.on('end', () => resolve(null));
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
+
 // Scripture lookup fast path — bible-api.com (free, no key). Google's AI
 // Overview only returns verse fragments for full-chapter asks; the API
 // returns the complete passage deterministically in <1s. Returns the
@@ -265,26 +308,90 @@ async function execute(opts) {
     const mediaHint = VIDEO_HINT_RE.test(englishText) ? 'video'
       : IMAGE_HINT_RE.test(englishText) ? 'image' : null;
 
-    const serp = await _postJson(WEB_SEARCH_PORT, '/web.search', {
+    // stream:true when a chunk channel is available — SSE progress events
+    // (engine transitions, partial items) become sentinels so the renderer
+    // shows favicon chips + cards while the SERP is still extracting.
+    const onReplyChunk = typeof opts.onReplyChunk === 'function' ? opts.onReplyChunk : null;
+    const _reqBody = {
       version: 'mcp.v1', service: 'web-search', action: 'web.search',
       payload: {
         query,
         limit: mediaHint ? 8 : 5,
         ...(mediaHint ? { maxResults: 8, intent: mediaHint } : {}),
         ...(detectedLanguage && detectedLanguage !== 'en' ? { lang: detectedLanguage } : {}),
+        ...(onReplyChunk ? { stream: true } : {}),
       },
       requestId: 'cg_wsx_' + Date.now(),
       context: { userId: 'local_user' },
-    }, WS_API_KEY, SERP_TIMEOUT_MS);
+    };
+    const _onSerpEvent = (ev) => {
+      try {
+        if (ev.type === 'engine' && ev.engine) {
+          onReplyChunk('\x00SEARCHING\x00' + ev.engine);
+        } else if (ev.type === 'items') {
+          if (Array.isArray(ev.items) && ev.items.length) {
+            const items = ev.items.map(_toItem).filter(Boolean);
+            if (items.length) onReplyChunk('\x00ITEMS\x00' + JSON.stringify(items));
+          }
+          const srcs = Array.isArray(ev.sources) && ev.sources.length ? ev.sources
+            : (Array.isArray(ev.items) ? ev.items : [])
+              .filter(r => (r.url || r.link || '').startsWith('http'))
+              .map(r => {
+                const url = r.url || r.link;
+                return { url, hostname: r.displayDomain || _hostname(url), title: r.title || '' };
+              });
+          if (srcs.length) onReplyChunk('\x00SOURCES\x00' + JSON.stringify(srcs));
+        }
+      } catch (_) {}
+    };
+    let serp = onReplyChunk
+      ? await _postSse(WEB_SEARCH_PORT, '/web.search', _reqBody, WS_API_KEY, SERP_TIMEOUT_MS, _onSerpEvent)
+      : null;
+    if (!serp) {
+      serp = await _postJson(WEB_SEARCH_PORT, '/web.search', _reqBody, WS_API_KEY, SERP_TIMEOUT_MS);
+    }
 
     const data = serp?.data || serp;
     const results = Array.isArray(data?.results) ? data.results : [];
     const overview = typeof data?.aiOverview === 'string' ? data.aiOverview.trim() : '';
-    if (!results.length && overview.length < 40) {
+
+    // Whole free chain is down (Google → Bing → DDG all failed) — answer with
+    // the connect-an-API guidance verbatim. Do NOT abstain: the stategraph
+    // lane would re-hit the same dead chain and LLM-synthesize noise.
+    if (data?.searchUnavailable) {
+      logger.warn('[SearchExpress] all providers down — serving search-unavailable guidance', {
+        latencyMs: Date.now() - t0, queryPreview: query.substring(0, 60),
+      });
+      const text = typeof data.userMessage === 'string' && data.userMessage.trim()
+        ? data.userMessage.trim()
+        : "I couldn't reach any free web search providers right now. To search the web, connect a Web Search API (e.g. Brave Search API) in Settings.";
+      return {
+        text,
+        fullText: text,
+        metadata: {
+          source: 'search_express',
+          provider: 'web-search',
+          engine: typeof data?.provider === 'string' ? data.provider : undefined,
+          intent: 1,
+          guessedIntent: 'web_search',
+          searchUnavailable: true,
+          sources: [],
+          items: [],
+        },
+      };
+    }
+
+    // Renderable results only — a raw-text fallback or url-less row would
+    // produce a "Here's what I found" header with zero cards beneath it.
+    const renderable = results.filter(r =>
+      r.type !== 'raw-text' &&
+      ((r.url || r.link || '').startsWith('http') || r.thumbnail || r.imageUrl));
+    if (!renderable.length && overview.length < 40) {
       // Distinguish "service unreachable/timed out" (serp null) from "service
       // answered but empty" — both abstain, but they mean very different things.
       logger.warn('[SearchExpress] abstained', {
-        reason: serp ? 'no-results' : 'serp-unreachable-or-timeout',
+        reason: serp ? 'no-renderable-results' : 'serp-unreachable-or-timeout',
+        resultTypes: results.map(r => r.type || '?').join(','),
         latencyMs: Date.now() - t0, queryPreview: query.substring(0, 60),
       });
       return null;
@@ -294,7 +401,7 @@ async function execute(opts) {
     // pills. displayDomain (from the SERP cite row) gives the real host even
     // when r.url is a wrapped google.com/goto link.
     const seenHosts = new Set();
-    const sources = results
+    const sources = renderable
       .filter(r => (r.url || r.link || '').startsWith('http'))
       .map(r => {
         const url = r.url || r.link;
@@ -306,7 +413,7 @@ async function execute(opts) {
       })
       .filter(s => s.hostname && !seenHosts.has(s.hostname) && seenHosts.add(s.hostname))
       .slice(0, 10);
-    const items = results.map(_toItem).filter(Boolean).slice(0, 24);
+    const items = renderable.map(_toItem).filter(Boolean).slice(0, 24);
 
     let text;
     if (overview.length > 40) {

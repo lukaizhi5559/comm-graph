@@ -23,6 +23,7 @@ const path = require('path');
 const logger = require('./logger.cjs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE, isContextDependent } = require('../../shared/text-patterns.cjs');
+const { isLocalMultiEntityTask } = require('../../shared/context-refs.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
@@ -195,8 +196,14 @@ function _complexityPlanningScore(text) {
   // deliverables under one verb). Single-service prompts stay handoff no
   // matter how long or sequenced they are — the stategraph's decomposePromptV2
   // already handles in-app multi-step; prompt length is not a routing signal.
-  const multiDeliverable = services.size >= 2;
-  return { score: multiDeliverable ? 1 : 0, services: services.size, actions: actions.size, sequenced, words };
+  // Local multi-entity work — a file/folder anchor + per-entity iteration +
+  // a side-effecting verb is plan-shaped even when zero external services are
+  // named ("scan this folder and commit each repo"). Without this the prompt
+  // falls to a bare handoff and grills instead of drafting a plan. Detector
+  // lives in shared/context-refs.cjs (stategraph's needs_plan gate shares it).
+  const localMultiEntity = isLocalMultiEntityTask(scrubbed);
+  const multiDeliverable = services.size >= 2 || localMultiEntity;
+  return { score: multiDeliverable ? 1 : 0, services: services.size, actions: actions.size, sequenced, words, localMultiEntity };
 }
 
 async function classify(englishText, conversationContext, opts = {}) {

@@ -176,7 +176,9 @@ function _postJson(port, urlPath, payload, apiKey, timeoutMs) {
 
 // SSE variant of _postJson for /web.search stream:true — parses
 // `data: {...}` lines, forwards {type:'answer'} deltas to onChunk, resolves
-// with the {type:'done'} payload.
+// with the {type:'done'} payload. {type:'engine'}/{type:'items'} progress
+// events become SEARCHING/ITEMS/SOURCES sentinels so the renderer shows
+// favicon chips + cards while the SERP fetch is still running.
 function _postSse(port, urlPath, payload, apiKey, timeoutMs, onChunk) {
   return new Promise((resolve) => {
     const body = JSON.stringify(payload);
@@ -201,6 +203,11 @@ function _postSse(port, urlPath, payload, apiKey, timeoutMs, onChunk) {
             try {
               const ev = JSON.parse(line.slice(5));
               if (ev.type === 'answer' && ev.text && onChunk) onChunk(ev.text);
+              else if (ev.type === 'engine' && ev.engine && onChunk) onChunk('\x00SEARCHING\x00' + ev.engine);
+              else if (ev.type === 'items' && onChunk) {
+                if (Array.isArray(ev.items) && ev.items.length) onChunk('\x00ITEMS\x00' + JSON.stringify(ev.items));
+                if (Array.isArray(ev.sources) && ev.sources.length) onChunk('\x00SOURCES\x00' + JSON.stringify(ev.sources));
+              }
               else if (ev.type === 'done') { req.destroy(); resolve(ev.data); return; }
             } catch (_) {}
           }
@@ -235,6 +242,10 @@ async function _serpAnswer(query, lang, onChunk = null) {
   // Real serving engine (google-serp/bing-copilot/bing-serp/…). Surfaced as
   // the transparency chip on the reply card — not the MCP service name.
   const engine = typeof data?.provider === 'string' ? data.provider : null;
+  // Whole free chain down — serve the connect-an-API guidance verbatim.
+  if (data?.searchUnavailable && typeof data?.userMessage === 'string' && data.userMessage.trim()) {
+    return { answer: data.userMessage.trim(), sources: [], engine };
+  }
   const overview = typeof data?.aiOverview === 'string' ? data.aiOverview.trim() : '';
   if (overview.length > 40) {
     const sources = (data?.results || [])
@@ -275,6 +286,11 @@ async function execute(englishText, systemPrompt, conversationContext, opts = {}
         ? opts.originalPrompt : englishText;
       const _searchQuery = await standaloneSearchQuery(_rawQuery, conversationContext, opts.routeDecision);
       try {
+        // Loading chip while the SERP fetch runs — replaced by the real
+        // engine chip when \x00ENGINE\x00 lands.
+        if (_searchQuery !== null && typeof opts.onReplyChunk === 'function') {
+          try { opts.onReplyChunk('\x00SEARCHING\x00google-serp'); } catch (_) {}
+        }
         const serp = _searchQuery === null ? null : await _serpAnswer(_searchQuery, opts.detectedLanguage, opts.onReplyChunk);
         if (serp?.answer) {
           logger.info('[GeneralQuick] serp_overview — skipping LLM', {

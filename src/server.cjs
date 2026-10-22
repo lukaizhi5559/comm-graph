@@ -62,6 +62,20 @@ const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT 
 // Fire-and-forget POST of each user prompt to personality-service so the
 // Thought/Trigger engine can accumulate prompt-derived thoughts.
 const PERSONALITY_PORT = parseInt(process.env.PERSONALITY_SERVICE_PORT || '3012', 10);
+const MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
+
+// Fire-and-forget POST to a main-process endpoint (plan triggers, events).
+function _postMain(path, payload) {
+  try {
+    fetch(`http://127.0.0.1:${MAIN_PORT}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => {});
+  } catch (_) {}
+}
+
 function _notifyThoughtEngine(type, info) {
   try {
     const body = JSON.stringify({
@@ -599,9 +613,26 @@ function _fetchConversationHistory(userText, pinnedSessionId = null) {
 // Mirrors the stategraph's logConversation.js pattern. Only called for quick
 // intents (general_quick, memory_quick, memory_store) — handoff intents are
 // logged by the stategraph's logConversation node.
-function _logConversationTurn(userText, assistantText, intentName, preRoutedSessionId) {
+function _logConversationTurn(userText, assistantText, intentName, preRoutedSessionId, searchMeta) {
   if (!CONV_API_KEY) return; // no key — skip silently
   const ts = new Date().toISOString();
+  // Search answers carry display metadata — persist it so the feed can
+  // rehydrate cards/pills/engine on reload (same job the stategraph's task
+  // journal does for handoff answers). data: URI thumbs are 5-10KB each and
+  // can't be refetched — strip them; keep http thumbs + all link fields.
+  const _searchMd = (() => {
+    if (!searchMeta) return {};
+    const items = (searchMeta.items || []).map(i => ({
+      ...i,
+      ...(typeof i.thumbnail === 'string' && i.thumbnail.startsWith('data:') ? { thumbnail: undefined } : {}),
+      ...(typeof i.imageUrl === 'string' && i.imageUrl.startsWith('data:') ? { imageUrl: undefined } : {}),
+    }));
+    return {
+      ...(items.length ? { items } : {}),
+      ...(searchMeta.sources?.length ? { sources: searchMeta.sources } : {}),
+      ...(typeof searchMeta.engine === 'string' && searchMeta.engine ? { engine: searchMeta.engine } : {}),
+    };
+  })();
   const _post = (action, payload) => {
     const body = JSON.stringify({
       version: 'mcp.v1', service: 'conversation', action, payload,
@@ -623,7 +654,7 @@ function _logConversationTurn(userText, assistantText, intentName, preRoutedSess
   if (preRoutedSessionId) {
     _post('message.add', { sessionId: preRoutedSessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
     if (assistantText) {
-      _post('message.add', { sessionId: preRoutedSessionId, text: assistantText, sender: 'assistant', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+      _post('message.add', { sessionId: preRoutedSessionId, text: assistantText, sender: 'assistant', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts, ..._searchMd } });
     }
     return;
   }
@@ -648,7 +679,7 @@ function _logConversationTurn(userText, assistantText, intentName, preRoutedSess
         if (!sessionId) return;
         _post('message.add', { sessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
         if (assistantText) {
-          _post('message.add', { sessionId, text: assistantText, sender: 'assistant', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+          _post('message.add', { sessionId, text: assistantText, sender: 'assistant', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts, ..._searchMd } });
         }
       } catch (_) {}
     });
@@ -850,8 +881,11 @@ async function processMessage(args) {
             openPlan: (_openPlan?.awaitingInput && _openPlan?.boundToSession) ? _openPlan : null,
             hasAttachment: /\[File:|\[Folder:/i.test(englishText),
           })) {
+        // Loading chip — SERP fetch takes 1-3s; show the user which engine is
+        // being tried until the real \x00ENGINE\x00 sentinel lands.
+        try { if (typeof onReplyChunk === 'function') onReplyChunk('\x00SEARCHING\x00google-serp'); } catch (_) {}
         const _er = await webSearchExpress.execute({
-          englishText, originalText, detectedLanguage, context,
+          englishText, originalText, detectedLanguage, context, onReplyChunk,
         });
         if (_er) {
           logger.info('[Process] Search express answered — skipping classify + handoff', {
@@ -870,7 +904,7 @@ async function processMessage(args) {
             try { _fx = await fromEnglish(_fx, detectedLanguage); } catch (_) {}
           }
           _addTurn(englishText, _fx, 1);
-          _logConversationTurn(englishText, _fx, 'search_express', routedSessionId);
+          _logConversationTurn(englishText, _fx, 'search_express', routedSessionId, _er.metadata);
           return {
             text: _fx,
             fullText: _fx,
@@ -1277,6 +1311,18 @@ async function processMessage(args) {
         result.metadata.movedToPlanning = true;
         result.metadata.planningReason = classifySource; // planning_phrase_guard | complexity_guard | force_prompt
       }
+      // Plan lifecycle → thought engine — draft-ready / running / blocked
+      // states feed continue_plan thoughts so the Brain can nudge a stalled
+      // plan without the user re-prompting.
+      if (result?.metadata?.planId) {
+        const _pmd = result.metadata;
+        _notifyThoughtEngine('plan', {
+          planId: _pmd.planId, taskNum: null,
+          status: _pmd.planStatus || (_pmd.taskCount ? 'draft' : 'empty'),
+          prompt: String(_pmd.planTitle || englishText || '').slice(0, 200),
+          taskCount: _pmd.taskCount || 0,
+        });
+      }
       break;
     }
 
@@ -1395,7 +1441,7 @@ async function processMessage(args) {
   _addTurn(englishText, finalText, intent);
   // Log to conversation-service for quick intents (handoff is logged by stategraph)
   if (intent === 1 || intent === 2 || intent === 5 || intent === 6) {
-    _logConversationTurn(englishText, finalText, intentName, routedSessionId);
+    _logConversationTurn(englishText, finalText, intentName, routedSessionId, result?.metadata);
   }
 
   const latencyMs = Date.now() - startTime;
@@ -1529,6 +1575,9 @@ const server = http.createServer(async (req, res) => {
         // Upstream task results — seeded into the child run so cross-task
         // {{synthesisAnswer}}/prior-output refs resolve to real data.
         priorResults: Array.isArray(body.priorResults) ? body.priorResults : null,
+        // Context refs — plan frontmatter refs + the plan file itself +
+        // per-task refs, carried through to task.agent.
+        refs: Array.isArray(body.refs) ? body.refs : null,
         // Plan-runner pins the canonical agent — lock key = shared session.
         agentId: body.agentId || null,
       });
@@ -1555,6 +1604,53 @@ const server = http.createServer(async (req, res) => {
     }
     if (body.sessionId) _lastSessionId = body.sessionId;
     handoffComplete(body.taskId, body.agentId, body.status || 'done', body.result, body.items, body.sessionId || null, body.planFile || null, body.trace || null, body.artifacts || null);
+    // Plan lifecycle → thought engine: a plan-bound task reaching a terminal
+    // or blocked status is a signal the Brain may act on (continue_plan).
+    {
+      const _pt = taskJournal.getTask(body.taskId);
+      if (_pt?.planMeta?.planId) {
+        _notifyThoughtEngine('plan', {
+          planId: _pt.planMeta.planId, taskNum: _pt.planMeta.planTaskNum || null,
+          status: body.status || 'done',
+          prompt: String(_pt.prompt || '').slice(0, 200),
+        });
+      }
+    }
+    // ── Loop-back escalations — a task decided mid-run it needs planning ──
+    // 'needs_plan': stategraph escalated a non-plan task (local multi-entity
+    //   sweep, grill not converging) → draft a FRESH plan from the seed.
+    // 'plan_update': a task.agent inside a plan run pushed a discovery back —
+    //   revise the SAME plan file with the proposal, then auto-resume.
+    if (body.status === 'needs_plan' || body.status === 'plan_update') {
+      const _lbTask = taskJournal.getTask(body.taskId);
+      let _lb = {};
+      try { _lb = JSON.parse(body.result || '{}'); } catch (_) {}
+      const _lbPlanId = _lbTask?.planMeta?.planId || _lb.planId || null;
+      const _isRevise = body.status === 'plan_update' && !!_lbPlanId;
+      const _lbText = _isRevise
+        ? `[Execution feedback — revise THIS plan in place]\nReason: ${_lb.reason || 'unspecified'}\nProposed change: ${_lb.proposal || 'see reason'}\n${_lb.gatheredContext?.length ? `Known: ${JSON.stringify(_lb.gatheredContext).slice(0, 600)}` : ''}`
+        : (_lb.seedPrompt || _lbTask?.prompt || '');
+      const _lbSession = body.sessionId || _lbTask?.sessionId || _lastSessionId || null;
+      logger.info(`[Server] Loop-back ${body.status} → planning lane`, {
+        taskId: body.taskId, planId: _lbPlanId, revise: _isRevise,
+        reason: _lb.reason || null,
+      });
+      planningNode.execute({
+        englishText: _lbText,
+        sessionId: _lbSession,
+        planning: _isRevise
+          ? { active: true, planId: _lbPlanId, revise: true, escalated: true, addRefs: _lb.addRefs }
+          : { active: true, escalated: true, forceNewPlan: true, refs: _lb.refs },
+      }).then((lbResult) => {
+        // Escalated plans auto-run: when the turn left a task list, post the
+        // run trigger — main's plan-check fires autoStart and starts the plan
+        // once every checklist item clears (auth/Approval gates still hold).
+        const md = lbResult?.metadata || {};
+        if (md.runPlan && md.planFile) {
+          _postMain('/plan.run', { planId: md.planId, planFile: md.planFile, escalated: true });
+        }
+      }).catch(err => logger.warn('[Server] Loop-back planning failed', { error: err?.message }));
+    }
     // Feed the completed task's RESULT back into conversation history. The
     // reply the user saw was only a handoff phrase ("one sec while I search"),
     // so follow-ups like "how long in office" have no real answer to reason
