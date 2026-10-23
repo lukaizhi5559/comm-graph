@@ -415,10 +415,34 @@ async function classify(englishText, conversationContext, opts = {}) {
     return _vetoQuick({ ...keywordHit, source: 'keyword_fallback' });
   };
 
-  // ── Try force-prompt classification (primary) ────────────────────────────────
+  // ── Local decision-model path ──────────────────────────────────────────────
+  // phi4 decision.answer replaces the remote force-prompt: one local forward
+  // pass (~50–300ms) vs 1.6–12.5s remote with pathological tails. Options are
+  // indexed to match INTENTS keys 0..6, so answers.intent.index IS the intent.
+  // DECISION_LOCAL=0 disables; DECISION_SHADOW=1 runs both, logs agreement,
+  // returns remote (see decision.cjs).
+  const decision = require('./decision.cjs');
+  const _localIntent = async () => {
+    const options = Object.entries(INTENTS).map(([n, i]) => `${i.name} — ${i.description}`);
+    const state = [
+      conversationContext ? `Conversation context (last 3 turns):\n${conversationContext}` : '',
+      openPlan ? `Open plan: "${openPlan.title}" is paused — ${openPlan.pendingCount} of ${openPlan.totalTasks} tasks still undone (${(openPlan.taskTitles || []).join('; ')}). If this message continues that plan or asks about it, pick planning.` : '',
+      `Current message: ${englishText}`,
+    ].filter(Boolean).join('\n');
+    const r = await decision.askDecision([{
+      id: 'intent', type: 'choice',
+      question: 'Which intent best classifies the user\'s current message?',
+      options,
+    }], { state });
+    const idx = r?.answers?.intent?.index;
+    return (idx != null && INTENTS[idx]) ? idx : null;
+  };
+
+  // ── Remote force-prompt classification (fallback / shadow-remote) ──────────
   // One retry on unparseable responses — a flaky provider echoing the system
   // prompt back is transient; the backend rotates providers between calls.
   const messages = _buildClassifyMessages(englishText, conversationContext, opts.openPlan);
+  const _remoteClassify = async () => {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const { text, provider } = await ask(messages, {
@@ -508,6 +532,34 @@ async function classify(englishText, conversationContext, opts = {}) {
   // directly).
   logger.info('[Classify] LLM failed — defaulting to handoff (safe)');
   return { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'default_handoff' };
+  }; // end _remoteClassify
+
+  // Local-first: authoritative when enabled and not in shadow mode.
+  if (decision.decisionEnabled() && !decision.shadowMode()) {
+    try {
+      const li = await _localIntent();
+      if (li != null) {
+        if (li === 0 && keywordHit) return _adoptKeyword('veto_llm_handoff');
+        const info = INTENTS[li];
+        logger.info('[Classify] Local decision result', {
+          intent: li, intentName: info.name,
+          inputPreview: englishText.substring(0, 60),
+        });
+        return _vetoQuick({ intent: li, intentName: info.name, confidence: 0.9, source: 'decision_local' });
+      }
+      logger.debug('[Classify] Local decision unavailable — falling back to remote');
+    } catch (e) {
+      logger.warn(`[Classify] Local decision error — falling back to remote: ${e.message}`);
+    }
+    return _remoteClassify();
+  }
+
+  // Shadow mode: run local alongside remote, log agreement, remote wins.
+  if (decision.decisionEnabled() && decision.shadowMode()) {
+    return decision.shadowCompare('classify.intent', _localIntent, _remoteClassify);
+  }
+
+  return _remoteClassify();
 }
 
 module.exports = { classify, INTENTS, GRAPH_ONLY_INTENTS, _complexityPlanningScore };

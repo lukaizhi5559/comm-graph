@@ -352,16 +352,32 @@ function _pickStepgenAppendix(task) {
   return null;
 }
 
+/** Names of installed MCP servers — mcp.agent steps may target ONLY these. */
+function _installedMcpServerNames() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(
+      path.join(os.homedir(), '.thinkdrop', 'mcp-servers.json'), 'utf8'));
+    return Object.keys(cfg.mcpServers || cfg || {});
+  } catch (_) { return []; }
+}
+
 function _stepgenSystemPrompt(task) {
   const core = _loadSgPrompt('plan-skills-core.md');
   if (!core) return _STEPGEN_FALLBACK;
   const appendixName = _pickStepgenAppendix(task);
   const appendix = appendixName ? _loadSgPrompt(appendixName) : null;
+  const mcpNames = _installedMcpServerNames();
+  const mcpRule =
+    `## MCP constraint\nInstalled MCP servers: ${mcpNames.length ? mcpNames.join(', ') : 'NONE'}. ` +
+    'A `mcp.agent` step may ONLY target one of these exact server names — ' +
+    'never invent a server (there is no "filesystem" server unless listed). ' +
+    'Local file work uses fs.read / doc.read / shell.run / edit.agent.';
   return [
     "You are ThinkDrop's execution planner. Convert ONE task into a concrete step list for the skill runtime.",
     core,
     appendix || '',
     '## Task scope\nYou are planning ONE task from a larger approved plan — emit ONLY the steps this task needs (the surrounding plan handles ordering and dependencies).',
+    mcpRule,
     '## Output contract\nReply with ONLY a fenced json block — an array of steps, each {"skill": "...", "args": {...}, "description": "..."}. Every step taking an agentId arg carries the exact TASK AGENTS value — never invent another agent id. synthesize is always last. No commentary — ONLY the json fence.',
   ].filter(Boolean).join('\n\n');
 }

@@ -137,6 +137,7 @@ async function classifyRoute(userMessage, conversationHistory) {
       logger,
       null, // priorScreenSummary — not gathered at ingress; screen follow-ups default to handoff anyway
       null, // activeAppContext — stategraph gathers its own live context
+      { askDecision: require('./decision.cjs').askDecision }, // local typed-decision path (DECISION_LOCAL=0 disables)
     );
     if (!tc || typeof tc !== 'object' || !tc.taskType) return null;
     const lane = deriveLane(tc);
