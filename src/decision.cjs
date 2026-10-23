@@ -58,7 +58,10 @@ async function askDecision(questions, opts = {}) {
           ...(opts.image ? { image: opts.image } : {}),
         },
       }),
-      signal: AbortSignal.timeout(opts.timeoutMs || DEFAULT_TIMEOUT_MS),
+      // Batch-scaled — flat 2s ceiling timed out multi-question batches
+      // (e.g. classifyTask's ~23 questions) before the model could answer.
+      signal: AbortSignal.timeout(opts.timeoutMs
+        || (process.env.DECISION_TIMEOUT_MS ? DEFAULT_TIMEOUT_MS : Math.min(1200 + 250 * (Array.isArray(questions) ? questions.length : 1), 12000))),
     });
     const body = await res.json().catch(() => null);
     if (!body || body.status !== 'ok' || !body.data?.answers) return null;
