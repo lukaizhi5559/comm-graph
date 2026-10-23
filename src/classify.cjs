@@ -27,9 +27,9 @@ const { isLocalMultiEntityTask } = require('../../shared/context-refs.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
-  0: { name: 'handoff',           description: 'Anything needing tools, web search, browser automation, computer actions, deep memory retrieval, scheduling, file operations, or multi-step tasks' },
+  0: { name: 'handoff',           description: 'Anything needing tools, web search, browser automation, computer actions, deep memory retrieval, scheduling, file operations, or multi-step tasks — including opening, checking, or using a named app or website ("check my gmail", "open chatgpt", "go to youtube")' },
   1: { name: 'general_quick',    description: 'Chitchat, greetings, opinions, simple knowledge questions the LLM can answer directly without tools' },
-  2: { name: 'memory_quick',      description: 'Quick personal fact recall — name, favorite color, email, job, age. Also handles explicit profile fact storage ("my name is X"). NOT deep temporal history or complex queries' },
+  2: { name: 'memory_quick',      description: 'Quick personal PROFILE fact recall — name, favorite color, email address, job, age. Also handles explicit profile fact storage ("my name is X"). NOT for named web services or apps ("check my gmail" is handoff) and NOT deep temporal history or complex queries' },
   3: { name: 'status_check',      description: 'Asking about the status/progress of a running or recently completed task' },
   // pause/resume are intentionally absent — those signals are unimplemented
   // (main.js aborts on 'cancel' only); advertising them here routes utterances
