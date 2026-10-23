@@ -150,6 +150,10 @@ function _resumeNotify(nextTaskId) {
 function _releaseTask(taskId, agentIdHint) {
   const task = getTask(taskId);
   const keys = new Set();
+  // The interactive lane is always worth a release attempt — release()
+  // no-ops for non-holders, and a journal-miss/null-agent task can ONLY be
+  // holding __run__ anyway (unagented work takes no agent lock).
+  keys.add(RUN_LOCK_KEY);
   if (task && task.lockKey) keys.add(task.lockKey);
   else if (task) keys.add(_lockKeyFor(task.source, task.planMeta && task.planMeta.planTask, task.agentId));
   else if (agentIdHint) keys.add(agentIdHint); // journal miss — caller's hint
@@ -261,12 +265,20 @@ function complete(taskId, agentId, status, result, items, sessionId = null, plan
  */
 function remove(taskId) {
   const task = getTask(taskId);
-  if (!task) return false;
-  // If the task is active or parked, release its locks — _resumeNotify skips
-  // a next task that was cancelled while parked (e.g. plan cancel hits every
-  // dispatched taskId — a release mid-loop must not spawn them).
-  const activeStatuses = ['queued', 'running', 'waiting-for-agent', 'awaiting-approval', 'waiting-for-input'];
-  if (activeStatuses.includes(task.status)) {
+  if (!task) {
+    // Journal entry already gone — the run lane may still name it holder
+    // (e.g. a delete that skipped release). Safe: no-ops for non-holders.
+    const nextTaskId = release(RUN_LOCK_KEY, taskId);
+    if (nextTaskId) _resumeNotify(nextTaskId);
+    return false;
+  }
+  // Release unless the task is terminal-and-already-released (done/failed —
+  // complete() runs _releaseTask). 'cancelled' MUST release: /comms.cancel
+  // marks status before remove() runs, so gating on active-only leaked the
+  // run lane — every later task parked forever behind the dead holder.
+  // _resumeNotify still skips a cancelled next-task, so releasing here can't
+  // spawn siblings during a plan cancel.
+  if (task.status !== 'done' && task.status !== 'failed') {
     _releaseTask(taskId, task.agentId);
   }
   const deleted = require('./taskJournal.cjs').deleteTask(taskId);

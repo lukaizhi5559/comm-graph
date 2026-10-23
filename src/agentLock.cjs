@@ -18,7 +18,7 @@
  */
 
 const logger = require('./logger.cjs');
-const { updateTask } = require('./taskJournal.cjs');
+const { updateTask, getTask } = require('./taskJournal.cjs');
 
 const LOCK_TTL_MS = parseInt(process.env.AGENT_LOCK_TTL_MS || '600000', 10); // 10 min default
 
@@ -182,8 +182,20 @@ function _resumeNext(agentId) {
     return null;
   }
 
-  const nextTaskId = queue.shift();
+  // Skip dead waiters — a task cancelled while parked (plan cancel hits every
+  // sibling) must never become holder: nothing would ever release it again.
+  let nextTaskId = null;
+  while (queue.length) {
+    const cand = queue.shift();
+    const status = getTask(cand)?.status;
+    if (status && status !== 'cancelled' && status !== 'failed' && status !== 'done') {
+      nextTaskId = cand;
+      break;
+    }
+    logger.info('[AgentLock] Skipping dead waiter', { agentId, taskId: cand, status });
+  }
   if (queue.length === 0) _waiting.delete(agentId);
+  if (!nextTaskId) return null;
 
   // Acquire the lock for the resumed task
   _locks.set(agentId, {

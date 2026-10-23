@@ -77,5 +77,27 @@ tryAcquire(RUN_LOCK_KEY, t5); // parked
 ok(release(RUN_LOCK_KEY, t5) === null, 'non-holder release dequeues t5 without resuming');
 ok(release(RUN_LOCK_KEY, t4) === null, 'holder release resumes nothing (t5 dequeued)');
 
+// ── 5. Cancelled waiters are skipped, never become holder ───────────────────
+// Regression: /comms.cancel marks 'cancelled' then remove()s; a parked-then-
+// cancelled task that reached the head of the queue would hold the lane dead.
+const t6 = journal.createTask({ prompt: 'sixth', intent: 'handoff', source: 'text' });
+const t7 = journal.createTask({ prompt: 'seventh', intent: 'handoff', source: 'text' });
+const t8 = journal.createTask({ prompt: 'eighth', intent: 'handoff', source: 'text' });
+tryAcquire(RUN_LOCK_KEY, t6);
+tryAcquire(RUN_LOCK_KEY, t7); // parked
+tryAcquire(RUN_LOCK_KEY, t8); // parked
+journal.updateTask(t7, 'cancelled', { error: 'cancelled by user' }); // parked-then-cancelled
+ok(release(RUN_LOCK_KEY, t6) === t8, 'release skips cancelled waiter, resumes t8');
+ok(isLocked(RUN_LOCK_KEY) === true, 'lane held by live task t8');
+ok(release(RUN_LOCK_KEY, t8) === null, 'lane drains after t8');
+
+// ── 6. Missing journal entries are skipped too ──────────────────────────────
+const t9 = journal.createTask({ prompt: 'ninth', intent: 'handoff', source: 'text' });
+const t10 = journal.createTask({ prompt: 'tenth', intent: 'handoff', source: 'text' });
+tryAcquire(RUN_LOCK_KEY, t9);
+tryAcquire(RUN_LOCK_KEY, t10); // parked
+require('../src/taskJournal.cjs').deleteTask(t10); // deleted while parked
+ok(release(RUN_LOCK_KEY, t9) === null, 'deleted waiter skipped, lane drains');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

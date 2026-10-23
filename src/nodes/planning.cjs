@@ -34,6 +34,7 @@ const { canonicalAgent } = require('../../../shared/agent-canonical.cjs');
 const skillIndex = require('../../../shared/skill-index.cjs');
 const serviceMap = require('../../../shared/service-map.cjs');
 const sysMap = require('../../../shared/system-map.cjs');
+const capIndex = require('../../../shared/capability-index.cjs');
 const { PLAN_CONFIRM_RE, PLAN_RUN_RE, PLAN_RUN_NEG_RE } = require('../../../shared/plan-check-phrases.cjs');
 const { extractContextRefs, mergeRefs } = require('../../../shared/context-refs.cjs');
 
@@ -1171,10 +1172,16 @@ async function _runTools(text, sessionId, opts = {}) {
       }
     }
     else if (call.tool === 'capability.probe') {
-      // Read-only probe runs VISIBLY in the diagnosis pane — same command the
-      // user could run, with the pane watching exit status.
-      const r = await _ptyDiagnose(call.query);
-      out = _ptyCmdText(r) || await _toolCapabilityProbe(call.query);
+      // Read-only probe runs VISIBLY in the diagnosis pane — but the pane
+      // executes through a real shell, so the raw string must pass the same
+      // verb/metachar gate as the spawn path before it can run.
+      const gate = capIndex.validateProbeCommand(call.query);
+      if (!gate.ok) {
+        out = `PROBE DENIED (${gate.denied}) — capability.probe only runs "<cli-tool> <read-only verb>" (help/status/list/version/auth status…). Reissue with an allowed verb.`;
+      } else {
+        const r = await _ptyDiagnose(call.query);
+        out = _ptyCmdText(r) || await _toolCapabilityProbe(call.query);
+      }
     }
     else if (call.tool === 'plan.find') {
       await _ptyNote(`searching saved plans for "${call.query}"…`);
@@ -1295,6 +1302,11 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             call this ONCE to register it as a
                                             draft agent. It returns the agentId
                                             to put in the task's Agents line.
+                                            ONLY call this for an option the user
+                                            explicitly picked from a <choices>
+                                            card — never on your own initiative,
+                                            and never for a need a LOCAL LANE or
+                                            registered agent already covers.
                                             Setup still happens at plan-check —
                                             this only files the intent. It does
                                             NOT create the task — the task does
@@ -1384,6 +1396,22 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             a region grep located).
 Use at most 3 tool calls per turn, then answer. Tool results come back inside
 <tool_results>. Do NOT use tools for things you already know.
+
+VISIBILITY — every tool call you emit appears on the user's live activity
+line; the user can see exactly what you are doing. NEVER narrate work in
+progress — no "I'm looking into that", "I'm running this", "checking that
+folder", "one moment while I…". Emit the tool call; the ticker shows it.
+Your words should carry only conclusions, questions, or plan changes. If a
+tool fails or returns nothing useful, say that plainly — never imply a
+check ran when it didn't.
+
+LOCAL LANES — reading, writing, moving, searching, or converting files on
+THIS computer is NEVER a capability gap. shell, fs.read, doc.read,
+edit.agent, shell.run, cli.agent already cover it — put them in the Agents
+line directly. Never capability.search/select and never pin an MCP server
+or external CLI just to touch the user's own files, folders, clipboard, or
+screen. capability.search is for EXTERNAL services only (APIs, SaaS tools,
+web services, device control).
 
 CLARIFY — when the request is ambiguous, underspecified, or risky, ask ONE
 question at a time (important for voice). Good questions resolve: target
@@ -2451,6 +2479,10 @@ function releaseSession(sessionId) {
 function retrySteps(planId, taskNum) {
   const sess = getPlanSession(planId);
   if (!sess) return { ok: false, error: 'no planning session for ' + planId };
+  // Pick up on-disk edits first (agent swaps via the readiness card clear
+  // steps+stepsStatus in the file) — otherwise regen runs against stale
+  // session agents.
+  _refreshSessionFromDisk(sess);
   const task = (sess.tasks || []).find(t => t.num === taskNum);
   if (!task) return { ok: false, error: 'no task ' + taskNum };
   try {
