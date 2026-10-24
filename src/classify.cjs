@@ -212,6 +212,11 @@ async function classify(englishText, conversationContext, opts = {}) {
   }
   const hasSelectionContext = !!opts.hasSelectionContext;
   const openPlan = opts.openPlan || null;
+  // Bound tabs fetched in parallel with the guards — the local intent model
+  // can't see open pages otherwise and demotes page actions to quick lanes
+  // (observed: "click the first result" with a bound tab → local=general_quick
+  // vs remote=handoff). ~5ms localhost; awaited lazily inside _localIntent.
+  const _extSessP = require('./route-decision.cjs').fetchExtSessions().catch(() => []);
 
   // Explicit planning request — deterministic, runs before every other guard.
   // ("plan" inside a bigger automation prompt like "follow this plan" is NOT
@@ -424,8 +429,13 @@ async function classify(englishText, conversationContext, opts = {}) {
   const decision = require('./decision.cjs');
   const _localIntent = async () => {
     const options = Object.entries(INTENTS).map(([n, i]) => `${i.name} — ${i.description}`);
+    const _extSess = await _extSessP;
+    const _boundHosts = (_extSess || [])
+      .map(s => { try { return new URL(s.url).hostname.replace(/^www\./, ''); } catch (_) { return null; } })
+      .filter(Boolean);
     const state = [
       conversationContext ? `Conversation context (last 3 turns):\n${conversationContext}` : '',
+      _boundHosts.length ? `The user's browser has these pages open and bound to automation: ${_boundHosts.join(', ')} — any prompt that acts on, searches within, or continues from one of those open pages is intent 0 (handoff), NEVER a quick answer lane.` : '',
       openPlan ? `Open plan: "${openPlan.title}" is paused — ${openPlan.pendingCount} of ${openPlan.totalTasks} tasks still undone (${(openPlan.taskTitles || []).join('; ')}). If this message continues that plan or asks about it, pick planning.` : '',
       `Current message: ${englishText}`,
     ].filter(Boolean).join('\n');
