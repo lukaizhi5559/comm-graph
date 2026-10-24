@@ -2059,8 +2059,8 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
         `Your reply this turn is ONLY the route question — one short conversational sentence asking which route they want. Do NOT call other tools (memory.search, web.search, etc.) and do NOT ask about anything else — sign-in, credentials, missing details, or unrelated questions all come AFTER they pick. ` +
         `If one is marked ready/recommended, say it's the suggested one. ` +
         `After they pick: (a) if the pick isn't a registered agent, call <tool>capability.select("<name>")</tool> to get its agentId; ` +
-        (_missingInfo === 'recipient'
-          ? `(b) ask for the missing recipient detail (phone number / contact) — ONE short question; (c) when both route and recipient are known, immediately <plan_update> the task with the agentId and details baked in — no confirmation loops.`
+        (_missingInfo && _missingInfo !== 'clarify'
+          ? `(b) ask for the missing ${_missingInfo === 'recipient' ? 'recipient detail (phone number / contact)' : `${_missingInfo} detail`} — ONE short question; (c) when both route and ${_missingInfo === 'recipient' ? 'recipient' : 'details'} are known, immediately <plan_update> the task with the agentId and details baked in — no confirmation loops.`
           : `(b) if any required detail is still missing, ask ONE short question; (c) when the route and details are known, immediately <plan_update> the task with the agentId baked in — no confirmation loops.`) +
         ` If the pick needs setup, call <tool>setup.start("<name>")</tool> AFTER collecting missing details.\n\nOptions:\n`
         + _optionsList.map(h => `- ${h.label || h.id}${h.ready ? ' — READY (installed/registered)' : ' — needs setup'}${_isRecommended(h, _recommendedId) ? ' — RECOMMENDED' : ''}${h.setupSummary ? `, setup: "${h.setupSummary}"` : ''}${h.eta ? `, eta: ${h.eta}` : ''}${h.authEnv?.length ? `, needs keys: ${h.authEnv.join(', ')}` : ''}`).join('\n')

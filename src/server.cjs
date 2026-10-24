@@ -57,6 +57,7 @@ const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = req
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
 const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT, fetchExtSessions } = require('./route-decision.cjs');
+const _decision = require('./decision.cjs');
 
 // ── Thought engine prompt producer ─────────────────────────────────────────────
 // Fire-and-forget POST of each user prompt to personality-service so the
@@ -299,9 +300,38 @@ async function _capabilityGate(text, opts = {}) {
       if (decision !== 'none') {
         // Unresolved recipient — "text my wife", "call my mom" — no usable
         // contact info in the text. Planning asks for it AFTER the pick.
-        const needsInfo = /(?:\+?\d[\d\s().-]{6,}\d)|@\S+|[\w.+-]+@[\w-]+\.\w+/.test(text)
+        let needsInfo = /(?:\+?\d[\d\s().-]{6,}\d)|@\S+|[\w.+-]+@[\w-]+\.\w+/.test(text)
           ? null
           : (MISSING_INFO_RE.test(text) ? 'recipient' : null);
+        // Spec-completeness noul — generalizes the kinship-recipient regex to
+        // every required-slot class (time, destination, item, access). Runs
+        // only when the regexes found nothing and the gate is already engaged
+        // (service/action prompts); biased to complete like the grill — "when
+        // in doubt, complete". A missing slot keeps the planning-options flow
+        // so the lane asks for it after the route pick. Fail-open to null.
+        if (!needsInfo && _decision?.decisionEnabled?.() !== false) {
+          try {
+            const _specRes = await _decision.askDecision([
+              { id: 'spec', type: 'choice',
+                question: 'Does this request have enough information to execute? Flag missing ONLY when a required input is absent — no recipient for a send/message, no time for a schedule/reminder, no destination for a nav/book/order, no item for an action on "it". Never flag optional details, preferences, or things resolvable from context or memory. When in doubt, complete.',
+                options: ['complete — enough info to act', 'missing — a required detail is absent'] },
+              { id: 'slot', type: 'choice',
+                question: 'Which required detail is missing (answer only if spec is missing)?',
+                options: ['recipient or contact', 'time or date', 'destination or place', 'item or subject', 'credentials or access', 'something else'] },
+            ], { state: `prompt: ${String(text || '').slice(0, 300)}\nservice: ${tc?.targetService || 'unknown'}` });
+            const _spec = _specRes?.answers?.spec;
+            const _missing = _spec?.index === 1 || /^missing/i.test(String(_spec?.answer || ''));
+            if (_missing && (_spec?.confidence == null || _spec.confidence >= 0.5)) {
+              const _slots = ['recipient', 'time', 'destination', 'item', 'access', 'other'];
+              const _slotAns = _specRes.answers?.slot;
+              needsInfo = (typeof _slotAns?.index === 'number' ? _slots[_slotAns.index]
+                : _slots.find(s => String(_slotAns?.answer || '').toLowerCase().includes(s))) || 'other';
+              logger.info(`[capability-gate] specCompleteness → needsInfo=${needsInfo}${typeof _spec?.confidence === 'number' ? ` conf=${_spec.confidence}` : ''}`);
+            }
+          } catch (e) {
+            logger.debug(`[capability-gate] specCompleteness failed — continuing without needsInfo: ${e.message}`);
+          }
+        }
         // Exact+ready pick and nothing missing → pin the agent and hand off.
         // decideGate only returns 'pin' on fit:exact + verified installed/
         // low-friction, so the options card would be ceremony for a choice
