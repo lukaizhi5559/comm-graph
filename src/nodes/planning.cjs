@@ -1016,12 +1016,15 @@ function _toolJournalRecent(query) {
 // Open a real browser page for the user — signup/login/verify/dashboard
 // destinations they must visit in person. Only http(s) URLs; report failure
 // honestly, never claim a page opened that didn't.
-async function _toolUrlOpen(query) {
+async function _toolUrlOpen(query, sessionId) {
   const url = String(query || '').trim();
   if (!/^https?:\/\//i.test(url)) {
     return `url.open FAILED — "${url || 'empty'}" is not an http(s) URL. Get the real link first (setup.start result, capability info, or web.search).`;
   }
-  const res = await _postJson(MAIN_PORT, '/url.open', { url }, '', 4000);
+  // F16: pass the live plan id so main.js can verify the open request
+  // correlates to a real running plan — phantom opens are rejected there.
+  const planId = _sessionToPlan.get(sessionId) || _activePlanId || null;
+  const res = await _postJson(MAIN_PORT, '/url.open', { url, planId }, '', 4000);
   if (!res || res.ok !== true) {
     return `url.open FAILED — the browser could not be opened (${res?.error || 'no response'}). Give the user the URL to paste instead: ${url}`;
   }
@@ -1221,7 +1224,7 @@ async function _runTools(text, sessionId, opts = {}) {
     }
     else if (call.tool === 'url.open') {
       await _ptyNote(`opening ${call.query}…`);
-      out = await _toolUrlOpen(call.query);
+      out = await _toolUrlOpen(call.query, sessionId);
     }
     else if (call.tool === 'setup.start') {
       await _ptyNote(`starting ${call.query} setup in the terminal…`);

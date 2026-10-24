@@ -68,6 +68,18 @@ const APP_ACTION_VERB_RE = /\b(go\s+to|goto|navigate|open|launch|visit|log\s*in|
 // can't enumerate every site the user might name — the verb's position is
 // the signal that doesn't depend on the list. (Shared: NAV_VERB_START_RE.)
 
+// Episodic/activity recall — "what was I doing monday", "what did I browse
+// last night". A public SERP cannot answer the user's own history; these are
+// memory_retrieve, and guessing web_search on them opens a useless Google
+// SERP in the user's browser (observed).
+const ACTIVITY_RECALL_RE = /\b(what was i doing|what did i do|was i doing|did i (?:do|work|browse|visit|watch|read|look)|what i was doing|what i did|my (?:recent )?(?:activity|browsing history|screen time))\b/i;
+
+// Bare "search/find/look for X" — when a searchable site is bound in front,
+// the site's own search box owns the task, not a public SERP.
+const BARE_SEARCH_RE = /^\s*(?:please\s+)?(?:now\s+)?(?:then\s+)?(?:search|find|look)\s+(?:for|up)\b/i;
+const SEARCHABLE_HOST_RE = /(amazon|ebay|etsy|walmart|target|bestbuy|aliexpress|youtube|reddit|pinterest|imdb|yelp|airbnb|booking|zillow|indeed|spotify|netflix|tiktok|wikipedia|stackoverflow|github|gitlab|npmjs|pypi|quora|medium|substack|goodreads|wayfair|homedepot|lowes|newegg|chewy|instacart|doordash|ubereats|grubhub|depop|poshmark|mercari|craigslist|realtor|redfin|kayak|expedia|hotels|trivago|nordstrom|macys|kohls|sephora|ulta|shein|temu|discogs|bandcamp|soundcloud|vimeo|dailymotion|twitch|flickr|unsplash|pexels|archive\.org|genius|allrecipes|foodnetwork|bbcgoodfood|seriouseats)\./i;
+function _hostOf(u) { try { return new URL(u).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } }
+
 /**
  * @param {string} text         - English prompt (selection chips stripped)
  * @param {Object} opts         - { hasSelectionContext, openPlan, hasAttachment }
@@ -99,6 +111,12 @@ function isEligible(text, opts = {}) {
   // answer, a SERP can only answer wrong (observed: ebay follow-up →
   // screw-multipack prices).
   if (PAGE_ITEM_REF_RE.test(t)) return false;
+  // Episodic/activity recall — the user's own history lives in memory lanes.
+  if (ACTIVITY_RECALL_RE.test(t)) return false;
+  // Bound-search veto — "search for baby mittens" with an Amazon tab bound
+  // in front is on-page automation on that tab, never a public SERP.
+  if (BARE_SEARCH_RE.test(t) && Array.isArray(opts.extSessions)
+      && opts.extSessions.some(s => s && s.url && SEARCHABLE_HOST_RE.test(_hostOf(s.url)))) return false;
   return true;
 }
 

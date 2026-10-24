@@ -535,7 +535,7 @@ async function classify(englishText, conversationContext, opts = {}) {
   }; // end _remoteClassify
 
   // Local-first: authoritative when enabled and not in shadow mode.
-  if (decision.decisionEnabled() && !decision.shadowMode()) {
+  if (decision.decisionEnabled() && !decision.shadowMode('classify.intent')) {
     try {
       const li = await _localIntent();
       if (li != null) {
@@ -555,7 +555,7 @@ async function classify(englishText, conversationContext, opts = {}) {
   }
 
   // Shadow mode: run local alongside remote, log agreement, remote wins.
-  if (decision.decisionEnabled() && decision.shadowMode()) {
+  if (decision.decisionEnabled() && decision.shadowMode('classify.intent')) {
     // Compare the intent NUMBERS — local returns an index while remote returns
     // the full result object, so a raw JSON compare would always disagree.
     return decision.shadowCompare('classify.intent', _localIntent, async () => (await _remoteClassify())?.intent);

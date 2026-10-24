@@ -56,7 +56,7 @@ const { isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply } = require('.
 const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = require('./screen-context.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
-const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT } = require('./route-decision.cjs');
+const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT, fetchExtSessions } = require('./route-decision.cjs');
 
 // ── Thought engine prompt producer ─────────────────────────────────────────────
 // Fire-and-forget POST of each user prompt to personality-service so the
@@ -872,9 +872,13 @@ async function processMessage(args) {
     // handoff unchanged.
     {
       const _eg = intentGuesser.guess(classifyText, { hasSelectionContext }).guessedIntent;
+      // Bound-tab fact for the search veto — only fetched when the guesser
+      // already thinks SERP, so non-search prompts never pay the hop.
+      const _extSess = (_eg === 'web_search') ? await fetchExtSessions() : [];
       if (_eg === 'web_search' && !thoughtContext
           && webSearchExpress.isEligible(classifyText, {
             hasSelectionContext,
+            extSessions: _extSess,
             // Only a plan bound to THIS session and awaiting input vetoes —
             // a dormant or cross-session draft must not disable the lane
             // for every fresh lookup (disk scan finds stale plans forever).

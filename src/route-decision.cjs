@@ -18,8 +18,30 @@
  * gate returns null on structure alone — no regex needed to be right.
  */
 const path = require('path');
+const http = require('http');
 const { ask } = require('./llm-providers.cjs');
 const logger = require('./logger.cjs');
+
+// Bound extension tabs are the single most important fact for "what is this
+// prompt" — fetched once at ingress so the envelope's follow-up/first-result
+// decisions see the live browser surface instead of guessing context-free.
+const COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
+function _fetchExtSessions(timeoutMs = 600) {
+  return new Promise((resolve) => {
+    const req = http.get({ hostname: '127.0.0.1', port: COMMAND_PORT, path: '/ext.sessions', timeout: timeoutMs }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          resolve(Array.isArray(j.sessions) ? j.sessions.filter(s => s && s.url && /^https?:/i.test(s.url)) : []);
+        } catch (_) { resolve([]); }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve([]); });
+    req.on('error', () => resolve([]));
+  });
+}
 
 // Task types that name an external/automation capability and may legitimately
 // reach the service-picker. Everything else (query, local_file, local_system,
@@ -99,7 +121,10 @@ function deriveLane(tc) {
     return 'handoff';
   }
   if (tc.suggestedIntent === 'memory_store') return 'memory_store';
-  if (tc.suggestedIntent === 'memory_retrieve' && !tc.isFollowUp) return 'memory_quick';
+  // Episodic/activity recall ("what was I doing monday") often arrives
+  // follow-up-shaped — the memory lane still owns it; handoff would burn a
+  // full graph run on a user-memory query.
+  if (tc.suggestedIntent === 'memory_retrieve' || tc.isActivityQuery) return 'memory_quick';
   if (tc.suggestedIntent === 'greeting' || tc.suggestedIntent === 'general_knowledge') return 'general_quick';
   return 'handoff';
 }
@@ -137,7 +162,8 @@ async function classifyRoute(userMessage, conversationHistory) {
       logger,
       null, // priorScreenSummary — not gathered at ingress; screen follow-ups default to handoff anyway
       null, // activeAppContext — stategraph gathers its own live context
-      { askDecision: require('./decision.cjs').askDecision }, // local typed-decision path (DECISION_LOCAL=0 disables)
+      { askDecision: require('./decision.cjs').askDecision, // local typed-decision path (DECISION_LOCAL=0 disables)
+        extSessions: await _fetchExtSessions() }, // bound tabs — first-result/follow-up vetoes need them
     );
     if (!tc || typeof tc !== 'object' || !tc.taskType) return null;
     const lane = deriveLane(tc);
@@ -157,4 +183,4 @@ function serializeDecision(tc) {
   return out;
 }
 
-module.exports = { classifyRoute, deriveLane, canSkipCapabilityGate, serializeDecision, SERVICE_TASK_TYPES, LANE_BY_INTENT };
+module.exports = { classifyRoute, deriveLane, canSkipCapabilityGate, serializeDecision, SERVICE_TASK_TYPES, LANE_BY_INTENT, fetchExtSessions: _fetchExtSessions };
