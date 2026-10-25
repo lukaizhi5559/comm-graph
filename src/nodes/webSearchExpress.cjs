@@ -26,17 +26,7 @@ const http = require('http');
 const https = require('https');
 const logger = require('../logger.cjs');
 const { standaloneSearchQuery } = require('../query-context.cjs');
-const {
-  isContextDependent,
-  FILE_PATH_RE,
-  LOCAL_FS_PROBE_RE,
-  SCREEN_OBSERVATION_RE,
-  LIVE_PAGE_REF_RE,
-  PAGE_ITEM_REF_RE,
-  NAMED_APP_RE,
-  NAV_VERB_START_RE,
-  SCRIPTURE_REF_RE,
-} = require('../../../shared/text-patterns.cjs');
+const { SCRIPTURE_REF_RE } = require('../../../shared/text-patterns.cjs');
 const { toItem: _toItem, hostnameOf: _hostname } = require('../../../shared/serp-item.cjs');
 
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
@@ -51,73 +41,27 @@ const EXPRESS_ENABLED = process.env.WEB_SEARCH_EXPRESS !== '0';
 const IMAGE_HINT_RE = /\b(images?|pictures?|photos?|pics|wallpapers?|logos?|icons?|gifs?|memes?|thumbnails?)\b/i;
 const VIDEO_HINT_RE = /\b(videos?|clips?|trailers?|tutorials?|episodes?)\b/i;
 
-// Continuation/follow-up shapes the pronoun check misses — "again", "too",
-// "more like that". These only make sense against prior context.
-const FOLLOWUP_SHAPE_RE = /^(?:yes|yeah|yep|ok(?:ay)?|sure|please|now|then|again|more|another|same|also|too|and|next|continue|go\s+ahead|what\s+about|how\s+about)\b|\b(?:too|again|instead|as\s+well|this\s+time|as\s+before|the\s+same)\s*[.?!]?\s*$/i;
-
-// Personal/local referents — a web SERP cannot answer these.
-const PERSONAL_DATA_RE = /\bmy\s+(notes?|files?|folders?|documents?|downloads?|desktop|inbox|gmail|google\s*mail|e?-?mails?|outlook|messages?|texts?|chats?|dms|voicemails?|calendar|contacts?|bookmarks?|photos?|reminders?|history|saved|notifications?)\b|\b(?:saved|bookmarked|stored)\s+(?:in|on|to)\s+(?:my|the)\b/i;
-
-// Automation-shaped action verbs — a named app + one of these means the user
-// wants the app DRIVEN, not a SERP about it. Kept deliberately narrow (no
-// bare "search"/"find" — "search YouTube for X" is still a content lookup).
-const APP_ACTION_VERB_RE = /\b(go\s+to|goto|navigate|open|launch|visit|log\s*in|sign\s*in|check|read|post|send|compose|reply|upload|download|scroll|click|fill|submit|play|watch|browse)\b/i;
-
-// Nav-verb LEADING the prompt — "goto biblegateway", "open trello", "launch
-// figma". A command-shaped prompt is never a SERP lookup, and NAMED_APP_RE
-// can't enumerate every site the user might name — the verb's position is
-// the signal that doesn't depend on the list. (Shared: NAV_VERB_START_RE.)
-
-// Episodic/activity recall — "what was I doing monday", "what did I browse
-// last night". A public SERP cannot answer the user's own history; these are
-// memory_retrieve, and guessing web_search on them opens a useless Google
-// SERP in the user's browser (observed).
-const ACTIVITY_RECALL_RE = /\b(what was i doing|what did i do|was i doing|did i (?:do|work|browse|visit|watch|read|look)|what i was doing|what i did|my (?:recent )?(?:activity|browsing history|screen time))\b/i;
-
-// Bare "search/find/look for X" — when a searchable site is bound in front,
-// the site's own search box owns the task, not a public SERP.
-const BARE_SEARCH_RE = /^\s*(?:please\s+)?(?:now\s+)?(?:then\s+)?(?:search|find|look)\s+(?:for|up)\b/i;
-const SEARCHABLE_HOST_RE = /(amazon|ebay|etsy|walmart|target|bestbuy|aliexpress|youtube|reddit|pinterest|imdb|yelp|airbnb|booking|zillow|indeed|spotify|netflix|tiktok|wikipedia|stackoverflow|github|gitlab|npmjs|pypi|quora|medium|substack|goodreads|wayfair|homedepot|lowes|newegg|chewy|instacart|doordash|ubereats|grubhub|depop|poshmark|mercari|craigslist|realtor|redfin|kayak|expedia|hotels|trivago|nordstrom|macys|kohls|sephora|ulta|shein|temu|discogs|bandcamp|soundcloud|vimeo|dailymotion|twitch|flickr|unsplash|pexels|archive\.org|genius|allrecipes|foodnetwork|bbcgoodfood|seriouseats)\./i;
-function _hostOf(u) { try { return new URL(u).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } }
+// (The pre-classify exclusion list that used to live here was deleted — the
+// lane is an executor now; routing decisions belong to classify.cjs.)
 
 /**
  * @param {string} text         - English prompt (selection chips stripped)
- * @param {Object} opts         - { hasSelectionContext, openPlan, hasAttachment }
+ * @param {Object} opts         - (unused — kept for signature compatibility)
+ *
+ * The eligibility GATE collapsed to a single on/off switch: this lane is now
+ * an EXECUTOR, not a classifier. The pre-classify race is gone — prompts reach
+ * here only because the real classifier assigned intent 8 (web_search), so the
+ * negative-list checks (personal data, screen referents, bound tabs, deictic
+ * continuations, open plans, attachments) are the classifier's guards' job.
+ * The old list deleted rather than grown: every missed shape became a wrong
+ * SERP in production (observed: "how much do you know about me" matched the
+ * "how much" price pattern → answer was "How Well Do You Know Me" listicles;
+ * "show raining emojis on my screen" matched the media pattern → image SERP).
  */
 function isEligible(text, opts = {}) {
   if (!EXPRESS_ENABLED) return false;
   const t = String(text || '').trim();
-  if (t.length < 8 || t.split(/\s+/).length < 3) return false;
-  if (opts.hasSelectionContext || opts.openPlan || opts.hasAttachment) return false;
-  // Pronoun-subject follow-ups ("how long has he been in office") — the
-  // referent lives in conversation history; classifyTask resolves it.
-  if (isContextDependent(t)) return false;
-  if (FOLLOWUP_SHAPE_RE.test(t)) return false;
-  if (PERSONAL_DATA_RE.test(t)) return false;
-  // Named app + action verb → the user wants the app driven (command_automate),
-  // not a SERP about it. "goto youtube", "open gmail", "check my netflix" all
-  // fall through to the real classifier — express only claims pure lookups.
-  if (NAMED_APP_RE.test(t) && APP_ACTION_VERB_RE.test(t)) return false;
-  // Nav-verb-led command ("goto biblegateway…") — command-shaped regardless
-  // of whether the destination is a listed app. Fail closed: the real
-  // classifier decides what it is; express just doesn't claim it.
-  if (NAV_VERB_START_RE.test(t)) return false;
-  // File paths, local-fs probes, and live screen/page referents can never be
-  // answered by a public SERP — the stategraph owns those.
-  if (FILE_PATH_RE.test(t) || LOCAL_FS_PROBE_RE.test(t)) return false;
-  if (SCREEN_OBSERVATION_RE.test(t) || LIVE_PAGE_REF_RE.test(t)) return false;
-  // Ordinal page-item referents ("the first three items", "the second
-  // listing") — context-dependent by definition; the bound tab owns the
-  // answer, a SERP can only answer wrong (observed: ebay follow-up →
-  // screw-multipack prices).
-  if (PAGE_ITEM_REF_RE.test(t)) return false;
-  // Episodic/activity recall — the user's own history lives in memory lanes.
-  if (ACTIVITY_RECALL_RE.test(t)) return false;
-  // Bound-search veto — "search for baby mittens" with an Amazon tab bound
-  // in front is on-page automation on that tab, never a public SERP.
-  if (BARE_SEARCH_RE.test(t) && Array.isArray(opts.extSessions)
-      && opts.extSessions.some(s => s && s.url && SEARCHABLE_HOST_RE.test(_hostOf(s.url)))) return false;
-  return true;
+  return t.length >= 8 && t.split(/\s+/).length >= 3;
 }
 
 function _postJson(port, urlPath, payload, apiKey, timeoutMs) {

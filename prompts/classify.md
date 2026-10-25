@@ -6,9 +6,9 @@ INTENTS:
 CLASSIFICATION RULES:
 1. If the message asks for any action that requires tools, websites, browser automation, computer control, file operations, or multi-step execution → classify as 0 (handoff).
 2. If the message is chitchat, a greeting, an opinion question, or simple knowledge the LLM can answer directly → classify as 1 (general_quick).
-3. If the message asks for a quick personal fact about the user (name, email, favorite color, age, job) → classify as 2 (memory_quick).
-3a. If the message PROVIDES a personal fact about the user (e.g., "my name is John", "my favorite color is red", "remember my email is x@y.com", "I live in NYC", or a short follow-up answer like "it's red" right after a memory question) → classify as 2 (memory_quick — storage path).
-3b. If the message states a general memory, note, appointment, or event that is NOT a personal profile fact (e.g., "i have a dentist appt next week friday", "remember I have a meeting at 3pm", "note: buy milk tomorrow", "I have a flight on Monday") → classify as 5 (memory_store — general memory, not profile fact).
+3. If the message ASKS about a personal fact, stored memory, or past activity — "what's my name", "what do you know about me", "when is my dentist appt", "what was I doing monday" → classify as 0 (handoff — the graph's memory retrieval answers with full context).
+3a. If the message PROVIDES a personal fact to store (e.g., "my name is John", "my favorite color is red", "remember my email is x@y.com", "I live in NYC", or a short follow-up answer like "it's red" right after a memory question) → classify as 5 (memory_store).
+3b. If the message explicitly asks to store/remember a note, appointment, or event ("remember I have a meeting at 3pm", "note: buy milk tomorrow") → classify as 5 (memory_store). A BARE statement with no action verb ("i have a dentist appt next week") is NOT a store — see planning rule 22.
 4. If the message asks about the status or progress of a running task → classify as 3 (status_check).
 5. If the message is a control command (cancel, pause, resume, stop) → classify as 4 (control_signal).
 6. If the message asks for the current time, today's date, the current day of the week, or any real-time local information the LLM cannot know without a device clock → classify as 0 (handoff).
@@ -16,7 +16,7 @@ CLASSIFICATION RULES:
 8. If the message asks about the CONVERSATION ITSELF — what was discussed, whether a topic was mentioned, what the user asked or said earlier, or requests searching conversation history/memory → classify as 0 (handoff — needs full transcript search). Pattern: "did we talk about X", "what did we discuss", "what did I just ask", "what were we talking about", "look that up in your memory", "remind me what we said", "check your memory", "in our conversation".
 9. If the message is a SHORT conversational follow-up REACTING to the assistant's previous answer — asking why, expressing confusion, or requesting clarification of what was just said → classify as 1 (general_quick — it continues the conversation, it does not request a task). This differs from rule 8: reacting to an answer is chitchat; asking WHAT was said is recall. Pattern: "why?", "why not", "how come", "what do you mean", "huh", "really?", "seriously?".
 10. If answering the message well requires a LONG-FORM response or a generated deliverable — code/snippets/starter code, scripts, essays, stories, poems, detailed step-by-step guides, long lists, documents → classify as 0 (handoff — the stategraph produces the full answer). This differs from rule 2: a quick fact or opinion stays inline; a deliverable does not. Pattern: "show me X code", "write me a script/essay/poem", "give me a step-by-step guide to X", "draft a document about X".
-11. If the message asks to FIND/SHOW/PULL UP IMAGES, photos, pictures, or pics of something → classify as 0 (handoff — needs a real search/fetch action that general_quick cannot perform). Do NOT deflect with "I can't display images" from general_quick. Pattern: "show me pics of X", "find photos of Y", "pull up pictures of Z".
+11. If the message asks to FIND/SHOW PICTURES, images, photos, or videos of something WITHOUT naming a screen/app target → classify as 8 (web_search — the express search lane fetches media cards). "show X on my screen" is intent 7 instead. Pattern: "show me pics of X", "find photos of Y", "videos of Z".
 12. If the message asks what is ON the user's screen, to read/describe/identify visible screen content, or which app/window is currently active → classify as 0 (handoff — needs a live screen capture that general_quick cannot perform). Pattern: "what's on my screen", "read the text on my screen", "what app am I in", "describe what I'm looking at", "is there an error dialog visible".
 
 21. If the message asks for MULTIPLE DISTINCT DELIVERABLES or services in one request — different apps/accounts that each need their own work — OR explicitly asks to plan/brainstorm/organize an approach — OR asks to BUILD/CREATE a new skill, app, agent, workflow, automation, or script → classify as 6 (planning — a plan gets drafted and approved before anything executes). This differs from rule 1: a single multi-step task in one app stays 0; several independent deliverables, an explicit plan request, or a buildable deliverable is 6. Pattern: "create a doc, then a calendar event, and a spreadsheet", "add to my amazon cart and email me when done", "let's plan a trip to Denver", "help me brainstorm X", "I need to do X, then after do Y and also Z", "let's put a skill together", "build me an app", "create a workflow for X". Mere references are not enough: "open the app", "use this skill", "install the extension" stay 0 — no create/build verb, no planning.
@@ -28,25 +28,32 @@ IMPORTANT BOUNDARIES:
 - "List all my appointments for next week" → 0 (handoff — deep temporal retrieval)
 - "What was I doing yesterday" → 0 (handoff — deep temporal retrieval)
 - "Remember I have a meeting at 3pm" → 5 (memory_store — general memory)
-- "I have a dentist appt next week friday" → 5 (memory_store — general memory)
-- "Note: buy milk tomorrow" → 5 (memory_store — general memory)
-- "I have a flight on Monday" → 5 (memory_store — general memory)
-- "My name is John" → 2 (memory_quick — profile fact storage)
-- "My favorite color is red" → 2 (memory_quick — profile fact storage)
-- "It's red" (after "what's my favorite color") → 2 (memory_quick — follow-up fact storage)
-- "I live in NYC" → 2 (memory_quick — profile fact storage)
-- "What's my name?" → 2 (memory_quick — quick profile fact)
-- "What's my favorite color?" → 2 (memory_quick — quick profile fact)
+- "I have a dentist appt next week friday" → 6 (planning — bare event statement, clarify remember/calendar/reminder)
+- "Remember I have a dentist appt friday" → 5 (memory_store — explicit store verb)
+- "Note: buy milk tomorrow" → 5 (memory_store — explicit note verb)
+- "Add my flight on Monday to my calendar" → 0 (handoff — explicit action verb)
+- "I have a flight on Monday" → 6 (planning — bare event statement)
+- "My name is John" → 5 (memory_store — storing a personal fact)
+- "My favorite color is red" → 5 (memory_store)
+- "It's red" (after "what's my favorite color") → 5 (memory_store — follow-up fact storage)
+- "I live in NYC" → 5 (memory_store)
+- "What's my name?" → 0 (handoff — memory retrieval)
+- "What's my favorite color?" → 0 (handoff — memory retrieval)
+- "What do you know about me?" → 0 (handoff — memory retrieval)
+- "How much do you know about me?" → 0 (handoff — memory retrieval, NOT a web search)
 - "Go to ChatGPT and search for X" → 0 (handoff — browser automation)
-- "Search the web for X" → 0 (handoff — web search)
 - "Close Zoom" → 0 (handoff — computer action)
 - "Who is the current X of Y?" → 0 (handoff — current office-holder, needs live data)
 - "Who is the X right now?" → 0 (handoff — current office-holder, needs live data)
 - "What is the latest X?" → 0 (handoff — latest info, needs live data)
 - "What happened today?" → 0 (handoff — current events, needs live data)
-- "What does a PS5 cost?" → 0 (handoff — live price data)
-- "How much is Apple stock?" → 0 (handoff — live price data)
-- "How much does an iPhone cost?" → 0 (handoff — live price data)
+- "What does a PS5 cost?" → 8 (web_search — live price data)
+- "How much is Apple stock?" → 8 (web_search — live price data)
+- "How much does an iPhone cost?" → 8 (web_search)
+- "What is the latest X?" → 8 (web_search)
+- "Show me pictures of baby clothes" → 8 (web_search)
+- "Search the web for X" → 8 (web_search)
+- "Search gmail for X" / "search youtube for X" → 0 (handoff — in-app lookup is automation)
 - "Did we talk about Jesus?" → 0 (handoff — conversation recall, needs transcript search)
 - "What did we discuss earlier?" → 0 (handoff — conversation recall)
 - "What did I just ask?" → 0 (handoff — conversation recall)
@@ -89,6 +96,8 @@ IMPORTANT BOUNDARIES:
 - "Open YouTube and search for cats" → 0 (handoff — single service, one flow)
 - "Send an email to a@b.com saying I'll be late" → 0 (handoff — one deliverable; its fields are not multiple actions)
 
+22. If the message STATES a personal future event with NO action verb — "I have an appointment next week at 5", "my dentist appt is friday" — classify as 6 (planning — ambiguous: remember it? calendar event? reminder? and missing details like which day; planning asks before doing). Explicit verbs ("remember my appt", "add it to my calendar", "remind me about it") keep their normal lanes.
+
 DISAMBIGUATION — "remember" is ambiguous:
 - "Remember I have a meeting at 3pm" → 5 (memory_store — storing a fact)
 - "Remember my birthday is May 5th" → 5 (memory_store — storing a fact)
@@ -97,4 +106,4 @@ DISAMBIGUATION — "remember" is ambiguous:
 - If the message contains an action verb (add, download, create, find, copy, save, put, send, open, close) AND "remember" → 0 (handoff — "remember" is a conversational reference, not a storage command)
 - If the message is a CORRECTION or CLARIFICATION of a previous task ("not from X but from Y", "I meant Z", "actually W") → 0 (handoff — it's a task instruction, not memory storage)
 
-Return ONLY a single number (0, 1, 2, 3, 4, 5, or 6). No words, no explanation, no punctuation — just the number.
+Return ONLY a single number (0, 1, 3, 4, 5, 6, 7, or 8). No words, no explanation, no punctuation — just the number.

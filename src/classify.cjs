@@ -29,7 +29,8 @@ const { isLocalMultiEntityTask } = require('../../shared/context-refs.cjs');
 const INTENTS = {
   0: { name: 'handoff',           description: 'Anything needing tools, web search, browser automation, computer actions, deep memory retrieval, scheduling, file operations, or multi-step tasks — including opening, checking, or using a named app or website ("check my gmail", "open chatgpt", "go to youtube")' },
   1: { name: 'general_quick',    description: 'Chitchat, greetings, opinions, simple knowledge questions the LLM can answer directly without tools' },
-  2: { name: 'memory_quick',      description: 'Quick personal PROFILE fact recall — name, favorite color, email address, job, age. Also handles explicit profile fact storage ("my name is X"). NOT for named web services or apps ("check my gmail" is handoff) and NOT deep temporal history or complex queries' },
+  // 2 is intentionally vacant — the memory_quick lane was removed; all memory
+  // READS go to the stategraph (handoff), all explicit stores go to intent 5.
   3: { name: 'status_check',      description: 'Asking about the status/progress of a running or recently completed task' },
   // pause/resume are intentionally absent — those signals are unimplemented
   // (main.js aborts on 'cancel' only); advertising them here routes utterances
@@ -37,6 +38,8 @@ const INTENTS = {
   4: { name: 'control_signal',    description: 'Cancel, stop, or abort a running task' },
   5: { name: 'memory_store',      description: 'Storing a general memory, note, appointment, or event — NOT a personal profile fact. E.g., "i have a dentist appt next week", "remember I have a meeting at 3pm", "note: buy milk tomorrow"' },
   6: { name: 'planning',          description: 'Requests that need a multi-task plan drafted BEFORE execution — brainstorming, "let\'s plan X", building/creating a new skill, app, agent, workflow, automation, or script, or multiple distinct deliverables/services in one request (e.g. doc + calendar + sheet, add to cart then email me). NOT single quick actions.' },
+  7: { name: 'screen',            description: 'Display content on the user\'s screen output surface — show a previous reply/search result/file on screen ("show this on the screen", "put that chart up"), paint text/doc/image/chart/deck/effect/emoji/alert/three.js scene, or clear the screen. The output surface only — NOT for gathering data first ("check my mail and show it on screen" is handoff) and NOT for observing the screen ("what\'s on my screen" is handoff).' },
+  8: { name: 'web_search',        description: 'Standalone public web lookups needing live web data — facts, news, prices, recommendations, media ("pictures of cats", "latest headlines", "best laptops", "what does a ps5 cost"). NOT lookups inside a named app or account ("search gmail", "find on my youtube" is handoff), NOT personal/stored data ("what do you know about me" is handoff), and NOT screen output ("show X on my screen" is screen).' },
 };
 
 // ── Load classification prompt ─────────────────────────────────────────────────
@@ -137,7 +140,7 @@ const PLAN_RESUME_RE = /\bcontinue\b|\bresume\b|\bkeep going\b|\bcarry on\b|\bpi
 // Intents only the main stategraph can serve — a quick-tier pick with one of
 // these guessed is an action-veto flake (also used by server.cjs's selection
 // fastlane so "post this" + a highlight can't be answered instead of run).
-const GRAPH_ONLY_INTENTS = new Set(['command_automate', 'screen_analysis', 'web_search', 'memory_retrieve']);
+const GRAPH_ONLY_INTENTS = new Set(['command_automate', 'screen_analysis', 'memory_retrieve']);
 
 // "is <thing> installed / done / set up" — anchored when <thing> names a task
 // in the open plan, or the referent is bare "it"/"the plan".
@@ -289,31 +292,32 @@ async function classify(englishText, conversationContext, opts = {}) {
     return { intent: 6, intentName: 'planning', confidence: 0.9, source: 'deliverable_guard' };
   }
 
-  // Screen-output commands ("show it on the screen", "make it rain on my
-  // screen", "clear the screen") drive the GhostLayer display channel in the
-  // stategraph — never let them land in general_quick or control_signal.
-  // …but not when the prompt also names a personal account/service — "check
-  // my inbox … and put a summary on my screen" is a gather+display compound
-  // that needs the service lane (nylas/gmail) first. Let it reach the
-  // capability gate instead of display-short-circuiting the whole prompt.
-  const _serviceRef = /\b(?:inbox|e-?mails?|gmail|outlook|slack|discord|calendar|notion|drive|spotify|whatsapp|imessage|messages|reminders|contacts|files?|photos?)\b/i.test(englishText);
-  if (!_serviceRef && /\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(englishText)) {
-    logger.info('[Classify] Screen-output guard → handoff', {
-      inputPreview: englishText.substring(0, 60),
-    });
-    return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'screen_output_guard' };
-  }
-
-  // Screen-observation questions ("what's on my screen", "describe what I'm
-  // looking at", "read the text on screen") need a live capture — general_quick
-  // has no eyes. The classifier LLM slips here because the question *looks*
-  // answerable; deterministic handoff instead.
+  // Screen-observation guard must run BEFORE the screen-output guard —
+  // "what's on my screen" matches the output regex too ("on my screen").
   if (SCREEN_OBSERVATION_RE.test(englishText)) {
     logger.info('[Classify] Screen-observation guard → handoff', {
       inputPreview: englishText.substring(0, 60),
     });
     return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'screen_observation_guard' };
   }
+
+  // Screen-output commands ("show it on the screen", "make it rain on my
+  // screen", "clear the screen") go to the dedicated screen lane — it posts
+  // straight to the GhostLayer display channel without a stategraph run.
+  // …but not when the prompt also names a personal account/service — "check
+  // my inbox … and put a summary on my screen" is a gather+display compound
+  // that needs the service lane (nylas/gmail) first. Let it reach the
+  // capability gate instead of display-short-circuiting the whole prompt.
+  const _serviceRef = /\b(?:inbox|e-?mails?|gmail|outlook|slack|discord|calendar|notion|drive|spotify|whatsapp|imessage|messages|reminders|contacts|files?|photos?)\b/i.test(englishText);
+  if (!_serviceRef && /\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(englishText)) {
+    logger.info('[Classify] Screen-output guard → screen lane', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 7, intentName: 'screen', confidence: 0.95, source: 'screen_output_guard' };
+  }
+
+  // (screen-observation guard moved above the screen-output guard — both
+  // patterns match "on my screen" and observation must win.)
 
   // Bare-deictic continuations ("when was that", "tell me more about that")
   // carry their referent entirely in a pronoun — only the graph's transcript
@@ -340,6 +344,49 @@ async function classify(englishText, conversationContext, opts = {}) {
     return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'device_state_guard' };
   }
 
+  // Memory read-vs-store guards — tev1:0.8b confuses "what do you have on file"
+  // with "store this": questions about stored memory were landing in
+  // memory_store (intent 5) and getting WRITTEN as facts. Interrogatives can
+  // never be stores; broad recalls ("all memories", "this month") need the
+  // graph's memory search, not the 12-attribute quick lane.
+  const _isQuestion = /^(?:what|who|when|where|which|whos|how|do you|can you|could you|tell me|show me|list|give me)\b|\?\s*$/i.test(englishText);
+  const _memoryRef = /\b(?:remember|memory|memories|on file|stored|saved|know about me|have about me|about me\b)/i.test(englishText);
+  const _broadRecall = /\b(?:all (?:my |the )?memor|everything (?:you|about)|history|this (?:week|month|year)|last (?:week|month))\b/i.test(englishText);
+  if (_isQuestion && _memoryRef) {
+    logger.info('[Classify] Memory-question guard → handoff', { inputPreview: englishText.substring(0, 60) });
+    return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'memory_question_guard' };
+  }
+  // Personal-fact attribute questions without the word "memory" — "what's my
+  // github", "do you know my email", "when is my dentist appt". All memory
+  // reads ride the graph — retrieveMemory does profile.get + memory.search.
+  if (_isQuestion && /\bmy\s+(?:name|e-?mails?|github|gitlab|phone|number|address|birthday|age|job|title|role|company|timezone|location|favorite|favourite|appt|appointment|meeting|schedule|password|username)\b|\bdo you (?:know|remember) (?:my|who|what|when|where)\b/i.test(englishText)) {
+    logger.info('[Classify] Attribute-question guard → handoff', { inputPreview: englishText.substring(0, 60) });
+    return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'attribute_question_guard' };
+  }
+
+  // Bare personal future-event statements with no action verb — "I have an
+  // appointment next week at 5", "my dentist appt is friday". The intent is
+  // ambiguous (remember? calendar event? reminder?) and details are missing —
+  // planning asks instead of silently storing (as fact) or blindly automating
+  // (observed: gemini picked memory_store → sentinel → stategraph decomposed a
+  // doomed Google-Calendar task against the YouTube tab). An explicit action
+  // verb keeps the normal route ("add it to my calendar", "remind me").
+  const _personalEvent = /\bi\s+(?:have|'ve\s+got|got)\s+(?:a\s+|an\s+|the\s+|my\s+)?(?:appointment|appt|meeting|dentist|doctor|checkup|interview|call|date|event|haircut|reservation|flight|class|session|practice|party|dinner|lunch|brunch|exam|test|shift|game|concert|wedding|funeral|recital|inspection|deadline)\b/i.test(englishText);
+  const _eventAction = /\b(?:add|put|schedule|remind|create|book|set|make|plan|cancel|move|reschedul\w*|delete|remove|check|confirm|note|remember|save|store|what|when|where|who|tell|show)\b/i.test(englishText);
+  if (!_isQuestion && _personalEvent && !_eventAction) {
+    logger.info('[Classify] Personal-event guard → planning', { inputPreview: englishText.substring(0, 60) });
+    return { intent: 6, intentName: 'planning', confidence: 0.9, source: 'personal_event_guard' };
+  }
+
+  // Explicit standalone web lookups → web_search lane (express executor).
+  // Personal/screen/service referents already returned above; this keeps the
+  // ~1.5s SERP path for shapes that can't mean anything else — ambiguous
+  // lookups pay the local-decision classify instead.
+  if (/^(?:please\s+)?(?:search|google|look\s+up|find|look\s+for|show\s+me\s+(?:pictures?|images|photos|pics|videos|clips)\s+of)\b/i.test(englishText)) {
+    logger.info('[Classify] Explicit-search guard → web_search', { inputPreview: englishText.substring(0, 60) });
+    return { intent: 8, intentName: 'web_search', confidence: 0.9, source: 'search_guard' };
+  }
+
   // ── Pre-compute the keyword fallback (synchronous, free) ─────────────────────
   // It only fires when the LLM path fails or returns garbage — but computing it
   // up front lets a confident keyword hit short-circuit a failed LLM attempt
@@ -362,16 +409,11 @@ async function classify(englishText, conversationContext, opts = {}) {
   let _guessedIntent = null;
   try { _guessedIntent = require('./intentGuesser.cjs').guess(englishText, { hasSelectionContext }).guessedIntent; } catch (_) {}
   const _vetoQuick = (result) => {
-    // memory_retrieve and memory_quick share the memory domain — the guesser's
-    // "what's my X" recall patterns overlap the quick tier's profile-fact
-    // surface. When the LLM picked memory_quick, trust its depth judgment over
-    // a regex that can't tell shallow fact recall from deep transcript search.
-    const _sameMemoryDomain = result.intent === 2 && _guessedIntent === 'memory_retrieve';
     // status_check (3) is non-executable too — it only reads the task journal.
     // Observed: "…explain the status for each repo… commit it" — the status
     // keyword vetoed the LLM's handoff and the prompt died as a canned
     // journal summary while intentGuesser saw command_automate.
-    if (!_sameMemoryDomain && (result.intent === 1 || result.intent === 2 || result.intent === 3 || result.intent === 4 || result.intent === 5) && GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
+    if ((result.intent === 1 || result.intent === 3 || result.intent === 4 || result.intent === 5 || result.intent === 8) && GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
       logger.info('[Classify] Action veto — quick tier cannot serve graph-only intent', {
         llmIntent: result.intent, guessedIntent: _guessedIntent,
         inputPreview: englishText.substring(0, 60),
@@ -420,6 +462,33 @@ async function classify(englishText, conversationContext, opts = {}) {
     return _vetoQuick({ ...keywordHit, source: 'keyword_fallback' });
   };
 
+  // ── Missing-details → planning (decision-model check) ──────────────────────
+  // Statement-shaped prompts that routed to a write/task lane may be
+  // underspecified or ambiguous about what should happen ("send the report" —
+  // missing recipient; "remind me" — missing when). The personal-event regex
+  // above catches the common shape for free; this askDecision call is the
+  // general check for the rest. Gated narrow: non-question statements bound
+  // for intent 0/5 only, one call, fail-open to the original pick.
+  const _missingDetailCheck = async (result) => {
+    if (!result || (result.intent !== 0 && result.intent !== 5)) return result;
+    if (_isQuestion || englishText.trim().split(/\s+/).length < 3) return result;
+    if (!decision.decisionEnabled()) return result;
+    try {
+      const r = await decision.askDecision([{
+        id: 'missing', type: 'choice',
+        question: 'This user statement would be executed or stored as-is. Is it missing details needed to act correctly (missing target, date, recipient, or subject) OR ambiguous about what the user wants done? Answer NO for clear instructions, questions, and complete statements.',
+        options: ['YES', 'NO'],
+      }], { state: `User message: ${englishText}` });
+      if (r?.answers?.missing?.label === 'YES') {
+        logger.info('[Classify] Missing-details decision → planning', {
+          was: result.intentName, inputPreview: englishText.substring(0, 60),
+        });
+        return { intent: 6, intentName: 'planning', confidence: 0.75, source: 'missing_detail_guard' };
+      }
+    } catch (_) { /* fail open */ }
+    return result;
+  };
+
   // ── Local decision-model path ──────────────────────────────────────────────
   // phi4 decision.answer replaces the remote force-prompt: one local forward
   // pass (~50–300ms) vs 1.6–12.5s remote with pathological tails. Options are
@@ -444,7 +513,15 @@ async function classify(englishText, conversationContext, opts = {}) {
       question: 'Which intent best classifies the user\'s current message?',
       options,
     }], { state });
-    const idx = r?.answers?.intent?.index;
+    const a = r?.answers?.intent;
+    const idx = a?.index;
+    // Confidence floor — a 0.8b model's coin-flip must not route writes
+    // (memory_store) or wrong lanes. Below the floor → null → remote path.
+    const conf = a?.confidence;
+    if (idx != null && conf != null && conf < 0.55) {
+      logger.info('[Classify] Low-confidence local pick — remote fallback', { intent: idx, confidence: conf });
+      return null;
+    }
     return (idx != null && INTENTS[idx]) ? idx : null;
   };
 
@@ -506,8 +583,8 @@ async function classify(englishText, conversationContext, opts = {}) {
         // are untrustworthy as a whole, but a trailing digit or an explicit
         // "intent: N" phrase is a deliberate final answer — extract it rather
         // than paying a second flaky 12s call that ends in blind handoff.
-        const tailMatch = trimmed.match(/([0-6])\s*[.!)]*\s*$/)
-          || trimmed.match(/intent\s*(?:is|:|=|->|of)?\s*([0-6])\s*[.!)]*\s*$/i);
+        const tailMatch = trimmed.match(new RegExp(`([${_intentMin}-${_intentMax}])\\s*[.!)]*\\s*$`))
+          || trimmed.match(new RegExp(`intent\\s*(?:is|:|=|->|of)?\\s*([${_intentMin}-${_intentMax}])\\s*[.!)]*\\s*$`, 'i'));
         if (tailMatch) {
           const intent = parseInt(tailMatch[1], 10);
           const info = INTENTS[intent];
@@ -555,23 +632,30 @@ async function classify(englishText, conversationContext, opts = {}) {
           intent: li, intentName: info.name,
           inputPreview: englishText.substring(0, 60),
         });
-        return _vetoQuick({ intent: li, intentName: info.name, confidence: 0.9, source: 'decision_local' });
+        return _missingDetailCheck(_vetoQuick({ intent: li, intentName: info.name, confidence: 0.9, source: 'decision_local' }));
       }
       logger.debug('[Classify] Local decision unavailable — falling back to remote');
     } catch (e) {
       logger.warn(`[Classify] Local decision error — falling back to remote: ${e.message}`);
     }
-    return _remoteClassify();
+    return _missingDetailCheck(await _remoteClassify());
   }
 
   // Shadow mode: run local alongside remote, log agreement, remote wins.
   if (decision.decisionEnabled() && decision.shadowMode('classify.intent')) {
     // Compare the intent NUMBERS — local returns an index while remote returns
     // the full result object, so a raw JSON compare would always disagree.
-    return decision.shadowCompare('classify.intent', _localIntent, async () => (await _remoteClassify())?.intent);
+    // shadowCompare returns the remoteFn VALUE — it must be the full result
+    // object, not just .intent, or processMessage's destructure gets
+    // undefined for every field and every prompt falls to generalQuick→
+    // sentinel→blind handoff (observed: every shadow-mode prompt misrouted).
+    let _remoteFull = null;
+    await decision.shadowCompare('classify.intent', _localIntent,
+      async () => { _remoteFull = await _remoteClassify(); return _remoteFull?.intent; });
+    return _missingDetailCheck(_remoteFull || { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'shadow_remote_missing' });
   }
 
-  return _remoteClassify();
+  return _missingDetailCheck(await _remoteClassify());
 }
 
 module.exports = { classify, INTENTS, GRAPH_ONLY_INTENTS, _complexityPlanningScore };

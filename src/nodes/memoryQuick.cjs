@@ -18,6 +18,7 @@ const { _storeGeneralMemory } = (() => {
   try { return require('./memoryStore.cjs'); } catch (_) { return {}; }
 })();
 const { ask, buildMessages } = require('../llm-providers.cjs');
+const decision = require('../decision.cjs');
 
 const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
@@ -164,26 +165,51 @@ async function _llmDetectAttribute(englishText) {
 ${numberedList}`;
   const prompt = `Message: "${q}"\n\nAttribute index (0–11 or -1):`;
 
-  try {
-    const { text: raw } = await ask(buildMessages(prompt, systemPrompt), {
-      maxTokens: 5,
-      temperature: 0,
-      timeoutMs: 3000,
-      taskType: 'classification',
-    });
-    if (!raw) return null;
-    const numMatch = (raw || '').trim().match(/-?\d+/);
-    const idx = numMatch ? parseInt(numMatch[0], 10) : -1;
-    if (idx >= 0 && idx < ATTRIBUTES.length) {
-      const attr = ATTRIBUTES[idx];
-      logger.info('[MemoryQuick] LLM detected attribute', { attribute: attr, index: idx });
-      return attr;
+  const remoteDetect = async () => {
+    try {
+      const { text: raw } = await ask(buildMessages(prompt, systemPrompt), {
+        maxTokens: 5,
+        temperature: 0,
+        timeoutMs: 3000,
+        taskType: 'classification',
+      });
+      if (!raw) return null;
+      const numMatch = (raw || '').trim().match(/-?\d+/);
+      const idx = numMatch ? parseInt(numMatch[0], 10) : -1;
+      if (idx >= 0 && idx < ATTRIBUTES.length) {
+        const attr = ATTRIBUTES[idx];
+        logger.info('[MemoryQuick] LLM detected attribute', { attribute: attr, index: idx });
+        return attr;
+      }
+      return null;
+    } catch (e) {
+      logger.debug('[MemoryQuick] LLM attribute detection failed', { error: e.message });
+      return null;
     }
-    return null;
-  } catch (e) {
-    logger.debug('[MemoryQuick] LLM attribute detection failed', { error: e.message });
-    return null;
+  };
+
+  // ── Local decision-model path ─────────────────────────────────────────────
+  // Same fixed-vocabulary pick (12 attributes + none) as one choice question.
+  // Shadow mode runs both and returns remote; otherwise local is authoritative
+  // with remote fallback (see decision.cjs modes).
+  if (!decision.decisionEnabled()) return remoteDetect();
+
+  const localDetect = async () => {
+    const r = await decision.askDecision([{
+      id: 'attr',
+      type: 'choice',
+      question: `Which personal attribute is the user asking about or stating in this message? Answer "none" if no personal attribute is mentioned. Message: "${q}"`,
+      options: [...ATTRIBUTES, 'none'],
+    }], { state: q, timeoutMs: 3000 });
+    const label = r?.answers?.attr?.label;
+    if (!label || label === 'none') return null;
+    return ATTRIBUTES.includes(label) ? label : null;
+  };
+
+  if (decision.shadowMode('memoryQuick.attrDetect')) {
+    return decision.shadowCompare('memoryQuick.attrDetect', localDetect, remoteDetect);
   }
+  return (await localDetect()) ?? (await remoteDetect());
 }
 
 /**

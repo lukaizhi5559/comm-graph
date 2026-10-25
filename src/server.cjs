@@ -42,13 +42,14 @@ const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona
 const { classify, INTENTS, GRAPH_ONLY_INTENTS } = require('./classify.cjs');
 const { sanitizeContext, isRoutingPromise, stripRoutingPromises } = require('./refusal.cjs');
 const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE, isLocalFileEdit, NAMED_APP_RE } = require('../../shared/text-patterns.cjs');
+const { replaceVocalizationTags, createVocalizationMapper } = require('../../shared/vocalization-tags.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const webSearchExpress = require('./nodes/webSearchExpress.cjs');
-const { execute: memoryQuick } = require('./nodes/memoryQuick.cjs');
 const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
 const planningNode = require('./nodes/planning.cjs');
 const { execute: statusCheck } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
+const screenNode = require('./nodes/screen.cjs');
 const { execute: handoff, complete: handoffComplete, remove: handoffRemove, startRetrySweep: startHandoffRetrySweep } = require('./handoff.cjs');
 const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
 const intentGuesser = require('./intentGuesser.cjs');
@@ -56,7 +57,7 @@ const { isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply } = require('.
 const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = require('./screen-context.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const agentLock = require('./agentLock.cjs');
-const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT, fetchExtSessions } = require('./route-decision.cjs');
+const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT } = require('./route-decision.cjs');
 const _decision = require('./decision.cjs');
 
 // ── Thought engine prompt producer ─────────────────────────────────────────────
@@ -768,7 +769,18 @@ async function _generateHandoffPhrase(englishText, detectedLanguage, conversatio
  */
 async function processMessage(args) {
   const startTime = Date.now();
-  const { text, language, source = 'text', speakerProfile, isResemble, thoughtContext = null, selectedText = null, planning = null, onReplyChunk = null } = args;
+  const { text, language, source = 'text', speakerProfile, isResemble, thoughtContext = null, selectedText = null, planning = null } = args;
+  let { onReplyChunk = null } = args;
+
+  // Vocalization tags ([sigh], [um], [laugh]…) are Resemble TTS markup —
+  // voice turns keep them raw for TTS; text turns get them mapped to emoji
+  // before they paint (stream chunks AND the final reply), so the feed never
+  // shows the literal tags.
+  let _vocMapper = null;
+  if (source !== 'voice' && typeof onReplyChunk === 'function') {
+    _vocMapper = createVocalizationMapper((t) => onReplyChunk(t));
+    onReplyChunk = (t) => _vocMapper.push(t);
+  }
 
   if (!text || !text.trim()) {
     return {
@@ -892,65 +904,6 @@ async function processMessage(args) {
     // "paused plan exists" line in the classify prompt so continuation
     // phrasings route semantically, not just on regex hits.
     _openPlan = planningNode.findOpenPlan(routedSessionId);
-
-    // ── Web-search express lane ─────────────────────────────────────────────
-    // A standalone public lookup (regex-guessed web_search AND context-free)
-    // doesn't need classify + the stategraph — the same web.search service
-    // answers it here in ~1.5s with identical overlay cards. Strict gates:
-    // any ambiguity (pronouns, continuation markers, selection, open plan,
-    // thought-card reply, file/screen referents) falls through to classify →
-    // handoff unchanged.
-    {
-      const _eg = intentGuesser.guess(classifyText, { hasSelectionContext }).guessedIntent;
-      // Bound-tab fact for the search veto — only fetched when the guesser
-      // already thinks SERP, so non-search prompts never pay the hop.
-      const _extSess = (_eg === 'web_search') ? await fetchExtSessions() : [];
-      if (_eg === 'web_search' && !thoughtContext
-          && webSearchExpress.isEligible(classifyText, {
-            hasSelectionContext,
-            extSessions: _extSess,
-            // Only a plan bound to THIS session and awaiting input vetoes —
-            // a dormant or cross-session draft must not disable the lane
-            // for every fresh lookup (disk scan finds stale plans forever).
-            openPlan: (_openPlan?.awaitingInput && _openPlan?.boundToSession) ? _openPlan : null,
-            hasAttachment: /\[File:|\[Folder:/i.test(englishText),
-          })) {
-        // Loading chip — SERP fetch takes 1-3s; show the user which engine is
-        // being tried until the real \x00ENGINE\x00 sentinel lands.
-        try { if (typeof onReplyChunk === 'function') onReplyChunk('\x00SEARCHING\x00google-serp'); } catch (_) {}
-        const _er = await webSearchExpress.execute({
-          englishText, originalText, detectedLanguage, context, onReplyChunk,
-        });
-        if (_er) {
-          logger.info('[Process] Search express answered — skipping classify + handoff', {
-            items: (_er.metadata?.items || []).length,
-            sources: (_er.metadata?.sources || []).length,
-          });
-          _notifyThoughtEngine('prompt', {
-            text: classifyText,
-            sessionId: routedSessionId,
-            intentName: 'search_express',
-          });
-          // Translate-back + record + return — same tail as the shared path.
-          let _fx = _er.fullText || _er.text;
-          const _sl = require('./translate.cjs').detectScriptLanguage(_fx || '');
-          if (wasTranslated && detectedLanguage !== 'en' && _fx && _fx.trim() && _sl !== detectedLanguage) {
-            try { _fx = await fromEnglish(_fx, detectedLanguage); } catch (_) {}
-          }
-          _addTurn(englishText, _fx, 1);
-          _logConversationTurn(englishText, _fx, 'search_express', routedSessionId, _er.metadata);
-          return {
-            text: _fx,
-            fullText: _fx,
-            intent: 1,
-            intentName: 'search_express',
-            detectedLanguage,
-            wasTranslated,
-            metadata: { ..._er.metadata, latencyMs: Date.now() - startTime },
-          };
-        }
-      }
-    }
 
     ({ intent, intentName, confidence, source: classifySource, resumePlanId: _resumePlanId } =
       await classify(classifyText, context, { hasSelectionContext, openPlan: _openPlan }));
@@ -1248,21 +1201,28 @@ async function processMessage(args) {
       break;
     }
 
-    case 2: { // memory_quick
-      result = await memoryQuick(englishText, systemPrompt, context);
-      // If memory_quick couldn't find a match, handoff instead
-      if (result.metadata.shouldHandoff) {
-        const { guessedIntent: _gi2 } = intentGuesser.guess(classifyText, { hasSelectionContext });
+    case 8: { // web_search — express executor (post-classify, single authority)
+      // The classifier assigned web_search; the express lane just EXECUTES —
+      // ~1.5s SERP direct to :3002 with the same overlay card contract.
+      // Abstain (no renderable results / service down) → real handoff so the
+      // stategraph's full web_search lane answers instead.
+      try { if (typeof onReplyChunk === 'function') onReplyChunk('\x00SEARCHING\x00google-serp'); } catch (_) {}
+      const _er = await webSearchExpress.execute({
+        englishText, originalText, detectedLanguage, context, onReplyChunk,
+      });
+      if (!_er) {
+        logger.info('[Process] Search express abstained → handoff');
+        const { guessedIntent: _gi8 } = intentGuesser.guess(classifyText, { hasSelectionContext });
         const handoffResult = await handoff({
           englishPrompt: englishText,
           source,
           originalPrompt: originalText,
           detectedLanguage,
-          guessedIntent: _gi2,
+          guessedIntent: _gi8,
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
         });
-        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi2);
+        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi8);
         const handoffText = handoffResult.parked
           ? `${basePhrase} I'll start on that as soon as the current task finishes.`
           : basePhrase;
@@ -1270,13 +1230,24 @@ async function processMessage(args) {
           text: handoffText,
           fullText: handoffText,
           metadata: {
-            ...result.metadata,
-            source: 'memory_quick_handoff',
+            source: 'web_search_handoff',
+            intent: 0,
             taskId: handoffResult.taskId,
             agentId: handoffResult.agentId,
+            parked: handoffResult.parked,
             speakable: false,
             guessedIntent,
           },
+        };
+      } else {
+        logger.info('[Process] Search express answered', {
+          items: (_er.metadata?.items || []).length,
+          sources: (_er.metadata?.sources || []).length,
+        });
+        result = {
+          text: _er.fullText || _er.text,
+          fullText: _er.fullText || _er.text,
+          metadata: { ..._er.metadata, intent: 8, intentName: 'web_search', source: 'search_express' },
         };
       }
       break;
@@ -1355,6 +1326,47 @@ async function processMessage(args) {
           prompt: String(_pmd.planTitle || englishText || '').slice(0, 200),
           taskCount: _pmd.taskCount || 0,
         });
+      }
+      break;
+    }
+
+    case 7: { // screen — direct GhostLayer display lane (no stategraph run)
+      result = await screenNode.execute({
+        englishText,
+        conversationContext: convHistory,
+        sessionId: routedSessionId,
+      });
+      // The lane couldn't resolve a payload from context (generative chart/
+      // scene asks, fetch-then-display) → real handoff so the stategraph's
+      // screenOutput node generates it.
+      if (result?.metadata?.shouldHandoff) {
+        const { guessedIntent: _gi7 } = intentGuesser.guess(classifyText, { hasSelectionContext });
+        const handoffResult = await handoff({
+          englishPrompt: englishText,
+          source,
+          originalPrompt: originalText,
+          detectedLanguage,
+          guessedIntent: _gi7,
+          sessionId: routedSessionId,
+          routeDecision: serializeDecision(_routeDecision),
+        });
+        const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi7);
+        const handoffText = handoffResult.parked
+          ? `${basePhrase} I'll start on that as soon as the current task finishes.`
+          : basePhrase;
+        result = {
+          text: handoffText,
+          fullText: handoffText,
+          metadata: {
+            source: 'screen_handoff',
+            intent: 0,
+            taskId: handoffResult.taskId,
+            agentId: handoffResult.agentId,
+            parked: handoffResult.parked,
+            speakable: false,
+            guessedIntent,
+          },
+        };
       }
       break;
     }
@@ -1452,6 +1464,7 @@ async function processMessage(args) {
   // Use fullText (the complete answer) not text (the first-sentence preview) —
   // display, translate-back, and conversation history all need the full reply.
   let finalText = result.fullText || result.text;
+  if (source !== 'voice') finalText = replaceVocalizationTags(finalText);
   // A localized SERP overview (or a same-language LLM reply) is already in the
   // user's language — a translate-back call would waste an LLM round-trip
   // echoing zh text through an "en→zh" prompt. Script-detectable languages
@@ -1473,7 +1486,7 @@ async function processMessage(args) {
   // ── Record conversation turn ──────────────────────────────────────────────────
   _addTurn(englishText, finalText, intent);
   // Log to conversation-service for quick intents (handoff is logged by stategraph)
-  if (intent === 1 || intent === 2 || intent === 5 || intent === 6) {
+  if (intent === 1 || intent === 5 || intent === 6 || intent === 7 || intent === 8) {
     _logConversationTurn(englishText, finalText, intentName, routedSessionId, result?.metadata);
   }
 
@@ -1483,9 +1496,13 @@ async function processMessage(args) {
     wasTranslated, detectedLanguage,
   });
 
+  // Release any '['-run the stream mapper is still holding (a partial tag at
+  // end-of-stream paints literally rather than disappearing).
+  if (_vocMapper) _vocMapper.flush();
+
   return {
     text: finalText,
-    fullText: result.fullText,
+    fullText: source !== 'voice' ? replaceVocalizationTags(result.fullText) : result.fullText,
     intent,
     intentName,
     detectedLanguage,

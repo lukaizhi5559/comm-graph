@@ -59,8 +59,9 @@ const SERVICE_TASK_TYPES = new Set([
 const LANE_BY_INTENT = {
   handoff: 0,
   general_quick: 1,
-  memory_quick: 2,
   memory_store: 5,
+  screen_display: 7,
+  web_search: 8,
 };
 
 let _classifyTask = null;
@@ -121,10 +122,12 @@ function deriveLane(tc) {
     return 'handoff';
   }
   if (tc.suggestedIntent === 'memory_store') return 'memory_store';
-  // Episodic/activity recall ("what was I doing monday") often arrives
-  // follow-up-shaped — the memory lane still owns it; handoff would burn a
-  // full graph run on a user-memory query.
-  if (tc.suggestedIntent === 'memory_retrieve' || tc.isActivityQuery) return 'memory_quick';
+  // A clean standalone lookup the envelope calls web_search can ride the
+  // express executor (~1.5s) instead of a full graph run.
+  if (tc.suggestedIntent === 'web_search') return 'web_search';
+  // Memory retrieval stays handoff — the stategraph's retrieveMemory does
+  // profile.get + memory.search with full context; the old demote to the
+  // memory_quick lane produced shallow/wrong answers.
   if (tc.suggestedIntent === 'greeting' || tc.suggestedIntent === 'general_knowledge') return 'general_quick';
   return 'handoff';
 }

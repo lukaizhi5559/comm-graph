@@ -41,11 +41,27 @@ const BACKEND_PATH = BACKEND_BASE.replace(/^https?:\/\/[^/]+/, '') || '/api/llm'
 const BACKEND_API_KEY = process.env.STATEGRAPH_API_KEY || '';
 
 // ── Messages → { systemPrompt, prompt } ────────────────────────────────────────
+// The backend contract is two flat strings, so a multi-turn messages[] array
+// must be flattened WITH role labels — without them the model can't tell its
+// own questions from the user's answers and re-asks what was already answered
+// (observed: planning lane looped on "Which day next week?" — the unlabeled
+// blob was dominated by the model's own repeated question). Single-message
+// callers pass through untouched; the labels match the "User:/Assistant:"
+// transcript convention used everywhere else (_formatContext, buildMessages).
 function _extractFromMessages(messages) {
   const systemMsgs = messages.filter(m => m.role === 'system');
   const userMsgs   = messages.filter(m => m.role !== 'system');
   const systemPrompt = systemMsgs.map(m => m.content).join('\n\n');
-  const prompt = userMsgs.map(m => m.content).join('\n\n');
+  const prompt = userMsgs.length <= 1
+    ? userMsgs.map(m => m.content).join('\n\n')
+    : userMsgs.map(m => {
+        const c = String(m.content || '');
+        if (m.role === 'assistant') return `Assistant: ${c}`;
+        // System-injected tool results are self-describing — keep the tag raw.
+        if (/^\s*<tool_results>/.test(c)) return c;
+        if (m.role === 'user') return `User: ${c}`;
+        return `${String(m.role || 'user').replace(/^./, ch => ch.toUpperCase())}: ${c}`;
+      }).join('\n\n');
   return { systemPrompt, prompt };
 }
 
@@ -385,4 +401,4 @@ function buildMessages(userText, systemPrompt, conversationContext) {
   return msgs;
 }
 
-module.exports = { ask, askEarly, askStream, buildMessages };
+module.exports = { ask, askEarly, askStream, buildMessages, _extractFromMessages };

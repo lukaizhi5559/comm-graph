@@ -37,6 +37,7 @@ const sysMap = require('../../../shared/system-map.cjs');
 const capIndex = require('../../../shared/capability-index.cjs');
 const { PLAN_CONFIRM_RE, PLAN_RUN_RE, PLAN_RUN_NEG_RE } = require('../../../shared/plan-check-phrases.cjs');
 const { extractContextRefs, mergeRefs } = require('../../../shared/context-refs.cjs');
+const decision = require('../decision.cjs');
 
 // Tolerant LLM-JSON parse for step generation — repairs unfenced replies,
 // dangling commas, unterminated strings and truncated arrays (the last step
@@ -487,6 +488,7 @@ function _scheduleStepGen(sess) {
     return;
   }
   _stepGenInFlight.add(sess.planId);
+  _activity(`generating steps for ${sess.tasks.length} task${sess.tasks.length > 1 ? 's' : ''}…`, 'plan');
   setImmediate(async () => {
     try {
       for (const task of sess.tasks) {
@@ -654,6 +656,116 @@ async function _toolMemoryDelete(arg) {
   return `Memory ${memoryId} deleted.`;
 }
 
+// profile.get("name") — canonical profile-attribute read (self:name etc.).
+// memory.search only sees the semantic store; canonical profile.set keys need
+// this endpoint. A bare attribute gets the self: prefix tried first.
+async function _toolProfileGet(arg) {
+  const key = String(arg || '').trim().replace(/\s+/g, '_').toLowerCase();
+  if (!key) return 'Usage: profile.get("<attribute>") — e.g. profile.get("name"), profile.get("email").';
+  const candidates = key.includes(':') ? [key] : [`self:${key}`, key];
+  for (const k of candidates) {
+    const res = await _postJson(MEMORY_PORT, '/profile.get', {
+      version: 'mcp.v1', service: 'user-memory', action: 'profile.get',
+      payload: { key: k },
+      requestId: 'cg_plan_pg_' + Date.now(),
+    }, MCP_API_KEY, 4000);
+    const value = res?.data?.valueRef || res?.data?.value || res?.data?.[k] || null;
+    if (value) return `${k} = ${value}`;
+  }
+  return `No profile value stored for "${key}" — try memory.search for less structured facts.`;
+}
+
+// memory.store("fact text") — the CREATE path the lane was missing: a "just
+// remember it" choice could only be narrated, never executed (observed:
+// "Filing that away for you" — nothing stored).
+async function _toolMemoryStore(arg) {
+  const text = String(arg || '').trim();
+  if (!text) return 'Usage: memory.store("<fact text>") — the fact to remember is required.';
+  const res = await _postJson(MEMORY_PORT, '/memory.store', {
+    version: 'mcp.v1', service: 'user-memory', action: 'memory.store',
+    payload: { text, metadata: { source: 'planning', type: 'general_memory' } },
+    context: { userId: 'local_user' },
+    requestId: 'cg_plan_ms_' + Date.now(),
+  }, MCP_API_KEY, 8000);
+  if (res?.status === 'error' || res?.error || res?.status !== 'ok') {
+    return `memory.store failed: ${res?.error?.message || res?.error?.code || res?.message || 'memory service unreachable or rejected the store'} — tell the user honestly; do NOT claim it was saved.`;
+  }
+  return `Stored: ${text}`;
+}
+
+// profile.set("name|John") — canonical profile-attribute write (self:name).
+// Prefer this for direct user facts ("my email is…"); memory.store for prose.
+async function _toolProfileSet(arg) {
+  const s = String(arg || '');
+  const pipe = s.indexOf('|');
+  if (pipe < 1) return 'Usage: profile.set("<attribute>|<value>") — e.g. profile.set("name|John").';
+  const attr = s.slice(0, pipe).trim().replace(/\s+/g, '_').toLowerCase();
+  const value = s.slice(pipe + 1).trim();
+  if (!attr || !value) return 'Usage: profile.set("<attribute>|<value>").';
+  const key = attr.includes(':') ? attr : `self:${attr}`;
+  const res = await _postJson(MEMORY_PORT, '/profile.set', {
+    version: 'mcp.v1', service: 'user-memory', action: 'profile.set',
+    payload: { key, value },
+    requestId: 'cg_plan_ps_' + Date.now(),
+  }, MCP_API_KEY, 5000);
+  if (res?.status === 'error' || res?.error) {
+    return `profile.set failed: ${res?.error?.message || res?.error?.code || res?.message || 'service error'} — do NOT claim it was saved.`;
+  }
+  return `Profile stored: ${key} = ${value}`;
+}
+
+// episodic.search("query|days") — activity/capture history: what the user was
+// watching, reading, doing. THE data behind "what did I watch this week" →
+// chart flows — memory.search only sees semantic facts, never captures.
+async function _toolEpisodicSearch(arg) {
+  const s = String(arg || '');
+  const pipe = s.indexOf('|');
+  const query = (pipe >= 0 ? s.slice(0, pipe) : s).trim();
+  let startDate, endDate;
+  if (pipe >= 0) {
+    const range = s.slice(pipe + 1).trim();
+    const days = parseInt(range, 10);
+    if (!isNaN(days) && days > 0) {
+      const now = new Date();
+      startDate = new Date(now.getTime() - days * 86400000).toISOString().slice(0, 10);
+      endDate = now.toISOString().slice(0, 10);
+    }
+  }
+  const res = await _postJson(MEMORY_PORT, '/episodic.search', {
+    version: 'mcp.v1', service: 'user-memory', action: 'episodic.search',
+    payload: { query: query || 'activity', limit: 10, ...(startDate ? { startDate, endDate } : {}), dedup: true },
+    requestId: 'cg_plan_eps_' + Date.now(),
+  }, MCP_API_KEY, 8000);
+  const results = res?.data?.results || res?.data?.captures || res?.data || [];
+  if (!Array.isArray(results) || !results.length) return 'No episodic memories found for that query/period — report that honestly.';
+  return results.slice(0, 10).map(r => {
+    const when = r.capturedAt || r.created_at || r.timestamp || '';
+    const app = r.appName || r.app || '';
+    const text = (r.text || r.title || r.windowTitle || r.content || '').replace(/\s+/g, ' ').slice(0, 120);
+    return `[${String(when).slice(0, 16)}] ${app ? `${app}: ` : ''}${text}`;
+  }).join('\n');
+}
+
+// memory.getAppUsageSummary("hours") — per-app usage durations ("how long was
+// I in X", "apps I used today/this week") — chart-ready numbers.
+async function _toolAppUsage(arg) {
+  const hours = Math.min(Math.max(parseInt(String(arg || ''), 10) || 168, 1), 720);
+  const res = await _postJson(MEMORY_PORT, '/memory.getAppUsageSummary', {
+    version: 'mcp.v1', service: 'user-memory', action: 'memory.getAppUsageSummary',
+    payload: { maxAgeHours: hours },
+    requestId: 'cg_plan_app_' + Date.now(),
+  }, MCP_API_KEY, 6000);
+  const rows = res?.data?.apps || res?.data?.summary || res?.data || [];
+  if (!Array.isArray(rows) || !rows.length) return 'No app usage recorded for that period.';
+  return rows.slice(0, 15).map(r => {
+    const app = r.appName || r.app || r.name || '?';
+    const dur = r.durationMinutes != null ? `${Math.round(r.durationMinutes)}m`
+      : r.minutes != null ? `${Math.round(r.minutes)}m`
+      : r.duration != null ? String(r.duration) : '';
+    return `${app}: ${dur}`;
+  }).join('\n');
+}
+
 async function _toolWebSearch(query) {
   const res = await _postJson(WEB_SEARCH_PORT, '/web.search', {
     version: 'mcp.v1', service: 'web-search', action: 'web.search',
@@ -681,7 +793,20 @@ async function _toolWebSearch(query) {
     .join('\n');
 }
 
-const _TOOL_RE = /<tool>\s*(memory\.search|memory\.update|memory\.delete|web\.search|media\.resolve|screen\.read|capability\.search|capability\.probe|capability\.select|plan\.find|plan\.open|plan\.status|plan\.cancel|journal\.recent|url\.open|setup\.start|screen\.preview|system\.map|logs\.tail|logs\.head|logs\.grep|logs\.range)(?:\s*\(\s*(?:"([^"]*)")?\s*\))?\s*<\/tool>/g;
+// Generic tool-marker parser — matches ANY <tool>name("arg")</tool> so a name
+// the registry doesn't know lands as a corrective <tool_results> entry and the
+// model self-corrects next round. The old allowlist regex silently dropped
+// unknown names: the model then narrated fake results to match its own claim
+// (observed: <tool>fs.read(...)</tool> "read" an RTF file that was never opened
+// — the reply carried a fabricated <tool_results> block with invented content).
+const _TOOL_CALL_RE = /<tool>\s*([a-zA-Z][\w.]*)\s*(?:\(\s*([\s\S]*?)\s*\))?\s*<\/tool>/g;
+
+// Lenient arg extraction — strip one matching quote pair; bare args pass as-is.
+function _toolArg(raw) {
+  const s = String(raw || '').trim();
+  const m = s.match(/^([\"'`])([\s\S]*)\1$/);
+  return m ? m[2] : s;
+}
 
 const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const COMMAND_API_KEY = process.env.MCP_COMMAND_API_KEY || process.env.MCP_API_KEY || '';
@@ -696,6 +821,85 @@ async function _toolMediaResolve(query) {
   return results.slice(0, 3)
     .map(r => `- ${r.title || ''}\n  ${r.url || ''}`)
     .join('\n');
+}
+
+// ── Local file tools — real reads via command-service skills ─────────────────
+// fs.read covers text/code reads, dir trees, grep, and stat; doc.read decodes
+// rtf/pdf/docx/xlsx/pptx via textutil/python extractors. READ-ONLY — there is
+// no write tool in this lane on purpose.
+const _FILE_TOOL_CAP = 12000; // chars per file — keeps results inside the window
+
+function _skillEnvelope(res) {
+  // /command.automate → {success:true, data:{ok, stdout, summary, ...raw}}
+  return res?.data || res;
+}
+
+async function _toolFsRead(arg) {
+  const p = String(arg || '').trim();
+  if (!p) return 'Usage: fs.read("absolute/path") — a file path is required (use dir.list for folders, doc.read for rtf/pdf/docx).';
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'fs.read', args: { action: 'read', path: p, maxFileSize: 200 * 1024 } },
+  }, COMMAND_API_KEY, 20000));
+  if (!res) return `fs.read failed: command-service unreachable (is it running on :${COMMAND_SERVICE_PORT}?). Try again or tell the user the file couldn't be read.`;
+  const files = Array.isArray(res.files) ? res.files : [];
+  if (!files.length) return `fs.read failed: ${res.error || 'no file content returned'} — the path may not exist ("${p}").`;
+  return files.map(f => {
+    if (!f.ok) return `${f.path}: ${f.error || 'unreadable'}`;
+    const body = String(f.content || '');
+    const trunc = body.length > _FILE_TOOL_CAP ? `\n… (${body.length - _FILE_TOOL_CAP} chars truncated)` : '';
+    return `${f.path} (${f.size} bytes, ${f.lines} lines)\n${body.slice(0, _FILE_TOOL_CAP)}${trunc}`;
+  }).join('\n\n');
+}
+
+async function _toolDirList(arg) {
+  const p = String(arg || '').trim();
+  if (!p) return 'Usage: dir.list("absolute/path") — a folder path is required.';
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'fs.read', args: { action: 'tree', path: p, maxDepth: 3 } },
+  }, COMMAND_API_KEY, 20000));
+  if (!res) return `dir.list failed: command-service unreachable (is it running on :${COMMAND_SERVICE_PORT}?).`;
+  if (res.ok === false) return `dir.list failed: ${res.error || 'unknown error'} — the folder may not exist ("${p}").`;
+  const tree = String(res.tree || '').slice(0, _FILE_TOOL_CAP);
+  return tree ? `Contents of ${res.path}:\n${tree}` : `${p} is empty.`;
+}
+
+async function _toolFsStat(arg) {
+  const p = String(arg || '').trim();
+  if (!p) return 'Usage: fs.stat("absolute/path") — a path is required.';
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'fs.read', args: { action: 'stat', path: p } },
+  }, COMMAND_API_KEY, 10000));
+  if (!res) return `fs.stat failed: command-service unreachable (is it running on :${COMMAND_SERVICE_PORT}?).`;
+  if (res.ok === false) return `fs.stat failed: ${res.error || 'unknown error'} — the path may not exist ("${p}").`;
+  return `${res.path}\n  type: ${res.type}  size: ${res.sizeFormatted || res.size}  modified: ${res.modified || 'unknown'}${res.entries != null ? `  entries: ${res.entries}` : ''}`;
+}
+
+async function _toolFsSearch(arg) {
+  // fs.search("path | pattern") — grep under a file or directory.
+  const pipe = String(arg || '').indexOf('|');
+  const p = (pipe >= 0 ? String(arg).slice(0, pipe) : String(arg)).trim();
+  const pattern = pipe >= 0 ? String(arg).slice(pipe + 1).trim() : '';
+  if (!p || !pattern) return 'Usage: fs.search("path | pattern") — both a path and a search pattern are required.';
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'fs.read', args: { action: 'search', path: p, pattern } },
+  }, COMMAND_API_KEY, 20000));
+  if (!res) return `fs.search failed: command-service unreachable (is it running on :${COMMAND_SERVICE_PORT}?).`;
+  if (res.ok === false) return `fs.search failed: ${res.error || 'unknown error'}`;
+  const out = String(res.output || (Array.isArray(res.matches) ? res.matches.join('\n') : '') || '').slice(0, _FILE_TOOL_CAP);
+  return out || `No matches for "${pattern}" under ${p}.`;
+}
+
+async function _toolDocRead(arg) {
+  const p = String(arg || '').trim();
+  if (!p) return 'Usage: doc.read("absolute/path") — a document path is required (rtf/pdf/docx/doc/xlsx/pptx/odt/html).';
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'doc.read', args: { path: p, maxChars: _FILE_TOOL_CAP } },
+  }, COMMAND_API_KEY, 30000));
+  if (!res) return `doc.read failed: command-service unreachable (is it running on :${COMMAND_SERVICE_PORT}?).`;
+  if (res.ok === false) return `doc.read failed: ${res.error || res.reason || 'unknown error'} — the file may not exist or the format may be unsupported ("${p}").`;
+  const text = String(res.text || '').trim();
+  if (!text) return `doc.read returned no text for "${p}" (${res.format || 'unknown format'}).`;
+  return `${res.path || p} [${res.format || 'doc'}${res.truncated ? ', truncated' : ''}]\n${text.slice(0, _FILE_TOOL_CAP)}`;
 }
 
 // ── Media-URL grounding ─────────────────────────────────────────────────────
@@ -1141,135 +1345,147 @@ function _ptyCmdText(r) {
 // beside the route card — two unrelated questions in one reply).
 const ROUTE_PICK_TOOLS = new Set(['capability.select', 'setup.start', 'plan.cancel', 'plan.find', 'plan.open', 'plan.status']);
 
+// Read-only probe runs VISIBLY in the diagnosis pane — but the pane executes
+// through a real shell, so the raw string must pass the same verb/metachar
+// gate as the spawn path before it can run.
+async function _toolCapabilityProbeVisible(commandLine) {
+  const gate = capIndex.validateProbeCommand(commandLine);
+  if (!gate.ok) {
+    return `PROBE DENIED (${gate.denied}) — capability.probe only runs "<cli-tool> <read-only verb>" (help/status/list/version/auth status…). Reissue with an allowed verb.`;
+  }
+  const r = await _ptyDiagnose(commandLine);
+  return _ptyCmdText(r) || await _toolCapabilityProbe(commandLine);
+}
+
+// logs.* run as REAL terminal commands in the pane — visible, bounded,
+// greppable. Falls back to the file helpers when the PTY layer is unreachable.
+async function _toolLogsPty(kind, query) {
+  const file = _logFilePath((query || '').split('|')[0].trim().split(/[,\s]/)[0]);
+  const args2 = String(query || '');
+  let shellCmd = null;
+  if (file) {
+    if (kind === 'tail') shellCmd = `tail -n ${_parseLogQuery(args2, 80).n} ${JSON.stringify(file)}`;
+    else if (kind === 'head') shellCmd = `head -n ${_parseLogQuery(args2, 50).n} ${JSON.stringify(file)}`;
+    else if (kind === 'grep') {
+      const parts = args2.split('|').map(s => s.trim());
+      const gm = (parts[1] || '').match(/^([^\s,"]+)(?:[,\s]+(\d+))?/);
+      shellCmd = gm ? `grep -n -i -C${gm[2] || 3} ${JSON.stringify(gm[1])} ${JSON.stringify(file)} | head -n 120` : null;
+    } else {
+      const parts = args2.split('|').map(s => s.trim());
+      const rm = (parts[1] || '').match(/(\d+)\s*-\s*(\d+)/);
+      shellCmd = rm ? `sed -n '${rm[1]},${rm[2]}p' ${JSON.stringify(file)} | nl -ba -v${rm[1]}` : null;
+    }
+  }
+  const fb = kind === 'tail' ? () => _toolLogsTail(query)
+           : kind === 'head' ? () => _toolLogsHead(query)
+           : kind === 'grep' ? () => _toolLogsGrep(query)
+           : () => _toolLogsRange(query);
+  return shellCmd ? await _ptyLogsCmd(shellCmd, fb) : fb();
+}
+
+function _shortPath(p) {
+  const s = String(p || '').trim();
+  const tail = s.split('/').filter(Boolean).pop() || s;
+  return s.length > 60 ? `…/${tail}` : s;
+}
+function _logLabel(q) {
+  return String(q || '').split('|')[0].trim().split(/[,\s]/)[0] || 'log';
+}
+
+// Tool registry — name → {note(arg) → ticker line, run(arg, ctx) → result text}.
+// The directive's TOOLS section must stay in sync with these keys; the drift
+// check at the bottom of this file warns when they diverge.
+const TOOL_HANDLERS = {
+  'memory.search':     { note: q => `searching memory for "${q}"…`,              run: (q) => _toolMemorySearch(q) },
+  'memory.update':     { note: () => 'updating stored memory…',                  run: (q) => _toolMemoryUpdate(q) },
+  'memory.delete':     { note: () => 'deleting stored memory…',                  run: (q) => _toolMemoryDelete(q) },
+  'memory.store':      { note: () => 'saving to memory…',                        run: (q) => _toolMemoryStore(q) },
+  'profile.get':       { note: () => 'checking stored profile fact…',            run: (q) => _toolProfileGet(q) },
+  'profile.set':       { note: q => `storing profile fact ${String(q || '').split('|')[0]}…`, run: (q) => _toolProfileSet(q) },
+  'episodic.search':   { note: q => `searching activity history for "${q}"…`,    run: (q) => _toolEpisodicSearch(q) },
+  'memory.getAppUsageSummary': { note: () => 'summarizing app usage…',           run: (q) => _toolAppUsage(q) },
+  'web.search':        { note: q => `searching the web for "${q}"…`,             run: (q) => _toolWebSearch(q) },
+  'media.resolve':     { note: q => `finding playable media: "${q}"…`,           run: (q) => _toolMediaResolve(q) },
+  'screen.read':       { note: () => 'reading the screen…',                      run: (q) => _toolScreenRead(q) },
+  'capability.search': { note: q => `looking up capabilities for "${q}"…`,       run: (q, ctx) => ctx?.opts?.optionsTurn
+                          ? 'SKIPPED — a verified route-options list was already shown for this turn. Do not re-search; ask the user to pick from the list.'
+                          : _toolCapabilitySearch(q) },
+  'capability.probe':  { note: q => `probing ${String(q || '').split(/\s+/)[0] || 'tool'}…`, run: (q) => _toolCapabilityProbeVisible(q) },
+  'capability.select': { note: q => `registering ${q}…`,                         run: (q) => _toolCapabilitySelect(q) },
+  'plan.find':         { note: q => `searching saved plans for "${q}"…`,         run: (q) => _toolPlanFind(q) },
+  'plan.open':         { note: q => `opening saved plan ${q}…`,                  run: (q, ctx) => _toolPlanOpen(q, ctx?.sessionId) },
+  'plan.status':       { note: () => 'checking plan status…',                    run: (q, ctx) => _toolPlanStatus(q, ctx?.sessionId) },
+  'plan.cancel':       { note: () => 'cancelling the plan…',                     run: (q, ctx) => _toolPlanCancel(q, ctx?.sessionId) },
+  'journal.recent':    { note: () => 'checking the task journal…',               run: (q) => _toolJournalRecent(q) },
+  'url.open':          { note: q => `opening ${q}…`,                             run: (q, ctx) => _toolUrlOpen(q, ctx?.sessionId) },
+  'setup.start':       { note: q => `starting ${q} setup in the terminal…`,      run: (q) => _toolSetupStart(q) },
+  'screen.preview':    { note: () => 'rendering a preview on screen…',           run: (q) => _toolScreenPreview(q) },
+  'system.map':        { note: () => 'loading ThinkDrop system map…',            run: () => sysMap.renderLayout() },
+  'logs.tail':         { note: q => `tailing ${_logLabel(q)}…`,                  run: (q) => _toolLogsPty('tail', q) },
+  'logs.head':         { note: q => `reading top of ${_logLabel(q)}…`,           run: (q) => _toolLogsPty('head', q) },
+  'logs.grep':         { note: q => `searching ${_logLabel(q)} logs…`,           run: (q) => _toolLogsPty('grep', q) },
+  'logs.range':        { note: q => `reading ${_logLabel(q)} lines…`,            run: (q) => _toolLogsPty('range', q) },
+  'fs.read':           { note: q => `reading ${_shortPath(q)}…`,                 run: (q) => _toolFsRead(q) },
+  'dir.list':          { note: q => `listing ${_shortPath(q)}…`,                 run: (q) => _toolDirList(q) },
+  'fs.stat':           { note: q => `checking ${_shortPath(q)}…`,                run: (q) => _toolFsStat(q) },
+  'fs.search':         { note: q => `searching files under ${_shortPath(q)}…`,   run: (q) => _toolFsSearch(q) },
+  'doc.read':          { note: q => `extracting text from ${_shortPath(q)}…`,    run: (q) => _toolDocRead(q) },
+};
+
+/**
+ * Extract + execute every <tool>name("arg")</tool> marker in a model reply.
+ * Returns { text, toolCalls } — text is the <tool_results> body injected back
+ * as the next user turn; toolCalls is the structured record for metadata so
+ * the UI can show what actually ran. Returns null when no marker exists.
+ */
 async function _runTools(text, sessionId, opts = {}) {
   const calls = [];
-  _TOOL_RE.lastIndex = 0;
+  _TOOL_CALL_RE.lastIndex = 0;
   let m;
-  while ((m = _TOOL_RE.exec(text)) !== null) {
-    calls.push({ tool: m[1], query: m[2] });
+  while ((m = _TOOL_CALL_RE.exec(text)) !== null) {
+    calls.push({ tool: m[1], query: _toolArg(m[2]) });
   }
   if (!calls.length) return null;
   const results = [];
-  for (const call of calls.slice(0, 3)) {
+  const toolCalls = [];
+  for (const call of calls.slice(0, 4)) {
     logger.info('[Planning] Tool call', { tool: call.tool, query: call.query });
-    let out;
+    const handler = TOOL_HANDLERS[call.tool];
+    let out, ok = true;
     if (opts.routePickTurn && !ROUTE_PICK_TOOLS.has(call.tool)) {
+      ok = false;
       out = 'SKIPPED — the verified route-options list is already on screen. Ask which route the user wants; other lookups wait until after they pick.';
-      results.push(`${call.tool}("${call.query || ''}") →\n${out}`);
-      continue;
-    }
-    if (call.tool === 'memory.search') {
-      await _ptyNote(`searching memory for "${call.query}"…`);
-      out = await _toolMemorySearch(call.query);
-    }
-    else if (call.tool === 'memory.update') {
-      await _ptyNote('updating stored memory…');
-      out = await _toolMemoryUpdate(call.query);
-    }
-    else if (call.tool === 'memory.delete') {
-      await _ptyNote('deleting stored memory…');
-      out = await _toolMemoryDelete(call.query);
-    }
-    else if (call.tool === 'web.search') {
-      await _ptyNote(`searching the web for "${call.query}"…`);
-      out = await _toolWebSearch(call.query);
-    }
-    else if (call.tool === 'media.resolve') {
-      await _ptyNote(`finding playable media: "${call.query}"…`);
-      out = await _toolMediaResolve(call.query);
-    }
-    else if (call.tool === 'screen.read') {
-      await _ptyNote('reading the screen…');
-      out = await _toolScreenRead(call.query);
-    }
-    else if (call.tool === 'capability.search') {
-      if (opts.optionsTurn) {
-        out = 'SKIPPED — a verified route-options list was already shown for this turn. Do not re-search; ask the user to pick from the list.';
-      } else {
-        await _ptyNote(`looking up capabilities for "${call.query}"…`);
-        out = await _toolCapabilitySearch(call.query);
+    } else if (!handler) {
+      // Unknown name — the model called a tool that doesn't exist in this
+      // lane (e.g. fs.read before it was registered, or a run-lane agent name
+      // like edit.agent). Correct it explicitly so the next round calls a
+      // real tool instead of fabricating a result to match the narration.
+      ok = false;
+      await _ptyNote(`unknown tool ${call.tool} — correcting…`);
+      logger.warn('[Planning] Unknown tool call — injecting correction', { tool: call.tool });
+      out = `UNKNOWN TOOL "${call.tool}" — it does not exist in this lane. Valid tools: ${Object.keys(TOOL_HANDLERS).join(', ')}. To read local files/folders/documents use fs.read, dir.list, doc.read, or fs.search. Re-emit the call with a valid name, or answer only from what is already known.`;
+    } else {
+      try {
+        const note = typeof handler.note === 'function' ? handler.note(call.query) : null;
+        if (note) await _ptyNote(note);
+        out = await handler.run(call.query, { sessionId, opts });
+        if (out == null || out === '') { ok = false; out = '(no result)'; }
+        else if (/^(?:[\w.]+\s+)?(?:failed|FAILED|denied|DENIED|SKIPPED|threw)\b|\bfailed:/i.test(String(out).slice(0, 80))) ok = false;
+      } catch (err) {
+        ok = false;
+        out = `${call.tool} threw: ${err.message}`;
+        logger.warn('[Planning] Tool call threw', { tool: call.tool, error: err.message });
       }
     }
-    else if (call.tool === 'capability.probe') {
-      // Read-only probe runs VISIBLY in the diagnosis pane — but the pane
-      // executes through a real shell, so the raw string must pass the same
-      // verb/metachar gate as the spawn path before it can run.
-      const gate = capIndex.validateProbeCommand(call.query);
-      if (!gate.ok) {
-        out = `PROBE DENIED (${gate.denied}) — capability.probe only runs "<cli-tool> <read-only verb>" (help/status/list/version/auth status…). Reissue with an allowed verb.`;
-      } else {
-        const r = await _ptyDiagnose(call.query);
-        out = _ptyCmdText(r) || await _toolCapabilityProbe(call.query);
-      }
-    }
-    else if (call.tool === 'plan.find') {
-      await _ptyNote(`searching saved plans for "${call.query}"…`);
-      out = _toolPlanFind(call.query);
-    }
-    else if (call.tool === 'plan.open') {
-      await _ptyNote(`opening saved plan ${call.query}…`);
-      out = _toolPlanOpen(call.query, sessionId);
-    }
-    else if (call.tool === 'plan.status') {
-      await _ptyNote(`checking plan status…`);
-      out = await _toolPlanStatus(call.query, sessionId);
-    }
-    else if (call.tool === 'plan.cancel') {
-      await _ptyNote(`cancelling the plan…`);
-      out = await _toolPlanCancel(call.query, sessionId);
-    }
-    else if (call.tool === 'journal.recent') {
-      await _ptyNote(`checking the task journal…`);
-      out = _toolJournalRecent(call.query);
-    }
-    else if (call.tool === 'url.open') {
-      await _ptyNote(`opening ${call.query}…`);
-      out = await _toolUrlOpen(call.query, sessionId);
-    }
-    else if (call.tool === 'setup.start') {
-      await _ptyNote(`starting ${call.query} setup in the terminal…`);
-      out = await _toolSetupStart(call.query);
-    }
-    else if (call.tool === 'screen.preview') {
-      await _ptyNote('rendering a preview on screen…');
-      out = await _toolScreenPreview(call.query);
-    }
-    else if (call.tool === 'system.map') {
-      await _ptyNote('loading ThinkDrop system map…');
-      out = sysMap.renderLayout();
-    }
-    else if (call.tool === 'logs.tail' || call.tool === 'logs.head'
-             || call.tool === 'logs.grep' || call.tool === 'logs.range') {
-      // Real terminal command in the pane — visible, bounded, greppable.
-      const file = _logFilePath((call.query || '').split('|')[0].trim().split(/[,\s]/)[0]);
-      const args2 = String(call.query || '');
-      let shellCmd = null;
-      if (file) {
-        if (call.tool === 'logs.tail') shellCmd = `tail -n ${_parseLogQuery(args2, 80).n} ${JSON.stringify(file)}`;
-        else if (call.tool === 'logs.head') shellCmd = `head -n ${_parseLogQuery(args2, 50).n} ${JSON.stringify(file)}`;
-        else if (call.tool === 'logs.grep') {
-          const parts = args2.split('|').map(s => s.trim());
-          const gm = (parts[1] || '').match(/^([^\s,"]+)(?:[,\s]+(\d+))?/);
-          shellCmd = gm ? `grep -n -i -C${gm[2] || 3} ${JSON.stringify(gm[1])} ${JSON.stringify(file)} | head -n 120` : null;
-        } else {
-          const parts = args2.split('|').map(s => s.trim());
-          const rm = (parts[1] || '').match(/(\d+)\s*-\s*(\d+)/);
-          shellCmd = rm ? `sed -n '${rm[1]},${rm[2]}p' ${JSON.stringify(file)} | nl -ba -v${rm[1]}` : null;
-        }
-      }
-      const fb = call.tool === 'logs.tail' ? () => _toolLogsTail(call.query)
-               : call.tool === 'logs.head' ? () => _toolLogsHead(call.query)
-               : call.tool === 'logs.grep' ? () => _toolLogsGrep(call.query)
-               : () => _toolLogsRange(call.query);
-      out = shellCmd ? await _ptyLogsCmd(shellCmd, fb) : fb();
-    }
-    else {
-      await _ptyNote(`registering ${call.query}…`);
-      out = await _toolCapabilitySelect(call.query);
-    }
-    results.push(`${call.tool}("${call.query || ''}") →\n${out || '(no result)'}`);
+    const brief = String(out || '').split('\n')[0].slice(0, 90);
+    _activity(`${call.tool} ${ok ? 'done' : 'failed'} — ${brief}`, ok ? 'tool' : 'warn');
+    toolCalls.push({ tool: call.tool, query: call.query || '', ok, detail: brief });
+    results.push(`${call.tool}("${call.query || ''}") →\n${out}`);
   }
-  return results.join('\n\n');
+  if (calls.length > 4) {
+    results.push(`(${calls.length - 4} more tool call(s) ignored — at most 4 run per turn)`);
+  }
+  return { text: results.join('\n\n'), toolCalls };
 }
 
 // ── Planning directive (appended to the persona system prompt) ────────────────
@@ -1285,6 +1501,16 @@ needed to make the plan correct, and (2) maintain the plan's Task list.
 
 TOOLS — when you need facts about the user or the world, emit ONE of:
   <tool>memory.search("query")</tool>       — the user's stored facts/preferences;
+  <tool>memory.store("fact text")</tool>    — save a fact the user asked to remember;
+  <tool>profile.get("name")</tool>          — canonical profile attribute (self:name,
+                                            self:email, …); use when memory.search
+                                            doesn't have a direct fact.
+  <tool>profile.set("name|John")</tool>     — write a canonical profile attribute;
+  <tool>episodic.search("query|days")</tool> — activity/capture history: what the
+                                            user was watching/reading/doing. Use
+                                            for "what have I been watching/doing".
+  <tool>memory.getAppUsageSummary("hours")</tool> — per-app usage durations
+                                            ("apps I used", "how long in X").
                                             each result line starts with its
                                             [memoryId] for update/delete calls
   <tool>memory.update("id|new text")</tool> — rewrite a stored fact by memoryId
@@ -1362,6 +1588,22 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             been running", "did the X send" →
                                             this tool. Number arg = how many
                                             (default 15).
+  <tool>fs.read("absolute/path")</tool>     — read a local file's REAL contents
+                                            (text/code/markdown/json). For
+                                            rtf/pdf/docx use doc.read —
+                                            fs.read can't decode binary
+                                            formats. Use dir.list first when
+                                            you don't know the exact filename.
+  <tool>dir.list("absolute/path")</tool>    — directory tree of a folder: file
+                                            names and structure. Use this when
+                                            the user names a folder you haven't
+                                            seen.
+  <tool>doc.read("absolute/path")</tool>    — extract text from rtf, pdf, docx,
+                                            doc, xlsx, pptx, odt, html.
+  <tool>fs.search("path | pattern")</tool>  — grep a file or directory for a
+                                            pattern (pipe separates them).
+  <tool>fs.stat("absolute/path")</tool>     — file metadata without reading:
+                                            exists? size? last modified?
   <tool>setup.start("nylas")</tool>         — ThinkDrop runs the service's real
                                             setup ITSELF in the terminal pane:
                                             init/auth/install commands, then it
@@ -1419,23 +1661,33 @@ Use at most 3 tool calls per turn, then answer. Tool results come back inside
 VISIBILITY — every tool call you emit appears on the user's live activity
 line; the user can see exactly what you are doing. NEVER narrate work in
 progress — no "I'm looking into that", "I'm running this", "checking that
-folder", "one moment while I…". Emit the tool call; the ticker shows it.
-Your words should carry only conclusions, questions, or plan changes. If a
-tool fails or returns nothing useful, say that plainly — never imply a
-check ran when it didn't.
+folder", "one moment while I…", "let me read that file" — a reply that
+describes work in progress without a <tool> call is REJECTED and you get
+one more turn to emit the real call. Emit the tool call; the ticker shows
+it. Your words should carry only conclusions, questions, or plan changes.
+NEVER write <tool_results> yourself — results are system-generated; a
+<tool_results> block in your reply is stripped and rejected. If a tool
+fails or returns nothing useful, say that plainly — never imply a check
+ran when it didn't.
 
 LOCAL LANES — reading, writing, moving, searching, or converting files on
-THIS computer is NEVER a capability gap. shell, fs.read, doc.read,
-edit.agent, shell.run, cli.agent already cover it — put them in the Agents
-line directly. Never capability.search/select and never pin an MCP server
-or external CLI just to touch the user's own files, folders, clipboard, or
-screen. capability.search is for EXTERNAL services only (APIs, SaaS tools,
-web services, device control).
+THIS computer is NEVER a capability gap. When YOU need to look at a file
+or folder while drafting, the tools above cover it directly:
+fs.read / dir.list / doc.read / fs.search / fs.stat as <tool> calls. When a
+TASK needs local file work at run time, shell, edit.agent, shell.run,
+cli.agent cover it — put them in the Agents line. Never
+capability.search/select and never pin an MCP server or external CLI just
+to touch the user's own files, folders, clipboard, or screen.
+capability.search is for EXTERNAL services only (APIs, SaaS tools, web
+services, device control).
 
 CLARIFY — when the request is ambiguous, underspecified, or risky, ask ONE
 question at a time (important for voice). Good questions resolve: target
 service/account, names/titles, timing, dependencies between steps, and
-whether the user is already signed in.
+whether the user is already signed in. Scan the conversation before asking —
+NEVER re-ask anything the user already answered, including bundled answers
+like "friday, dentist appt". The moment route + required details are known,
+emit <plan_update> in this same reply — no extra confirmation questions.
 
 PLAN UPDATE — whenever the plan changes (first draft, edits after answers),
 emit the COMPLETE task list inside <plan_update>...</plan_update> using this
@@ -1596,7 +1848,10 @@ OTHER MARKERS (optional):
     planning"). Emitting this marker REALLY flips the mode off in the app —
     the plan draft stays saved and resumable ("continue the plan"). Never say
     planning mode is off/closed/exited without this marker — it is the ONLY
-    thing that exits.
+    thing that exits. Also emit it when a turn resolves COMPLETELY through a
+    tool result — a stored fact, an answered question — with no plan drafted:
+    confirm in one sentence and emit <plan_exit/>. Planning is for plans; a
+    turn that ended in a single action leaves the lane.
 
 REPLY TEXT — everything outside the markers is spoken/shown to the user.
 Keep it short and conversational: acknowledge, ask your one question, or
@@ -1613,6 +1868,15 @@ offer to resume ("say 'run it'"), never narrate progress that isn't happening.
 Question about the user → memory.search ALWAYS first — even "what do you
 remember about me". If a tool fails, report the failure; never fill the gap
 with a plausible-sounding answer.
+
+PERSONAL EVENT WITHOUT AN ACTION — when the user states a future event but
+says nothing about what to do ("I have an appointment next week at 5",
+"my dentist appt is friday"), do NOT just store it or draft a plan blindly.
+Offer <choices>: "Just remember it", "Add to my calendar", "Set a reminder" —
+and if the day/date or other detail is missing, ask for it in the same turn
+before drafting any tasks. When the user PICKS a choice, DO it — memory.store
+for "remember it", a drafted task for calendar/reminder — never only
+acknowledge with words like "noted" or "filing that away".
 
 CONFLICTING MEMORY — when memory.search returns contradictory values for the
 same fact (e.g. two different names for "my wife"), do NOT pick one silently
@@ -1640,6 +1904,18 @@ a page (sign up, log in, verify, approve scopes, copy an API key), ALWAYS
 give the direct URL and offer to open it via url.open — real URLs only
 (setup.start's setupUrl or a web.search result); never guess a URL.
 ═══════════════════════════════════════════════`;
+
+// Directive ↔ registry drift check — a tool the directive doesn't document
+// gets called by name anyway (the model saw it in run-lane docs) and the old
+// allowlist regex silently dropped it; a documented tool with no handler
+// hangs the same way. Warn loudly at boot so the lists can't drift silently.
+try {
+  for (const name of Object.keys(TOOL_HANDLERS)) {
+    if (!PLANNING_DIRECTIVE.includes(`<tool>${name}`)) {
+      logger.warn(`[Planning] Directive missing tool doc: ${name}`);
+    }
+  }
+} catch (_) {}
 
 // ── Marker extraction ─────────────────────────────────────────────────────────
 
@@ -1707,6 +1983,53 @@ function _stripMetaTags(text) {
     .replace(/<\/?budget:token_budget\s*\/?\s*>/gi, '');
 }
 
+// Model-emitted <tool_results> blocks are fabrications — real results are
+// injected by this lane as user-role turns. Strip them (closed AND unclosed)
+// from assistant text before it enters history or display.
+function _stripFabricatedResults(text) {
+  return String(text || '')
+    .replace(/<tool_results>[\s\S]*?<\/tool_results>/gi, '')
+    .replace(/<tool_results>[\s\S]*$/gi, '');
+}
+
+// Reply prose that claims in-progress tool work — used by the stall gate.
+// Broad set feeds the decision-model question; the tight set is the fallback
+// verdict when phi4 is unreachable (fail toward honesty, never toward silent
+// fabrication).
+const _CLAIM_TOOL_WORK_RE = /\b(?:let me|i'?ll|i'?m|i am|i will|going to|one (?:sec|second|moment|minute)|hold on|bear with me)\b[^.!?\n]{0,80}\b(?:read|reading|check|checking|look|looking|pull(?:ing)? up|open|opening|search|searching|scan|scanning|list|listing|fetch|fetching|load|loading|inspect|examining|grab|grabbing|find|finding|retriev\w+|review\w+|load up|bring up)\b|\b(?:reading|checking|searching|scanning|listing|fetching|loading|opening|inspecting|pulling up|looking at)\s+(?:the|your|that|both|this)\b/i;
+const _STRONG_CLAIM_RE = /\b(?:i'?m (?:now )?(?:reading|checking|looking|pulling|opening|searching|scanning|fetching|loading|listing)|let me (?:read|check|look|pull|open|search|scan|fetch|list)|one (?:sec|moment|minute)|hold on (?:a (?:sec|moment|second) )?while|bear with me while|apolog\w+ for the delay)\b/i;
+// Completion claims — "filing that away", "saved", "added it" — a false-DONE
+// is worse than a stall: the user believes the action happened. Plan-marker
+// vocabulary (drafted/approved/running) is excluded — those come from real
+// markers, not tools.
+const _CLAIM_COMPLETION_RE = /\b(?:fil(?:ed|ing)\s+(?:that|it|this|away)|saved|stored|noted|added\s+(?:it|that|this|them|to)|done\b|finished|completed|set\s+(?:a\s+|the\s+|your\s+|up\s+a\s+)?reminder|scheduled|booked|created|updated|deleted|cancelled|sent|posted|opened|launched|marked|remembered\s+(?:that|it|this|for\s+you))\b/i;
+
+// ── Repeat-question guard helpers ────────────────────────────────────────────
+// Normalize a question for dedup — strip vocalization tags, punctuation, and
+// glue words so "Which day next week should I schedule it?" and "Which day
+// next week?" share the same content stem.
+const _Q_GLUE = new Set(['the','a','an','it','its','your','you','for','of','to','in','on','do','does','did','should','would','could','about','me','my','we','i','just','please','any','some','this','that','be','is','are','was','were','am','at','so','if']);
+function _qNorm(q) {
+  return String(q || '')
+    .toLowerCase()
+    .replace(/\[(?:sigh|um|laugh|gasp|crying)\]/g, ' ')
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w && !_Q_GLUE.has(w))
+    .join(' ');
+}
+// ≥70% of the shorter question's content tokens shared → same question.
+// (Distinct asks like "call the event" vs "title the event" stay separate.)
+function _qSimilar(a, b) {
+  const wa = new Set(String(a).split(' ').filter(Boolean));
+  const wb = new Set(String(b).split(' ').filter(Boolean));
+  const n = Math.min(wa.size, wb.size);
+  if (!n) return false;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared++;
+  return shared / n >= 0.7;
+}
+
 function _stripMarkers(text) {
   return _stripMetaTags(String(text || ''))
     .replace(/<tool>[\s\S]*?<\/tool>/g, '')
@@ -1718,6 +2041,10 @@ function _stripMarkers(text) {
     .replace(/<plan_exit\s*\/?\s*>/g, '')
     .replace(/<choices>[\s\S]*?<\/choices>/g, '')
     .replace(/<tool_results>[\s\S]*?<\/tool_results>/g, '')
+    // Unclosed markers — an open <tool>/<tool_results> with no closer swallows
+    // the rest of the reply (the model's fabricated results end mid-stream).
+    .replace(/<tool_results>[\s\S]*$/g, '')
+    .replace(/<tool>[\s\S]*$/g, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
@@ -2042,28 +2369,80 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     sess._routeRecommended = recommended || null;
   }
   if (sess.tasks.length) { sess._routeOptions = null; sess._needsInfo = null; sess._routeRecommended = null; }
-  const _optsTurn = gateReason === 'capability_options' || !!sess._routeOptions;
-  const _optionsList = sess._routeOptions || (gateReason === 'capability_options' ? capabilityHints : null);
+  // The SHOWING turn (gateReason just arrived) is the only one where the
+  // reply is restricted to the route question. sess._routeOptions persists
+  // into the follow-up turns so the pick can resolve — but those turns get
+  // post-show instructions: the old block kept saying "reply ONLY with the
+  // route question" after the user had already picked, which is one of the
+  // ways the lane looped on the same question.
+  const _showTurn = gateReason === 'capability_options';
+  const _optsTurn = _showTurn || !!sess._routeOptions;
+  const _optionsList = sess._routeOptions || (_showTurn ? capabilityHints : null);
   const _missingInfo = sess._needsInfo || needsInfo;
   // The gate's recommended pick (selector verdict) — drives the card's
   // RECOMMENDED badge. Falls back to first-ready only when absent.
   const _recommendedId = sess._routeRecommended || recommended || null;
+
+  // Deterministic pick detection — a follow-up turn naming an option label/
+  // id/service is the pick; the model must never re-ask which route.
+  const _normPick = s => String(s || '').toLowerCase().replace(/\.agent\b/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
+  const _pickable = (!_showTurn && Array.isArray(_optionsList) && _optionsList.length);
+  const _picked = _pickable
+    ? _optionsList.find(h => {
+        const t = ` ${_normPick(englishText)} `;
+        const cands = [h.label, h.id, h.service, h.tool]
+          .map(_normPick)
+          .filter(v => v.length >= 3)
+          .flatMap(v => {
+            const dedup = [...new Set(v.split(' '))].join(' ');
+            const first = v.split(' ')[0];
+            return [v, dedup, ...(first.length >= 4 ? [first] : [])];
+          });
+        return cands.some(c => t.includes(` ${c} `));
+      })
+    : null;
+  if (_picked) sess._routePicked = _picked.label || _picked.id;
+  const _pickedName = _picked
+    ? String(_picked.tool || _picked.service || _picked.id || _picked.label)
+    : (sess._routePicked || null);
+
+  const _missingInfoAsk = _missingInfo === 'recipient'
+    ? 'the missing recipient detail (phone number / contact)'
+    : (_missingInfo && _missingInfo !== 'clarify' ? `the missing ${_missingInfo} detail` : 'any still-missing required detail');
+  const _renderOptionLine = h =>
+    `- ${h.label || h.id}${h.ready ? ' — READY (installed/registered)' : ' — needs setup'}${_isRecommended(h, _recommendedId) ? ' — RECOMMENDED' : ''}${h.setupSummary ? `, setup: "${h.setupSummary}"` : ''}${h.eta ? `, eta: ${h.eta}` : ''}${h.authEnv?.length ? `, needs keys: ${h.authEnv.join(', ')}` : ''}`;
+
+  const _routeBlock = (_optsTurn && Array.isArray(_optionsList) && _optionsList.length)
+    ? (_showTurn
+      ? `\n\nROUTE OPTIONS — an options card listing these verified routes is shown to the user automatically. Do NOT emit <choices> or list them yourself; do NOT call capability.search (the list is already verified and complete). ` +
+        `Your reply this turn is ONLY the route question — one short conversational sentence asking which route they want. Do NOT call other tools (memory.search, web.search, etc.) and do NOT ask about anything else — sign-in, credentials, missing details, or unrelated questions all come AFTER they pick. ` +
+        `If one is marked ready/recommended, say it's the suggested one. ` +
+        `After they pick: (a) if the pick isn't a registered agent, call <tool>capability.select("<name>")</tool> to get its agentId; ` +
+        (_missingInfo && _missingInfo !== 'clarify'
+          ? `(b) ask for ${_missingInfoAsk} — ONE short question; (c) when both route and ${_missingInfo === 'recipient' ? 'recipient' : 'details'} are known, immediately <plan_update> the task with the agentId and details baked in — no confirmation loops.`
+          : `(b) if any required detail is still missing, ask ONE short question; (c) when the route and details are known, immediately <plan_update> the task with the agentId baked in — no confirmation loops.`) +
+        ` If the pick needs setup, call <tool>setup.start("<name>")</tool> AFTER collecting missing details.\n\nOptions:\n`
+        + _optionsList.map(_renderOptionLine).join('\n')
+      : _pickedName
+        ? `\n\nROUTE PICKED — the user chose "${_pickedName}" from the verified options. NEVER ask which route to use. ` +
+          `(a) if it isn't a registered agent, call <tool>capability.select("${_pickedName}")</tool> ONCE to get its agentId; ` +
+          `(b) if a required detail is still missing, ask for ${_missingInfoAsk} — ONE short question; ` +
+          `(c) when route + details are known, emit <plan_update> in this same reply — no confirmation loops. ` +
+          `If the pick needs setup, call <tool>setup.start("${_pickedName}")</tool> AFTER collecting missing details.\n\nOptions (reference):\n`
+          + _optionsList.map(_renderOptionLine).join('\n')
+        : `\n\nROUTE OPTIONS ALREADY SHOWN — the verified options card is on screen (list below for reference — do NOT re-render it or emit <choices>). ` +
+          `The user's message may pick a route, answer a pending detail question, or add information. If it names an option, treat it as the pick and follow the after-pick steps — NEVER re-ask which route. ` +
+          `Otherwise continue with ${_missingInfoAsk} — ONE short question. Once route + details are known, emit <plan_update> in this reply.\n\nOptions:\n`
+          + _optionsList.map(_renderOptionLine).join('\n'))
+    : null;
 
   const sysContent = (systemPrompt || '') + PLANNING_DIRECTIVE
     + `\n\nREGISTERED AGENTS (the ONLY agent names allowed in Tasks):\n`
     + _renderAgentCatalog()
     + `\n\nCURRENT PLAN STATE (planId ${sess.planId}, file already saved — update it with <plan_update> when it changes):\n`
     + _renderPlanState(sess)
-    + (Array.isArray(_optionsList) && _optionsList.length && _optsTurn
-      ? `\n\nROUTE OPTIONS — an options card listing these verified routes is shown to the user automatically. Do NOT emit <choices> or list them yourself; do NOT call capability.search (the list is already verified and complete). ` +
-        `Your reply this turn is ONLY the route question — one short conversational sentence asking which route they want. Do NOT call other tools (memory.search, web.search, etc.) and do NOT ask about anything else — sign-in, credentials, missing details, or unrelated questions all come AFTER they pick. ` +
-        `If one is marked ready/recommended, say it's the suggested one. ` +
-        `After they pick: (a) if the pick isn't a registered agent, call <tool>capability.select("<name>")</tool> to get its agentId; ` +
-        (_missingInfo && _missingInfo !== 'clarify'
-          ? `(b) ask for the missing ${_missingInfo === 'recipient' ? 'recipient detail (phone number / contact)' : `${_missingInfo} detail`} — ONE short question; (c) when both route and ${_missingInfo === 'recipient' ? 'recipient' : 'details'} are known, immediately <plan_update> the task with the agentId and details baked in — no confirmation loops.`
-          : `(b) if any required detail is still missing, ask ONE short question; (c) when the route and details are known, immediately <plan_update> the task with the agentId baked in — no confirmation loops.`) +
-        ` If the pick needs setup, call <tool>setup.start("<name>")</tool> AFTER collecting missing details.\n\nOptions:\n`
-        + _optionsList.map(h => `- ${h.label || h.id}${h.ready ? ' — READY (installed/registered)' : ' — needs setup'}${_isRecommended(h, _recommendedId) ? ' — RECOMMENDED' : ''}${h.setupSummary ? `, setup: "${h.setupSummary}"` : ''}${h.eta ? `, eta: ${h.eta}` : ''}${h.authEnv?.length ? `, needs keys: ${h.authEnv.join(', ')}` : ''}`).join('\n')
+    + (_routeBlock !== null
+      ? _routeBlock
       : Array.isArray(capabilityHints) && capabilityHints.length
       ? `\n\nVERIFIED CANDIDATES (existence confirmed by the capability index — prefer these in <choices> over your own suggestions, ordered easiest-setup first):\n`
         + capabilityHints.map(h =>
@@ -2074,7 +2453,10 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
         + `App: ${screenCtx.appName || '?'}${screenCtx.url ? `, URL: ${screenCtx.url}` : ''}${screenCtx.title ? `, Window: "${screenCtx.title}"` : ''}`
         + (screenCtx.ocrText ? `\nVisible text: ${screenCtx.ocrText}` : '')
       : '')
-    + (sess.contextSeed
+    + (sess.contextSeed && sess.history.length <= 4
+      // The seed exists to ground a fragmentary ENTRY prompt — once the
+      // session has its own turns they are the truth, and a frozen stale
+      // conversation (routed session may be unrelated) only misleads.
       ? `\n\nPRIOR CONVERSATION (context only — planning started mid-conversation; the user's latest message may refer to this):\n${sess.contextSeed}`
       : '');
 
@@ -2087,7 +2469,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   let replyText = '';
   let toolNotes = null;
   let planCancelQuery = null;
-  const MAX_TOOL_ROUNDS = 2;
+  const MAX_TOOL_ROUNDS = 3; // extra room: a stall-recovery round still leaves two for real tools
   let planChanged = false;
   const unknownAgents = [];
   // <plan_run/> seen in ANY round (the request flag sticks across the loop);
@@ -2096,8 +2478,13 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   let planRunRejected = false;
 
   const streamFilter = onReplyChunk ? new _StreamFilter(onReplyChunk) : null;
+  const sessToolCalls = [];
+  let stallChecked = false;
+  let stallRecovered = false;
+  let repeatCorrected = false;
 
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+    _activity(round === 0 ? 'planning · thinking…' : `planning · still working — round ${round + 1} of ${MAX_TOOL_ROUNDS + 1}`, 'plan');
     const messages = [{ role: 'system', content: sysContent }, ...sess.history];
     const { text } = await askStream(messages, {
       maxTokens: 1200,
@@ -2114,7 +2501,18 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
 
     // Provider scaffolding artifacts (e.g. <budget:token_budget>) must not
     // enter stored history — the model would imitate the markup next turn.
-    const cleanText = _stripMetaTags(text);
+    let cleanText = _stripMetaTags(text);
+    // Model-emitted <tool_results> are FABRICATIONS — real results only arrive
+    // as system-injected user turns. Strip them so invented file contents or
+    // search results can't enter history (the observed failure: the model
+    // wrote a <tool_results> block full of invented RTF text when its fs.read
+    // call silently did nothing).
+    const fabricatedResults = /<tool_results>[\s\S]/i.test(cleanText);
+    if (fabricatedResults) {
+      logger.warn('[Planning] Stripped model-fabricated <tool_results>', { planId: sess.planId, round });
+      _activity('ignored a fabricated tool result — verifying for real', 'warn');
+      cleanText = _stripFabricatedResults(cleanText);
+    }
 
     // A plan.cancel call in ANY round may close the lane — the final
     // replyText won't carry the earlier round's tool call, so capture the
@@ -2128,12 +2526,16 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     if (_applyPlanMarkers(cleanText, sess, unknownAgents)) planChanged = true;
     if (/<plan_run\s*\/?\s*>/.test(cleanText)) planRunSeen = true;
 
-    const toolResults = await _runTools(cleanText, sessionId, { optionsTurn: _optsTurn, routePickTurn: gateReason === 'capability_options' });
+    const ran = await _runTools(cleanText, sessionId, { optionsTurn: _optsTurn, routePickTurn: gateReason === 'capability_options' });
+    if (ran?.toolCalls?.length) sessToolCalls.push(...ran.toolCalls);
+    const toolResults = ran?.text || null;
     _recordObservedMedia(sess, toolResults);
     if (toolResults && round < MAX_TOOL_ROUNDS) {
-      // Record the assistant's tool-call turn, then feed results back.
+      // Record the assistant's tool-call turn, then feed results back. A
+      // fabricated <tool_results> riding beside real calls gets a corrective
+      // note so the model knows which results are real.
       sess.history.push({ role: 'assistant', content: cleanText });
-      sess.history.push({ role: 'user', content: `<tool_results>\n${toolResults}\n</tool_results>` });
+      sess.history.push({ role: 'user', content: `<tool_results>\n${toolResults}${fabricatedResults ? '\n\nNOTE: a <tool_results> block you wrote was removed — results are system-generated. Trust ONLY the entries above.' : ''}\n</tool_results>` });
       toolNotes = (toolNotes ? toolNotes + '\n' : '') + toolResults;
       continue;
     }
@@ -2148,6 +2550,75 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       sess.history.push({ role: 'user', content: '<tool_results>\nplan_run → REJECTED: the plan has no tasks, so nothing would run. Emit the complete task list in <plan_update> first (Agents line: use the agentId from capability.select or REGISTERED AGENTS), then <plan_run/> again — or ask the user what is missing.\n</tool_results>' });
       continue;
     }
+
+    // ── Stall verification ───────────────────────────────────────────────
+    // The reply narrates in-progress tool work ("I'm reading the file now…")
+    // but no <tool> marker executed this round — either the model forgot the
+    // marker or called a name not in the registry. The semantic check goes
+    // through the local decision model: does this reply promise work that did
+    // not happen? A fabricated <tool_results> block is an automatic YES — the
+    // model already proved it's inventing evidence.
+    const spokenSoFar = _stripMarkers(cleanText);
+    if (!toolResults && !stallChecked && round < MAX_TOOL_ROUNDS
+        && (fabricatedResults || _CLAIM_TOOL_WORK_RE.test(spokenSoFar) || _CLAIM_COMPLETION_RE.test(spokenSoFar))) {
+      stallChecked = true;
+      let verdict = fabricatedResults; // fabrication is a proven stall — no judgment needed
+      if (!verdict) {
+        let r = null;
+        try {
+          r = await decision.askDecision([{
+            id: 'stall', type: 'choice',
+            question: 'The assistant reply says it is doing tool work (reading files, searching, checking something) but NO tool call was executed in this turn. Does this reply promise work that did not happen?',
+            options: ['YES', 'NO'],
+          }], { state: spokenSoFar.slice(0, 800), timeoutMs: 6000 });
+          verdict = r?.answers?.stall?.label === 'YES';
+        } catch (_) {}
+        // Decision model down → fall back to the strong-claim regex so the
+        // honest path still wins over silent narration.
+        if (!verdict && r == null && _STRONG_CLAIM_RE.test(spokenSoFar)) verdict = true;
+        logger.info('[Planning] Stall verifier', { verdict, planId: sess.planId, round });
+      }
+      if (verdict) {
+        stallRecovered = true;
+        _activity('planning stall detected — recovering…', 'warn');
+        logger.warn('[Planning] Narration without tool execution — corrective round', { planId: sess.planId, round, fabricated: fabricatedResults });
+        sess.history.push({ role: 'assistant', content: cleanText });
+        sess.history.push({ role: 'user', content: '<tool_results>\nsystem → REJECTED: '
+          + (fabricatedResults
+            ? 'your reply contained a <tool_results> block — results are system-generated only; yours was removed.'
+            : 'your reply described work in progress but no <tool> call was emitted — nothing actually happened.')
+          + ' If a lookup was intended, emit the real <tool>name("arg")</tool> call now (valid tools: '
+          + Object.keys(TOOL_HANDLERS).join(', ')
+          + '). Otherwise answer only with what is already known — do not narrate work that is not running.\n</tool_results>' });
+        continue;
+      }
+    }
+
+    // ── Repeat-question guard ────────────────────────────────────────────
+    // A clarifying question the lane ALREADY asked (and the user answered)
+    // means the model lost the thread — observed loop: "Which day next
+    // week?" re-asked four times after the user had already said "friday".
+    // Detect a duplicate trailing question, reject it like a failed tool
+    // call, and take one more round with an explicit instruction to use the
+    // answer it already has.
+    const _trailingQ = (() => {
+      const s = spokenSoFar.trim();
+      const m = s.match(/([^.!?]*\?)\s*$/);
+      return m ? m[1].trim() : null;
+    })();
+    if (_trailingQ && !repeatCorrected && round < MAX_TOOL_ROUNDS) {
+      const key = _qNorm(_trailingQ);
+      const prev = (sess._askedQuestions ||= []);
+      if (prev.some(p => _qSimilar(p, key))) {
+        repeatCorrected = true;
+        _activity('re-asked an answered question — correcting…', 'warn');
+        logger.warn('[Planning] Repeat-question loop detected — corrective round', { planId: sess.planId, round, question: _trailingQ.slice(0, 80) });
+        sess.history.push({ role: 'assistant', content: cleanText });
+        sess.history.push({ role: 'user', content: '<tool_results>\nsystem → REJECTED: you already asked that question and the user answered it — re-read the conversation above and use their answer. If route + required details are now known, emit <plan_update> in this reply; if something else is genuinely missing, ask about THAT — never repeat a question.\n</tool_results>' });
+        continue;
+      }
+    }
+    if (_trailingQ) (sess._askedQuestions ||= []).push(_qNorm(_trailingQ));
 
     sess.history.push({ role: 'assistant', content: cleanText });
     replyText = cleanText;
@@ -2293,12 +2764,24 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
 
   // Marker-only replies need a fallback that says what actually happened —
   // never "working on it" prose when nothing moved.
-  const spoken = _stripMarkers(replyText)
+  let spoken = _stripMarkers(replyText)
     || (sess.tasks.length
       ? 'I updated the plan — take a look.'
       : (planRunSeen
         ? "The plan is still empty — nothing to run. Tell me the tasks you want in it, or say 'exit planning'."
         : "The plan is empty — tell me what you want it to do."));
+
+  // Last-line honesty scrub — zero tools ran all turn but the reply still
+  // narrates in-progress work ("I'm reading the file now"). Drop the claim
+  // sentences entirely; if nothing else remains, say what actually happened.
+  if (!sessToolCalls.length && (_CLAIM_TOOL_WORK_RE.test(spoken) || _CLAIM_COMPLETION_RE.test(spoken))) {
+    const kept = spoken
+      .split(/(?<=[.!?…—])\s+/)
+      .filter(s => s.trim() && !_CLAIM_TOOL_WORK_RE.test(s) && !_STRONG_CLAIM_RE.test(s) && !_CLAIM_COMPLETION_RE.test(s))
+      .join(' ').trim();
+    spoken = kept || "I went to look that up but nothing actually ran — try rephrasing or ask me again.";
+    logger.warn('[Planning] Final reply scrubbed — claim prose with zero tool calls', { planId: sess.planId });
+  }
 
   // A clarifying question during drafting must mark the session awaiting input —
   // otherwise findOpenPlan() sees an empty plan as closed and the user's answer
@@ -2326,6 +2809,10 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       exitPlanning,
       startedExplicit,
       speakable: true,
+      // What actually ran this turn — the feed can badge "tools used" and the
+      // stall check's recovery is visible rather than silent.
+      toolCalls: sessToolCalls,
+      stallRecovered,
     },
   };
 }
@@ -2364,7 +2851,10 @@ function _liveInstallCheck(title) {
 }
 
 function _renderPlanState(sess) {
-  if (!sess.tasks.length) return '(no tasks yet — first turn)';
+  // Never say "first turn" — the string is injected on EVERY turn while the
+  // plan is empty, and the model took it literally: it kept re-asking the
+  // opening clarify question because the state claimed none had happened.
+  if (!sess.tasks.length) return '(no tasks yet — emit <plan_update> once route + required details are known)';
   const lines = sess.tasks.map(t => {
     const live = /pending|progress|running/i.test(String(t.status || ''))
       ? _liveInstallCheck(t.title) : null;

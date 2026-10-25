@@ -25,8 +25,8 @@ const CASES = [
   ['is it done yet', 3, 'is it done → status_check'],
   ['any progress on that', 3, 'progress → status_check'],
 
-  ["what's my name", 2, 'name recall → memory_quick'],
-  ['what is my favorite color', 2, 'color recall → memory_quick'],
+  ["what's my name", 0, 'name recall → handoff (memory_quick removed)'],
+  ['what is my favorite color', 0, 'color recall → handoff (memory_quick removed)'],
 
   ['remember I have a dentist appointment next Tuesday', 5, 'dentist appt → memory_store'],
   ['note: buy milk tomorrow', 5, 'note → memory_store'],

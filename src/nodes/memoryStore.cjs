@@ -81,12 +81,15 @@ async function execute(englishText, systemPrompt, conversationContext) {
     };
   }
 
-  // Store failed — handoff to stategraph which has a more robust store path
-  logger.warn('[MemoryStore] Store failed, handing off');
+  // Store failed — reply honestly. Handing the raw statement to the graph
+  // decomposes it into whatever automation the parser invents (observed: "I
+  // have an appointment next week" → a doomed Google-Calendar run against the
+  // foreground tab). No task is better than the wrong task.
+  logger.warn('[MemoryStore] Store failed — honest reply, no handoff');
   return {
-    text: "Let me save that for you — one moment.",
-    fullText: "Let me save that for you — one moment.",
-    metadata: { source: 'memory_store_failed', intent: 5, shouldHandoff: true },
+    text: "I couldn't save that just now — the memory service isn't reachable. Try again in a moment?",
+    fullText: "I couldn't save that just now — the memory service isn't reachable. Try again in a moment?",
+    metadata: { source: 'memory_store_failed', intent: 5 },
   };
 }
 

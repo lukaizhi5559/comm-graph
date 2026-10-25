@@ -36,10 +36,12 @@ check('query + greeting → general_quick',
   deriveLane({ taskType: 'query', suggestedIntent: 'greeting' }) === 'general_quick');
 check('query + memory_store → memory_store',
   deriveLane({ taskType: 'query', suggestedIntent: 'memory_store' }) === 'memory_store');
-check('query + memory_retrieve (not follow-up) → memory_quick',
-  deriveLane({ taskType: 'query', suggestedIntent: 'memory_retrieve', isFollowUp: false }) === 'memory_quick');
+check('query + memory_retrieve (not follow-up) → handoff (memory_quick removed)',
+  deriveLane({ taskType: 'query', suggestedIntent: 'memory_retrieve', isFollowUp: false }) === 'handoff');
 check('query + memory_retrieve follow-up stays handoff (needs graph context)',
   deriveLane({ taskType: 'query', suggestedIntent: 'memory_retrieve', isFollowUp: true }) === 'handoff');
+check('query + web_search demotes to express executor',
+  deriveLane({ taskType: 'query', suggestedIntent: 'web_search', isFollowUp: false }) === 'web_search');
 check('query + command_automate stays handoff',
   deriveLane({ taskType: 'query', suggestedIntent: 'command_automate' }) === 'handoff');
 check('query + screen flag stays handoff',
@@ -57,7 +59,8 @@ check('null envelope stays handoff',
 
 // ── lane → intent-number bridge ──────────────────────────────────────────
 check('general_quick maps to intent 1', LANE_BY_INTENT.general_quick === 1);
-check('memory_quick maps to intent 2', LANE_BY_INTENT.memory_quick === 2);
+check('web_search maps to intent 8', LANE_BY_INTENT.web_search === 8);
+check('memory_quick removed from LANE_BY_INTENT', LANE_BY_INTENT.memory_quick === undefined);
 check('memory_store maps to intent 5', LANE_BY_INTENT.memory_store === 5);
 check('handoff maps to intent 0', LANE_BY_INTENT.handoff === 0);
 
