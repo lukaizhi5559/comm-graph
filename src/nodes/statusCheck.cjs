@@ -13,6 +13,7 @@ const http = require('http');
 const { ask, buildMessages } = require('../llm-providers.cjs');
 const { formatStatusSummary, getActiveTasks, getRecentTasks } = require('../taskJournal.cjs');
 const sysMap = require('../../../shared/system-map.cjs');
+const { computeTurnFacts } = require('../../../shared/turn-facts.cjs');
 
 // ── Visible log reads — same 'thinkdrop: check' pane session as planning ──
 const COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
@@ -133,7 +134,9 @@ function isStatusQuery(englishText) {
 // search saved plans on disk (incl. terminal ones) instead of trusting memory.
 const _PLAN_PROBE_RE = /\b(?:a\s+|the\s+|my\s+|our\s+)?([\w][\w .-]{0,40}?)\s+plan\b|\bplan\s+(?:for|about|on)\s+([\w][\w .-]{1,40})/i;
 function _probePlan(englishText) {
-  const s = String(englishText || '');
+  // Referent probing reads turn-fact userText — a [Highlighted:] blob quoting
+  // "the plan" must not echo a plan it merely mentions.
+  const s = computeTurnFacts({ rawText: englishText }).userText;
   if (!/\bplan\b/i.test(s)) return null;
   const m = s.match(_PLAN_PROBE_RE);
   const query = (m && (m[1] || m[2]) || '').trim()
@@ -141,7 +144,8 @@ function _probePlan(englishText) {
   // "the plan" / "my plan" alone carries no referent — let open-plan path answer.
   const meaningful = query.split(/[^a-z0-9]+/i).filter(t => t.length > 1 && !/^(the|a|an|my|our|new|next|same|plan)$/i.test(t));
   if (!meaningful.length) return null;
-  const hits = require('../../../shared/system-map.cjs').findPlans(query);
+  // Score floor — one generic token ("current") must not bind a random plan.
+  const hits = require('../../../shared/system-map.cjs').findPlans(query).filter(h => (h.score || 0) >= 6);
   if (!hits.length) return null;
   const p = hits[0];
   return `Yes — I found the ${p.name || p.title || 'saved'} plan (${p.planId}), `

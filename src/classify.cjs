@@ -22,8 +22,9 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('./logger.cjs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE, isContextDependent } = require('../../shared/text-patterns.cjs');
+const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE, isContextDependent, CONTROL_SIGNAL_RE } = require('../../shared/text-patterns.cjs');
 const { isLocalMultiEntityTask } = require('../../shared/context-refs.cjs');
+const _ds = require('../../shared/decision-state.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
@@ -35,7 +36,7 @@ const INTENTS = {
   // pause/resume are intentionally absent — those signals are unimplemented
   // (main.js aborts on 'cancel' only); advertising them here routes utterances
   // to a node that can't serve them.
-  4: { name: 'control_signal',    description: 'Cancel, stop, or abort a running task' },
+  4: { name: 'control_signal',    description: 'Cancel, stop, or abort a RUNNING ThinkDrop task ("cancel that", "stop it", "nevermind") — ONLY while a task is in flight. NOT for deleting/removing a created artifact (event, file, reminder, meeting) — those are handoff actions on the artifact itself.' },
   5: { name: 'memory_store',      description: 'Storing a general memory, note, appointment, or event — NOT a personal profile fact. E.g., "i have a dentist appt next week", "remember I have a meeting at 3pm", "note: buy milk tomorrow"' },
   6: { name: 'planning',          description: 'Requests that need a multi-task plan drafted BEFORE execution — brainstorming, "let\'s plan X", building/creating a new skill, app, agent, workflow, automation, or script, or multiple distinct deliverables/services in one request (e.g. doc + calendar + sheet, add to cart then email me). NOT single quick actions.' },
   7: { name: 'screen',            description: 'Display content on the user\'s screen output surface — show a previous reply/search result/file on screen ("show this on the screen", "put that chart up"), paint text/doc/image/chart/deck/effect/emoji/alert/three.js scene, or clear the screen. The output surface only — NOT for gathering data first ("check my mail and show it on screen" is handoff) and NOT for observing the screen ("what\'s on my screen" is handoff).' },
@@ -146,15 +147,28 @@ const GRAPH_ONLY_INTENTS = new Set(['command_automate', 'screen_analysis', 'memo
 // in the open plan, or the referent is bare "it"/"the plan".
 const _INSTALL_PROBE_RE = /\b(?:is|was|did)\s+(?:the\s+plan|it|that|([a-z0-9@._-]+))\s+(installed|set up|done|finished|working|running|complete|still going)\b/i;
 
+// Résumé/CV document signals — when "resume" is the only plan-resume match
+// AND these appear, the word is a noun (a biodata doc), not "resume the plan".
+// Observed: "Analyze the attached resume and compare…" pinned into planning
+// three times while a stale plan was open.
+const _RESUME_DOC_RE = /\b(?:attached|attach|pdf|cv|biodata|doc(?:ument)?|file|highlighted|job|career|experien|analy[sz]e|review|compare|upload|edit|read|scan|hiring|applicant|candidate|application|portfolio)\b/i;
+const _RESUME_VERB_CONTEXT_RE = /\b(?:continue|resume|keep going|carry on|pick up)\b[^.]{0,25}\b(?:plan|tasks?|setup|install|workflow|checklist)\b/i;
+
 function _isPlanResume(englishText, openPlan) {
   const t = String(englishText || '');
-  if (PLAN_RESUME_RE.test(t)) return true;
+  if (PLAN_RESUME_RE.test(t)) {
+    // Ambiguous: "resume" appears with document context and no resume-the-plan
+    // phrasing — could be a résumé/CV. The guard asks semantically instead of
+    // blind-pinning (AGENTS.md: lexical overrides need a verdict).
+    if (_RESUME_DOC_RE.test(t) && !_RESUME_VERB_CONTEXT_RE.test(t)) return 'ambiguous';
+    return 'yes';
+  }
   const m = t.match(_INSTALL_PROBE_RE);
-  if (!m) return false;
+  if (!m) return 'no';
   const entity = (m[1] || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (!entity) return true; // bare "it"/"the plan" — referent is the open plan
+  if (!entity) return 'yes'; // bare "it"/"the plan" — referent is the open plan
   const haystack = `${openPlan.title || ''} ${(openPlan.taskTitles || []).join(' ')}`.toLowerCase();
-  return haystack.includes(entity);
+  return haystack.includes(entity) ? 'yes' : 'no';
 }
 
 // Multi-deliverable complexity scorer — catches prompts that never SAY "plan"
@@ -237,7 +251,25 @@ async function classify(englishText, conversationContext, opts = {}) {
   // planning lane resolves planId via _sessionToPlan and answers from the
   // plan file (or emits <plan_run/>). Approval words are excluded — they're
   // consumed by _tryResolvePendingApproval upstream.
-  if (openPlan && _isPlanResume(englishText, openPlan)) {
+  const _planResumeVerdict = openPlan ? _isPlanResume(englishText, openPlan) : 'no';
+  if (_planResumeVerdict === 'ambiguous') {
+    // Lexical collision — "resume" the document vs resume-the-plan. Never
+    // blind-pin: the semantic verdict decides (fail-open to normal classify).
+    const _dec = require('./decision.cjs');
+    const _prv = await _dec.confirmJudgment({
+      site: 'plan-resume',
+      question: 'The user message contains the word "resume". Are they asking to RESUME the paused plan, or talking about a résumé/CV document? Answer YES only if they mean resume the plan.',
+      state: _ds.buildDecisionState({
+        site: 'plan-resume',
+        message: englishText,
+        extras: [`Paused plan: "${openPlan.title}" — ${openPlan.pendingCount}/${openPlan.totalTasks} undone`],
+      }),
+    });
+    logger.info(`[semantic-gate-evidence] site=plan-resume verdict=${_prv || 'null'} input=${englishText.substring(0, 60)}`);
+    if (_prv === 'YES') {
+      return { intent: 6, intentName: 'planning', confidence: 0.9, source: 'plan_resume_guard', resumePlanId: openPlan.planId };
+    }
+  } else if (_planResumeVerdict === 'yes') {
     logger.info('[Classify] Plan-resume guard → planning', {
       inputPreview: englishText.substring(0, 60),
       planId: openPlan.planId,
@@ -420,6 +452,18 @@ async function classify(englishText, conversationContext, opts = {}) {
       });
       return { intent: 0, intentName: 'handoff', confidence: 0.85, source: 'action_veto' };
     }
+    // Control-vocab guard: intent 4 can only abort a RUNNING task — the
+    // utterance must carry control vocabulary ("cancel", "stop", "nevermind").
+    // Observed: "use nylas to delte it" drew control_signal → the lane has no
+    // handler for artifact deletion → dead-end "did you want to cancel
+    // something?". Artifact mutations route to handoff where the stategraph
+    // (and the artifact-referent pin) can act on them.
+    if (result.intent === 4 && !(CONTROL_SIGNAL_RE && CONTROL_SIGNAL_RE.test(englishText))) {
+      logger.info('[Classify] control_signal picked but no control vocabulary — veto to handoff', {
+        inputPreview: englishText.substring(0, 60),
+      });
+      return { intent: 0, intentName: 'handoff', confidence: 0.8, source: 'control_vocab_veto' };
+    }
     // Multi-deliverable upgrade: LLM routes a many-service/many-action prompt to
     // handoff (or even general_quick) — the complexity scorer catches the shape
     // the LLM missed and moves it to the planning lane instead of one fused run.
@@ -473,13 +517,37 @@ async function classify(englishText, conversationContext, opts = {}) {
     if (!result || (result.intent !== 0 && result.intent !== 5)) return result;
     if (_isQuestion || englishText.trim().split(/\s+/).length < 3) return result;
     if (!decision.decisionEnabled()) return result;
+    // Resolvable-referent skip — "the current web page/screen/tab" IS the
+    // target; the stategraph resolves it against live context, so nothing is
+    // missing. Observed: "Scroll to the bottom of the current web page" and
+    // "Open the Medicaid site" were judged missing-detail → planning. Same
+    // for clearly imperative actions the guesser already recognizes.
+    if (/\b(?:the|this|that|current|my|open|visible)\s+(?:web\s?)?(?:page|site|website|tab|screen|window|document|doc|form|field|app|browser)\b/i.test(englishText)
+        || /\b(?:check|search|look|see|recall|find|is there|what'?s in|do you (?:have|remember))\b[^.]{0,40}\b(?:memory|memories|stored|saved|remembered)\b/i.test(englishText)
+        || (GRAPH_ONLY_INTENTS.has(_guessedIntent) && englishText.trim().split(/\s+/).length >= 4)) {
+      return result;
+    }
     try {
-      const r = await decision.askDecision([{
-        id: 'missing', type: 'choice',
-        question: 'This user statement would be executed or stored as-is. Is it missing details needed to act correctly (missing target, date, recipient, or subject) OR ambiguous about what the user wants done? Answer NO for clear instructions, questions, and complete statements.',
-        options: ['YES', 'NO'],
-      }], { state: `User message: ${englishText}` });
-      if (r?.answers?.missing?.label === 'YES') {
+      // The decision model sees conversation context — a referential prompt
+      // ("the calendar event to take out the trash I want you to remove it
+      // now") judged in a vacuum looks ambiguous; with the prior create turn
+      // in view it is a complete instruction. Observed: zero-context state
+      // sent an event-delete to planning, which pinned the UI and produced an
+      // empty plan.
+      const _ctxStr = Array.isArray(conversationContext)
+        ? conversationContext.join('\n')
+        : String(conversationContext || '');
+      const _missingV = await decision.confirmJudgment({
+        site: 'missing-detail',
+        question: 'This user statement would be executed or stored as-is. Is it missing details needed to act correctly (missing target, date, recipient, or subject) OR ambiguous about what the user wants done? Answer NO for clear instructions, questions, and complete statements — including actions on an artifact already established in the conversation (e.g. "delete that event I just set" after an event was created is complete), and actions whose target is the user\'s current page, screen, tab, site, or window (e.g. "scroll to the bottom of the current web page" is complete — the open page is the target).',
+        state: _ds.buildDecisionState({
+          site: 'missing-detail',
+          message: englishText,
+          history: _ctxStr.split('\n').filter(Boolean).slice(-3),
+        }),
+      });
+      logger.info(`[semantic-gate-evidence] site=missing-detail verdict=${_missingV || 'null'} input=${englishText.substring(0, 60)}`);
+      if (_missingV === 'YES') {
         logger.info('[Classify] Missing-details decision → planning', {
           was: result.intentName, inputPreview: englishText.substring(0, 60),
         });
@@ -502,12 +570,17 @@ async function classify(englishText, conversationContext, opts = {}) {
     const _boundHosts = (_extSess || [])
       .map(s => { try { return new URL(s.url).hostname.replace(/^www\./, ''); } catch (_) { return null; } })
       .filter(Boolean);
-    const state = [
-      conversationContext ? `Conversation context (last 3 turns):\n${conversationContext}` : '',
-      _boundHosts.length ? `The user's browser has these pages open and bound to automation: ${_boundHosts.join(', ')} — any prompt that acts on, searches within, or continues from one of those open pages is intent 0 (handoff), NEVER a quick answer lane.` : '',
-      openPlan ? `Open plan: "${openPlan.title}" is paused — ${openPlan.pendingCount} of ${openPlan.totalTasks} tasks still undone (${(openPlan.taskTitles || []).join('; ')}). If this message continues that plan or asks about it, pick planning.` : '',
-      `Current message: ${englishText}`,
-    ].filter(Boolean).join('\n');
+    // Shaped per-site state — the decision model only needs the message, a
+    // couple of turn previews, and the plan/host lines (decision-state.cjs).
+    const state = _ds.buildDecisionState({
+      site: 'classify.intent',
+      message: englishText,
+      history: String(conversationContext || '').split('\n').filter(Boolean).slice(-3),
+      extras: [
+        _boundHosts.length ? `Bound pages: ${_boundHosts.join(', ')} — prompts acting on/continuing those pages are intent 0 (handoff), NEVER a quick lane.` : '',
+        openPlan ? `Open plan: "${openPlan.title}" paused — ${openPlan.pendingCount}/${openPlan.totalTasks} undone (${(openPlan.taskTitles || []).join('; ')}) — continues/questions about it → planning.` : '',
+      ],
+    });
     const r = await decision.askDecision([{
       id: 'intent', type: 'choice',
       question: 'Which intent best classifies the user\'s current message?',
@@ -620,6 +693,29 @@ async function classify(englishText, conversationContext, opts = {}) {
   logger.info('[Classify] LLM failed — defaulting to handoff (safe)');
   return { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'default_handoff' };
   }; // end _remoteClassify
+
+  // Adaptive mode — DECISION_ADAPTIVE=1: run whichever leg has been faster
+  // for this site (EWMA); race both on cold start / periodic resample, first
+  // valid answer wins. First-valid-wins replaces shadow's remote-authority:
+  // on a slow-local box remote answers in ~0.5-1s while local keeps timing
+  // in the background; once state shaping makes local fast it wins again.
+  if (decision.decisionEnabled() && decision.adaptiveEnabled && decision.adaptiveEnabled()) {
+    const pick = await decision.adaptiveChoose('classify.intent', async () => {
+      const li = await _localIntent();
+      return li == null ? null : { intent: li, intentName: INTENTS[li].name, confidence: 0.9, source: 'decision_local' };
+    }, _remoteClassify);
+    let result = pick;
+    if (!result) {
+      logger.warn('[Classify] Adaptive: both legs failed — defaulting to handoff');
+      result = { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'adaptive_none' };
+    }
+    if (result.intent === 0 && keywordHit) return _missingDetailCheck(_adoptKeyword('veto_llm_handoff'));
+    logger.info('[Classify] Adaptive result', {
+      intent: result.intent, intentName: result.intentName, source: result.source,
+      inputPreview: englishText.substring(0, 60),
+    });
+    return _missingDetailCheck(_vetoQuick(result));
+  }
 
   // Local-first: authoritative when enabled and not in shadow mode.
   if (decision.decisionEnabled() && !decision.shadowMode('classify.intent')) {

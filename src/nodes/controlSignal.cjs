@@ -24,7 +24,11 @@ const { getActiveTasks, updateTask } = require('../taskJournal.cjs');
 const THINKDROP_MAIN_PORT = parseInt(process.env.THINKDROP_MAIN_PORT || '3010', 10);
 
 // ── Signal detection ───────────────────────────────────────────────────────────
-const CANCEL_RE = /\b(cancel|stop|abort|never\s*mind|nevermind|forget\s*it|forget\s+that|kill)\b/i;
+// Canonical in shared/text-patterns.cjs — classify.cjs's control-vocab guard
+// uses the same list, so a prompt the guard passes always has a servable
+// signal here (and vice versa).
+let CANCEL_RE = /\b(cancel|stop|abort|never\s*mind|nevermind|forget\s*it|forget\s+that|kill)\b/i;
+try { CANCEL_RE = require('../../../shared/text-patterns.cjs').CONTROL_SIGNAL_RE || CANCEL_RE; } catch (_) {}
 
 // Context tags ([File: …], etc.) are metadata, not prose — strip them so a
 // path word can't pick the signal type.

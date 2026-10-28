@@ -32,10 +32,12 @@ const { ask, askEarly, askStream } = require('../llm-providers.cjs');
 const planFormat = require('../../../shared/plan-format.cjs');
 const { canonicalAgent } = require('../../../shared/agent-canonical.cjs');
 const skillIndex = require('../../../shared/skill-index.cjs');
+const skillContracts = require('../../../shared/skill-contracts.cjs');
 const serviceMap = require('../../../shared/service-map.cjs');
 const sysMap = require('../../../shared/system-map.cjs');
 const capIndex = require('../../../shared/capability-index.cjs');
 const { PLAN_CONFIRM_RE, PLAN_RUN_RE, PLAN_RUN_NEG_RE } = require('../../../shared/plan-check-phrases.cjs');
+const { computeTurnFacts } = require('../../../shared/turn-facts.cjs');
 const { extractContextRefs, mergeRefs } = require('../../../shared/context-refs.cjs');
 const decision = require('../decision.cjs');
 
@@ -308,7 +310,18 @@ Available skills:
 Rules: 2-8 steps. Deterministic, self-contained, ordered. Research/compile
 tasks gather via web.agent/web.crawl and write results to LOCAL files
 (edit.agent/shell.run) — a service (Doc/Sheet/email) only appears when the
-user named it as the deliverable. No commentary — ONLY the json fence.`;
+user named it as the deliverable.
+
+MUTATION DISCIPLINE: a step that changes state MUST carry literal args
+resolved NOW — shell.run {cmd, argv:[...]} (e.g. {cmd:"git",
+argv:["-C","/abs/repo","commit","-m","msg"]}). NEVER emit cli.agent
+task-strings or shell.run goal-strings for a mutating step — those re-plan
+at replay. For per-run dynamic content (commit messages, summaries),
+compose: synthesize produces the text and {{PREV_OUTPUT}} pipes it into a
+literal-argv step. Loops stay INSIDE one step's argv bash script
+(for d in /path/*/; do … done) — never emit N steps for N entities.
+
+No commentary — ONLY the json fence.`;
 
 // ── Canonical stepgen prompt ─────────────────────────────────────────────────
 // planSkillsV2 and this lane share ONE canon: the stategraph prompt files.
@@ -378,9 +391,49 @@ function _stepgenSystemPrompt(task) {
     core,
     appendix || '',
     '## Task scope\nYou are planning ONE task from a larger approved plan — emit ONLY the steps this task needs (the surrounding plan handles ordering and dependencies).',
+    skillContracts.contractsVocabularyBlock(),
+    _appKnowledgeBlock(task),
     mcpRule,
     '## Output contract\nReply with ONLY a fenced json block — an array of steps, each {"skill": "...", "args": {...}, "description": "..."}. Every step taking an agentId arg carries the exact TASK AGENTS value — never invent another agent id. synthesize is always last. No commentary — ONLY the json fence.',
   ].filter(Boolean).join('\n\n');
+}
+
+// ── Learned app knowledge → stepgen context ──────────────────────────────────
+// The runtime learns per-host UI quirks (appKnowledge.cjs → ~/.thinkdrop/
+// app-knowledge/<host>.json) — the compiler reads the same store so authored
+// steps reflect what earlier runs discovered (field semantics, recovery
+// moves, verified intents). Load lazily + cross-repo like parseLlmJson: the
+// module's own relative requires resolve against its own dir.
+let _appKnowledge = null, _appKnowledgeTried = false;
+function _appKnowledgeMod() {
+  if (_appKnowledgeTried) return _appKnowledge;
+  _appKnowledgeTried = true;
+  try { _appKnowledge = require(path.resolve(__dirname, '../../../mcp-services/command-service/src/skills/lib/appKnowledge.cjs')); }
+  catch (_) { _appKnowledge = null; }
+  return _appKnowledge;
+}
+
+function _appKnowledgeBlock(task) {
+  const ak = _appKnowledgeMod();
+  if (!ak) return '';
+  const seen = new Set();
+  const blocks = [];
+  for (const a of task.agents || []) {
+    const meta = serviceMap.describeAgent(a);
+    if (!meta || meta.type !== 'browser') continue;
+    let host = '';
+    try { host = meta.startUrl ? new URL(meta.startUrl).hostname.replace(/^www\./, '') : ''; } catch (_) {}
+    if (!host || seen.has(host)) continue;
+    seen.add(host);
+    const formatted = ak.loadAndFormat ? ak.loadAndFormat(host, 800) : '';
+    const intentUrl = ak.loadIntentUrl ? ak.loadIntentUrl(host, 'create') : null;
+    const bits = [formatted, intentUrl && intentUrl.url ? `Known create/deep link: ${intentUrl.url}` : '']
+      .filter(Boolean).join('\n');
+    if (bits) blocks.push(`### ${host}\n${bits}`);
+  }
+  return blocks.length
+    ? `## Learned app knowledge\nRuntime-discovered knowledge for this task's services — use it when choosing steps, selectors, and deep links:\n${blocks.join('\n\n')}`
+    : '';
 }
 
 async function _generateTaskSteps(task) {
@@ -459,6 +512,24 @@ async function _generateTaskSteps(task) {
     if (steps.length < beforeFilter) {
       logger.info('[Planning] Dropped malformed step entries', { taskNum: task.num, kept: steps.length, dropped: beforeFilter - steps.length });
     }
+    // Contract check — the stepgen compiles typed steps; validate against the
+    // skill contracts so violations surface where they were authored.
+    // Structural violations (unknown skill, missing required, bad types)
+    // block the plan's cache bridge at save; wildcard flags (cli.agent task /
+    // shell.run goal on a mutating step) mark the plan as containing
+    // re-planning steps — executable but not deterministic-replayable.
+    try {
+      const _v = skillContracts.validatePlanSteps(steps);
+      if (_v.violations.length) {
+        task._contractViolations = _v.violations;
+        const structural = _v.violations.filter(x => !x.msg.startsWith('wildcard:'));
+        const wildcards = _v.violations.length - structural.length;
+        logger.warn('[Planning] Step contract violations', {
+          taskNum: task.num, structural: structural.length, wildcards,
+          first: _v.violations.slice(0, 3).map(x => `step${x.step}:${x.field}:${x.msg}`),
+        });
+      }
+    } catch (_) {}
     // One normalization rule shared with planRunner's dispatch path:
     // url steps → owning service agent; session-bound steps → task's lane.
     // Async variant — unknown step hosts get one bounded live discovery
@@ -2003,6 +2074,12 @@ const _STRONG_CLAIM_RE = /\b(?:i'?m (?:now )?(?:reading|checking|looking|pulling
 // vocabulary (drafted/approved/running) is excluded — those come from real
 // markers, not tools.
 const _CLAIM_COMPLETION_RE = /\b(?:fil(?:ed|ing)\s+(?:that|it|this|away)|saved|stored|noted|added\s+(?:it|that|this|them|to)|done\b|finished|completed|set\s+(?:a\s+|the\s+|your\s+|up\s+a\s+)?reminder|scheduled|booked|created|updated|deleted|cancelled|sent|posted|opened|launched|marked|remembered\s+(?:that|it|this|for\s+you))\b/i;
+// Prose describing a plan the model never wrote — the observed failure was a
+// reply like "I have everything I need. I'll advance each child to Exodus 7
+// and assign new songs…" with NO <plan_update>: the draft stayed empty and
+// the user's "do it" dead-ended on "The plan is empty". Catches intent-to-
+// edit claims; a trailing question (clarify) still exempts the reply.
+const _PLAN_IN_PROSE_RE = /\b(?:i (?:have|got|now have) everything i need|here'?s (?:the|my|a|your) (?:plan|tasks?)|i'?ll|i'?m (?:going|about) to|i will)\b[^.!?\n]{0,90}\b(?:advance|update|edit|assign|add|create|schedule|draft|write|rewrite|fill|populate|pick|choose|set|change|make|move)\b/i;
 
 // ── Repeat-question guard helpers ────────────────────────────────────────────
 // Normalize a question for dedup — strip vocalization tags, punctuation, and
@@ -2064,7 +2141,7 @@ function _isUnnamedResume(t) {
 // <plan_update> riding alongside a <tool> call used to be silently dropped
 // when the loop continued, leaving "I updated the plan" prose with zero tasks.
 // Returns true when the plan actually changed.
-function _applyPlanMarkers(text, sess, unknownAgents) {
+async function _applyPlanMarkers(text, sess, unknownAgents) {
   let changed = false;
   const update = _extractTag(text, 'plan_update');
   if (update) {
@@ -2112,9 +2189,70 @@ function _applyPlanMarkers(text, sess, unknownAgents) {
           // _scheduleStepGen pass would re-run the same doomed generation.
           if (prev.stepsStatus != null) t.stepsStatus = prev.stepsStatus;
           if (prev._failedHash != null) t._failedHash = prev._failedHash;
+          if (prev._pinnedAgent != null) t._pinnedAgent = prev._pinnedAgent;
         }
       }
       sess.tasks = newTasks;
+      // Deterministic tool binding — the LLM planner picks agents by service
+      // name and can miss the artifact's creator (observed: a calendar-event
+      // delete drafted with google.agent while nylas.agent owned the event).
+      // Two deterministic tiers, same as the direct-handoff path: an explicit
+      // tool name in the task prompt wins; otherwise the journal's creating
+      // agent claims the artifact it made (carries the server-side id).
+      try {
+        const _ref = require('../artifactReferent.cjs');
+        const _recentTasks = require('../taskJournal.cjs').getRecentTasks(25);
+        for (const t of newTasks) {
+          const _hit = (_ref.resolveExplicitTool && _ref.resolveExplicitTool(t.prompt))
+            || _ref.resolve(t.prompt, _recentTasks);
+          if (!_hit) continue;
+          // A pin the user/model already removed must not be re-applied by
+          // the next plan_update — otherwise "remove that agent" gets undone
+          // every turn (observed: messages.app.agent re-pinned seconds after
+          // the planner cleared it).
+          if (t._pinnedAgent === _hit.agentId && !(t.agents || []).includes(_hit.agentId)) continue;
+          // Weak-tier hits are bare vocabulary tokens ("messages" inside
+          // "commit messages") — in planner-generated task text they name data,
+          // never tools. A weak hit can never pin here: not silently, and not
+          // via verdict — the candidate shouldn't exist at this layer at all.
+          if (_hit.tier === 'weak') continue;
+          // The pin only overrides a planner-chosen agent list when context
+          // agrees — lexical matching can't tell "text" (scripture) from
+          // "text" (SMS), so the decision model vetoes bad binds.
+          const _disagrees = (t.agents || []).length && !t.agents.includes(_hit.agentId);
+          if (_disagrees) {
+            // Give the judge the agent's real identity — "messages.app.agent"
+            // alone reads as agreement with the matched word — plus the plan's
+            // other tasks so a git-sync plan can't pass for a messaging task.
+            const _desc = serviceMap.describeAgent ? serviceMap.describeAgent(_hit.agentId) : null;
+            const _who = _desc
+              ? `${_hit.agentId} (service "${_desc.service || '?'}", type ${_desc.type || '?'}${_desc.cliTool ? `, drives ${_desc.cliTool}` : ''}${_desc.keywords?.length ? ` — for: ${_desc.keywords.slice(0, 5).join(', ')}` : ''})`
+              : _hit.agentId;
+            const _planCtx = (newTasks || []).map(x => `${x.num}: ${String(x.prompt || '').slice(0, 100)}`).join(' | ');
+            const _verdict = await decision.confirmJudgment({
+              site: 'tool-pin',
+              question: `A binder wants to assign the tool ${_who} to this task because the word "${_hit.matched || 'artifact'}" appears in it. The word may be ordinary vocabulary (e.g. "commit messages" names git output, not the Messages app). Does this task actually intend to invoke that tool/service?`,
+              state: `Plan tasks — ${_planCtx}\nThis task: ${String(t.prompt || '').slice(0, 600)}`,
+            });
+            if (_verdict === 'NO') {
+              logger.info('[Planning] tool pin vetoed by context', { taskNum: t.num, agentId: _hit.agentId, matched: _hit.matched });
+              continue;
+            }
+            if (_verdict !== 'YES' && _hit.tier !== 'strong') {
+              // Decision model down — weak lexical matches get no benefit of the doubt.
+              logger.info('[Planning] tool pin skipped — no context verdict', { taskNum: t.num, agentId: _hit.agentId, tier: _hit.tier });
+              continue;
+            }
+            logger.info('[Planning] tool pin confirmed by context', { taskNum: t.num, agentId: _hit.agentId, verdict: _verdict || 'model-down' });
+          }
+          t.agents = [_hit.agentId];
+          t._pinnedAgent = _hit.agentId;
+          if (_hit.referentDesc && !/\(Resolved referent/i.test(String(t.prompt))) {
+            t.prompt = `${t.prompt} (Resolved referent — ${_hit.referentDesc})`;
+          }
+          logger.info('[Planning] task tool pin', { taskNum: t.num, agentId: _hit.agentId });
+        }
+      } catch (_) {}
       // Task prompts may only carry media URLs a tool actually returned —
       // an ungrounded watch?v= gets the wrong video cast silently.
       try { _groundTaskMediaUrls(newTasks, sess); } catch (_) {}
@@ -2476,6 +2614,13 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   // planRunRejected gates the corrective re-prompt to a single retry.
   let planRunSeen = false;
   let planRunRejected = false;
+  // Confirm-shaped user text ("sounds good do it", "do the plan") is run
+  // intent even when the model forgot the <plan_run/> marker — hoisted before
+  // the loop so an empty plan gets the corrective rejection instead of the
+  // dead-end "plan is empty" fallback. The tasks>0 path still goes through
+  // the post-loop askEarly verifier below.
+  const _userTxtEarly = String(englishText || '');
+  const userConfirmish = computeTurnFacts({ rawText: englishText }).confirmish;
 
   const streamFilter = onReplyChunk ? new _StreamFilter(onReplyChunk) : null;
   const sessToolCalls = [];
@@ -2523,7 +2668,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     // Plan markers land the round they're written — a <plan_update> riding
     // beside a <tool> call must still reach sess.tasks (previously only the
     // final replyText was parsed, silently dropping mid-loop updates).
-    if (_applyPlanMarkers(cleanText, sess, unknownAgents)) planChanged = true;
+    if (await _applyPlanMarkers(cleanText, sess, unknownAgents)) planChanged = true;
     if (/<plan_run\s*\/?\s*>/.test(cleanText)) planRunSeen = true;
 
     const ran = await _runTools(cleanText, sessionId, { optionsTurn: _optsTurn, routePickTurn: gateReason === 'capability_options' });
@@ -2543,11 +2688,21 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     // <plan_run/> on an empty plan used to be silently swallowed — the marker
     // stripped, the fallback said "Working on the plan now.", nothing ran.
     // Reject it like a failed tool call (once) so the model writes the task it
-    // was about to run — or explains what's missing.
-    if (planRunSeen && !sess.tasks.length && !planRunRejected && round < MAX_TOOL_ROUNDS) {
+    // was about to run — or explains what's missing. Run intent also counts
+    // from a confirm-shaped user message, and a reply that describes the plan
+    // in prose without <plan_update> gets the same corrective — both used to
+    // dead-end on "The plan is empty".
+    const spokenSoFar = _stripMarkers(cleanText);
+    const planInProse = !sess.tasks.length && !toolResults
+      && !/\?\s*$/.test(spokenSoFar.trim())
+      && _PLAN_IN_PROSE_RE.test(spokenSoFar);
+    if (!sess.tasks.length && !planRunRejected && round < MAX_TOOL_ROUNDS
+        && (planRunSeen || userConfirmish || planInProse)) {
       planRunRejected = true;
       sess.history.push({ role: 'assistant', content: cleanText });
-      sess.history.push({ role: 'user', content: '<tool_results>\nplan_run → REJECTED: the plan has no tasks, so nothing would run. Emit the complete task list in <plan_update> first (Agents line: use the agentId from capability.select or REGISTERED AGENTS), then <plan_run/> again — or ask the user what is missing.\n</tool_results>' });
+      sess.history.push({ role: 'user', content: '<tool_results>\nplan_run → REJECTED: the plan has no tasks, so nothing would run.'
+        + (planInProse && !planRunSeen ? ' You described the plan in prose but emitted no <plan_update> marker —' : '')
+        + ' Emit the complete task list in <plan_update> first (Agents line: use the agentId from capability.select or REGISTERED AGENTS), then <plan_run/> again — or ask the user what is missing.\n</tool_results>' });
       continue;
     }
 
@@ -2558,24 +2713,20 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     // through the local decision model: does this reply promise work that did
     // not happen? A fabricated <tool_results> block is an automatic YES — the
     // model already proved it's inventing evidence.
-    const spokenSoFar = _stripMarkers(cleanText);
     if (!toolResults && !stallChecked && round < MAX_TOOL_ROUNDS
         && (fabricatedResults || _CLAIM_TOOL_WORK_RE.test(spokenSoFar) || _CLAIM_COMPLETION_RE.test(spokenSoFar))) {
       stallChecked = true;
       let verdict = fabricatedResults; // fabrication is a proven stall — no judgment needed
       if (!verdict) {
-        let r = null;
-        try {
-          r = await decision.askDecision([{
-            id: 'stall', type: 'choice',
-            question: 'The assistant reply says it is doing tool work (reading files, searching, checking something) but NO tool call was executed in this turn. Does this reply promise work that did not happen?',
-            options: ['YES', 'NO'],
-          }], { state: spokenSoFar.slice(0, 800), timeoutMs: 6000 });
-          verdict = r?.answers?.stall?.label === 'YES';
-        } catch (_) {}
+        const _stallV = await decision.confirmJudgment({
+          site: 'stall',
+          question: 'The assistant reply says it is doing tool work (reading files, searching, checking something) but NO tool call was executed in this turn. Does this reply promise work that did not happen?',
+          state: spokenSoFar.slice(0, 800),
+        });
+        verdict = _stallV === 'YES';
         // Decision model down → fall back to the strong-claim regex so the
         // honest path still wins over silent narration.
-        if (!verdict && r == null && _STRONG_CLAIM_RE.test(spokenSoFar)) verdict = true;
+        if (!verdict && _stallV == null && _STRONG_CLAIM_RE.test(spokenSoFar)) verdict = true;
         logger.info('[Planning] Stall verifier', { verdict, planId: sess.planId, round });
       }
       if (verdict) {
@@ -2626,6 +2777,17 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   }
   if (streamFilter) streamFilter.flush();
 
+  // Explicit run intent ("run the plan", "do it", "execute it") is already a
+  // confirmation — don't pay an LLM call to ask whether the user meant it.
+  // Bounded to runish: bare confirms still go through the verifier below
+  // since a "yes" can be answering a clarifying question.
+  const userRunish = computeTurnFacts({ rawText: englishText }).runish;
+  if (!planRunSeen && userRunish && sess.tasks.length > 0
+      && ['drafting', 'ready'].includes(String(sess.status || 'drafting'))) {
+    planRunSeen = true;
+    logger.info('[Planning] Explicit run intent — bypassing confirm verifier', { planId: sess.planId });
+  }
+
   // ── Run-confirm verifier — the marker-paraphrase net ──────────────────────
   // Observed failure: user says "do it", the model writes "Starting the plan
   // check now — I'll verify…" as PROSE, never emits <plan_run/>, and the run
@@ -2636,10 +2798,8 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   // run itself.
   if (!planRunSeen && sess.tasks.length > 0
       && ['drafting', 'ready'].includes(String(sess.status || 'drafting'))) {
-    const _userTxt = String(englishText || '');
-    const _userConfirmish = _userTxt.length <= 80
-      && /^[\s"'(\[]*(yes|yeah|yep|yup|sure|ok|okay|go|do|run|send|start|proceed|looks? good|sounds? good|let'?s|please|alright|absolutely|definitely|approved?|confirm|fire|ship|launch|execute|kick)\b/i.test(_userTxt)
-      && !PLAN_RUN_NEG_RE.test(_userTxt);
+    const _userTxt = _userTxtEarly;
+    const _userConfirmish = userConfirmish;
     const _replyClaimsStart = /\b(starting|kicking off|firing|beginning|launching|executing|running|checking|verifying)\b[^.!?\n]{0,60}\b(check|checks|readiness|plan|run|task|tasks|it|this|verif)/i.test(replyText);
     if (_userConfirmish || _replyClaimsStart) {
       try {
@@ -2767,7 +2927,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   let spoken = _stripMarkers(replyText)
     || (sess.tasks.length
       ? 'I updated the plan — take a look.'
-      : (planRunSeen
+      : (planRunSeen || userConfirmish
         ? "The plan is still empty — nothing to run. Tell me the tasks you want in it, or say 'exit planning'."
         : "The plan is empty — tell me what you want it to do."));
 

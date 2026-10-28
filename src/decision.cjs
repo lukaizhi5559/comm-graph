@@ -19,6 +19,7 @@
  */
 
 const logger = require('./logger.cjs');
+const { clampState, adaptiveEnabled, adaptiveChoose } = require('../../shared/decision-state.cjs');
 
 const PHI4_URL = process.env.MCP_PHI4_URL || 'http://127.0.0.1:3009';
 const PHI4_API_KEY = process.env.MCP_PHI4_API_KEY || process.env.MCP_API_KEY || '';
@@ -63,7 +64,10 @@ async function askDecision(questions, opts = {}) {
         action: 'decision.answer',
         requestId: `cg_dec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         payload: {
-          state: opts.state || '',
+          // Backstop clamp — shaped callers budget per-site via
+          // buildDecisionState; this keeps an unshaped 8KB+ state from
+          // stalling the 0.8b (tail-keep: the message is appended last).
+          state: clampState(opts.state || ''),
           questions,
           ...(opts.image ? { image: opts.image } : {}),
         },
@@ -105,4 +109,33 @@ async function shadowCompare(site, localFn, remoteFn) {
   return remoteValue;
 }
 
-module.exports = { askDecision, decisionEnabled, shadowMode, shadowCompare };
+/**
+ * confirmJudgment — the single source of truth for semantic verdicts.
+ *
+ * Convention (see comms-graph/AGENTS.md): deterministic matchers and
+ * turn-facts generate candidates and fire anchored controls on userText;
+ * anything that OVERRIDES a lane/agent/exit on lexical evidence alone must
+ * pass through here. Returns 'YES' | 'NO' | null (model down/timeout —
+ * the CALLER picks the fallback; log line always records the outcome).
+ *
+ * @param {object} o
+ * @param {string} o.site       grepable gate name ('pin', 'stall', 'exit', …)
+ * @param {string} o.question   the judgment question
+ * @param {string[]} [o.options] verdict labels, first = affirmative (default YES/NO)
+ * @param {string} [o.state]    context the model judges against
+ * @param {number} [o.timeoutMs]
+ * @returns {Promise<string|null>} matched label or null
+ */
+async function confirmJudgment({ site, question, options = ['YES', 'NO'], state = '', timeoutMs = 6000 } = {}) {
+  const id = 'cj';
+  const r = await askDecision([{ id, type: 'choice', question, options }], { state, timeoutMs });
+  const label = r && r.answers && r.answers[id] && r.answers[id].label;
+  logger.info(`[semantic-gate] site=${site || '?'} verdict=${label || 'null'} ms=${r ? r.elapsedMs : -1}`);
+  return typeof label === 'string' && options.includes(label) ? label : null;
+}
+
+function _adaptiveChoose(site, localFn, remoteFn) {
+  return adaptiveChoose(site, localFn, remoteFn, { logger });
+}
+
+module.exports = { askDecision, decisionEnabled, shadowMode, shadowCompare, confirmJudgment, adaptiveEnabled, adaptiveChoose: _adaptiveChoose };

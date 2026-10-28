@@ -47,8 +47,13 @@ const AGENT_PATTERNS = [
  * @returns {string|null}
  */
 function detectAgent(englishPrompt) {
+  // Agent hints come from the USER'S words only — attachment blobs and bare
+  // email addresses are content, not intent (observed: a highlighted
+  // "…@gmail.com" inside a resume dispatched the analysis to gmail.agent).
+  const { _stripTags } = require('../../shared/decision-state.cjs');
+  const clean = _stripTags(englishPrompt).replace(/\S+@\S+/g, ' ');
   for (const { agentId, pattern } of AGENT_PATTERNS) {
-    if (pattern.test(englishPrompt)) return agentId;
+    if (pattern.test(clean)) return agentId;
   }
   return null;
 }
@@ -92,6 +97,7 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
         ? { deterministicPlan: planMeta.deterministicPlan } : {}),
       ...(planMeta && Array.isArray(planMeta.priorResults) && planMeta.priorResults.length
         ? { priorResults: planMeta.priorResults } : {}),
+      ...(planMeta && planMeta.allowPlannerFallback ? { allowPlannerFallback: true } : {}),
       ...(planMeta && Array.isArray(planMeta.refs) && planMeta.refs.length
         ? { refs: planMeta.refs } : {}),
     });
@@ -177,11 +183,14 @@ function _releaseTask(taskId, agentIdHint) {
  * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, refs = null, capabilityReason = null, routeDecision = null }) {
+async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, refs = null, capabilityReason = null, routeDecision = null, allowPlannerFallback = false }) {
   // Plan-dispatched tasks carry the task's canonical agentId so the lock key
   // is the shared session (google_*.agent → google.agent), not prompt text.
   const agentId = pinnedAgentId || detectAgent(englishPrompt);
-  const planMeta = planId ? { planId, planTaskNum, planTask, preflightAuthBypass, deterministicPlan, priorResults, refs } : null;
+  // allowPlannerFallback rides planMeta: a no_skill_coverage escalation the
+  // user declines re-dispatches here with the flag so stategraph's coverage
+  // gate lets the bounded planner run instead of looping back to planning.
+  const planMeta = (planId || allowPlannerFallback) ? { planId, planTaskNum, planTask, preflightAuthBypass, deterministicPlan, priorResults, refs, allowPlannerFallback } : null;
   const isThought = source === 'proactive' && !planTask;
   const lockKey = _lockKeyFor(source, planTask, agentId);
 

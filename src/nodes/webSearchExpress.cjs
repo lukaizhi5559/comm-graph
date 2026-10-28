@@ -180,7 +180,7 @@ function _cleanQuery(q) {
  *   context          - formatted conversation history for the synth fallback
  */
 async function execute(opts) {
-  const { englishText, originalText, detectedLanguage, context } = opts || {};
+  const { englishText, originalText, detectedLanguage, context, routeDecision } = opts || {};
   const t0 = Date.now();
   try {
     // Search in the user's own language (mirrors the webSearch node's
@@ -193,7 +193,7 @@ async function execute(opts) {
     // not to a SERP. With conversation history on hand, rewrite the query to
     // standalone form before sending; null = referent unresolvable → abstain.
     if (context && String(context).trim()) {
-      const contextual = await standaloneSearchQuery(query, context, null);
+      const contextual = await standaloneSearchQuery(query, context, routeDecision || null);
       if (contextual === null) {
         logger.warn('[SearchExpress] abstained — follow-up referent unresolvable', {
           queryPreview: query.substring(0, 60),

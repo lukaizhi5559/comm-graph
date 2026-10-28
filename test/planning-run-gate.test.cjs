@@ -30,6 +30,12 @@ providers.askStream = async (messages) => {
   return { text: SCRIPT.length ? SCRIPT.shift() : '' };
 };
 
+// Stub the decision model — the tool-pin context gate calls confirmJudgment
+// before a lexical hit may override planner-chosen agents. 'YES' | 'NO' | null.
+const decision = require('../src/decision.cjs');
+let DECISION = null;
+decision.confirmJudgment = async () => DECISION;
+
 const planning = require('../src/nodes/planning.cjs');
 
 let passed = 0, failed = 0;
@@ -127,6 +133,106 @@ const UPDATE = `<plan_update>
     disk4.slice(0, 300));
   check('resolve-at-runtime note appended', /resolve the video URL at run time/i.test(disk4),
     disk4.slice(0, 300));
+
+  // ── Scenario 5: confirm-shaped user text on an empty plan ────────────────
+  // Observed failure: user says "sounds good do it", the model replies in
+  // prose with NO <plan_run/> marker, and the turn dead-ends on "The plan is
+  // empty". The confirm is run intent — the empty-plan corrective must fire.
+  SCRIPT = [
+    'Starting the update now.',
+    UPDATE + '\n<plan_run/>',
+  ];
+  calls.length = 0;
+  const r5 = await planning.execute({
+    englishText: 'sounds good do it',
+    systemPrompt: '',
+    sessionId: 'test-gate-confirm',
+    planning: { active: true },
+  });
+  check('confirm on empty plan → corrective fed back', calls.some(msgs =>
+    msgs.some(m => /plan_run → REJECTED/.test(m.content || ''))));
+  check('confirm on empty plan → runPlan true after recovery', r5.metadata.runPlan === true,
+    `taskCount=${r5.metadata.taskCount}`);
+  check('confirm on empty plan → taskCount 1', r5.metadata.taskCount === 1);
+
+  // ── Scenario 6: plan described in prose, no <plan_update> ────────────────
+  // Observed failure: "I have everything I need. I'll advance each child to
+  // Exodus 7 and assign new songs…" — plan stayed empty, user's "do it"
+  // dead-ended. The prose-plan claim must get the same corrective.
+  SCRIPT = [
+    "I have everything I need. I'll advance each child to the next chapter and update the file.",
+    UPDATE,
+  ];
+  calls.length = 0;
+  const r6 = await planning.execute({
+    englishText: 'update the kids memory verse file to the next chapter',
+    systemPrompt: '',
+    sessionId: 'test-gate-prose',
+    planning: { active: true },
+  });
+  check('prose-plan claim → corrective fed back', calls.some(msgs =>
+    msgs.some(m => /plan_run → REJECTED/.test(m.content || ''))));
+  check('prose-plan claim → tasks landed', r6.metadata.taskCount === 1,
+    `taskCount=${r6.metadata.taskCount}`);
+
+  // ── Scenario 7: lexical tool pin vetoed by context ───────────────────────
+  // The reported bug: a file-edit task pinned messages.app.agent because the
+  // prompt said "text". Bare "nylas" in an editing prompt is a weak lexical
+  // hit that disagrees with the planner's edit.agent — a NO verdict must win.
+  const WEAK_HIT_UPDATE = `<plan_update>
+## Task 1 — Update the doc
+- **Prompt**: Update the project doc to mention nylas sync metrics in the summary.
+- **Agents**: edit.agent
+- **Depends on**: —
+- **Mode**: sequential
+</plan_update>`;
+  DECISION = 'NO';
+  SCRIPT = [WEAK_HIT_UPDATE];
+  calls.length = 0;
+  const r7 = await planning.execute({
+    englishText: 'update the doc',
+    systemPrompt: '',
+    sessionId: 'test-gate-veto',
+    planning: { active: true },
+  });
+  const disk7 = r7.metadata.planFile ? fs.readFileSync(r7.metadata.planFile, 'utf8') : '';
+  check('vetoed weak pin → planner agent kept', /Agents\*{0,2}:\s*edit\.agent/.test(disk7) && !/Agents\*{0,2}:\s*nylas\.agent/.test(disk7),
+    disk7.slice(0, 400));
+
+  // ── Scenario 8: context-confirmed strong pin still binds ─────────────────
+  const STRONG_HIT_UPDATE = `<plan_update>
+## Task 1 — Send the file
+- **Prompt**: Use nylas to send the file to the team.
+- **Agents**: edit.agent
+- **Depends on**: —
+- **Mode**: sequential
+</plan_update>`;
+  DECISION = 'YES';
+  SCRIPT = [STRONG_HIT_UPDATE];
+  calls.length = 0;
+  const r8 = await planning.execute({
+    englishText: 'use nylas to send the file',
+    systemPrompt: '',
+    sessionId: 'test-gate-confirm-pin',
+    planning: { active: true },
+  });
+  const disk8 = r8.metadata.planFile ? fs.readFileSync(r8.metadata.planFile, 'utf8') : '';
+  check('confirmed strong pin → nylas.agent bound', /Agents\*{0,2}:\s*nylas\.agent/.test(disk8),
+    disk8.slice(0, 400));
+
+  // ── Scenario 9: decision model down — weak hit defers to planner ─────────
+  DECISION = null;
+  SCRIPT = [WEAK_HIT_UPDATE];
+  calls.length = 0;
+  const r9 = await planning.execute({
+    englishText: 'update the doc',
+    systemPrompt: '',
+    sessionId: 'test-gate-down',
+    planning: { active: true },
+  });
+  const disk9 = r9.metadata.planFile ? fs.readFileSync(r9.metadata.planFile, 'utf8') : '';
+  check('model-down weak pin → planner agent kept', /Agents\*{0,2}:\s*edit\.agent/.test(disk9),
+    disk9.slice(0, 400));
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed) { console.log('failures:', failures.join('; ')); process.exit(1); }

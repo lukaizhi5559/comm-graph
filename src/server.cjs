@@ -42,6 +42,7 @@ const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona
 const { classify, INTENTS, GRAPH_ONLY_INTENTS } = require('./classify.cjs');
 const { sanitizeContext, isRoutingPromise, stripRoutingPromises } = require('./refusal.cjs');
 const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE, isLocalFileEdit, NAMED_APP_RE } = require('../../shared/text-patterns.cjs');
+const { computeTurnFacts } = require('../../shared/turn-facts.cjs');
 const { replaceVocalizationTags, createVocalizationMapper } = require('../../shared/vocalization-tags.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const webSearchExpress = require('./nodes/webSearchExpress.cjs');
@@ -56,8 +57,243 @@ const intentGuesser = require('./intentGuesser.cjs');
 const { isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply } = require('./planReply.cjs');
 const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = require('./screen-context.cjs');
 const taskJournal = require('./taskJournal.cjs');
+const artifactReferent = require('./artifactReferent.cjs');
 const agentLock = require('./agentLock.cjs');
 const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT } = require('./route-decision.cjs');
+const { askEarly } = require('./llm-providers.cjs');
+
+// ── Guardian/trigger rules — entry guard + passphrase-gated management ───────
+// The canonical matcher lives in command-service skill-helpers so every
+// service (stategraph preflight, executeCommand, monitorService) shares ONE
+// rules file. Evaluated after classify, before any lane dispatch — covers
+// web-search, general_quick, planning AND handoff uniformly.
+let _rulesMod = null;
+try { _rulesMod = require('../../mcp-services/command-service/src/skill-helpers/rules.cjs'); } catch (_) {}
+// A `then.ask` hit stashes the blocked prompt here; `guardian allow <pass>`
+// verifies and re-processes it with the rule bypassed once.
+let _pendingGuardian = null; // {ruleId, args}
+
+function _guardianReply(text, extra = {}) {
+  return { text, intent: 1, intentName: 'guardian', metadata: { source: 'guardian', ...extra } };
+}
+
+async function _guardianCommand(text, args) {
+  if (!_rulesMod) return _guardianReply('Guardian rules are unavailable (rules module missing).');
+  const rest = text.trim().replace(/^guardian\s+/i, '').split(/\s+/);
+  const cmd = (rest.shift() || '').toLowerCase();
+
+  if (cmd === 'allow') {
+    const pass = rest.join(' ');
+    if (!_pendingGuardian) return _guardianReply('Nothing is waiting on a guardian passphrase.');
+    if (!_rulesMod.verifyPassphrase(pass)) return _guardianReply('Wrong passphrase — the rule stays in force.');
+    const stash = _pendingGuardian;
+    _pendingGuardian = null;
+    const result = await processMessage({ ...stash.args, _guardianBypass: stash.ruleId });
+    return { ...result, guardianBypassed: stash.ruleId };
+  }
+  if (cmd === 'passphrase' || (cmd === 'set' && rest[0] === 'passphrase')) {
+    const words = cmd === 'set' ? rest.slice(1) : rest;
+    const r = _rulesMod.setPassphrase(words[0] || '', { confirmExisting: words[1] || null });
+    return _guardianReply(r.ok ? 'Guardian passphrase set.' : `Could not set passphrase: ${r.error}.`);
+  }
+  if (cmd === 'list' || cmd === 'rules' || cmd === 'recall') {
+    if (_rulesMod.hasPassphrase() && !_rulesMod.verifyPassphrase(rest.join(' '))) {
+      return _guardianReply('Passphrase required — say: guardian list <passphrase>');
+    }
+    const rules = _rulesMod.listRules();
+    if (!rules.length) return _guardianReply('No guardian rules configured.');
+    return _guardianReply(rules.map((r, i) =>
+      `${i + 1}. [${r.enabled ? 'on' : 'off'}] ${r.id} — when ${JSON.stringify(r.when)} → ${JSON.stringify(r.then)}`
+    ).join('\n'));
+  }
+  if (cmd === 'add') {
+    // The first token is a passphrase only when one is configured — otherwise
+    // it belongs to the payload (JSON or natural language).
+    const pass = _rulesMod.hasPassphrase() ? (rest.shift() || '') : '';
+    if (_rulesMod.hasPassphrase() && !_rulesMod.verifyPassphrase(pass)) {
+      return _guardianReply('Passphrase required — say: guardian add <passphrase> <rule JSON>');
+    }
+    try {
+      const r = _rulesMod.addRule(JSON.parse(rest.join(' ')));
+      return _guardianReply(r.ok ? `Rule "${r.rule.id}" added.` : `Rule not added: ${r.error}`);
+    } catch (e) {
+      // Not JSON — treat the remainder as natural-language rule phrasing.
+      // Already passphrase-authed above, so the confirm needs no pass again.
+      const draft = await _parseRuleNl(rest.join(' '));
+      if (!draft) return _guardianReply(`Could not parse rule JSON: ${e.message}`);
+      _pendingRule = { rule: draft, authed: true };
+      return _guardianReply(
+        `Here's the rule I understood:\n  ${_describeRule(draft)}\n` +
+        'Say "rule confirm" to set it, or "rule cancel" to drop it.'
+      );
+    }
+  }
+  if (cmd === 'delete' || cmd === 'remove' || cmd === 'enable' || cmd === 'disable') {
+    const [id, ...pw] = rest;
+    if (!id) return _guardianReply(`Usage: guardian ${cmd} <rule-id> <passphrase>`);
+    if (_rulesMod.hasPassphrase() && !_rulesMod.verifyPassphrase(pw.join(' '))) {
+      return _guardianReply(`Passphrase required — say: guardian ${cmd} ${id} <passphrase>`);
+    }
+    const r = (cmd === 'delete' || cmd === 'remove') ? _rulesMod.removeRule(id) : _rulesMod.setRuleEnabled(id, cmd === 'enable');
+    return _guardianReply(r.ok ? `Rule "${id}" ${cmd === 'enable' ? 'enabled' : cmd === 'disable' ? 'disabled' : 'deleted'}.` : `Failed: ${r.error}`);
+  }
+  return _guardianReply('Guardian commands: guardian passphrase <new> [current] · guardian list <passphrase> · guardian add <passphrase> <json> · guardian enable|disable|delete <id> <passphrase> · guardian allow <passphrase>');
+}
+
+// ── Natural-language rule authoring — plan-confirmed ─────────────────────────
+// Conditional trigger phrasing ("if I go to X, email Y", "next time I visit
+// this site show an emoji") is detected deterministically, parsed into a draft
+// rule by ONE bounded LLM call, echoed in English, and committed only on an
+// explicit "rule confirm" — passphrase-gated when one is set. Match/fire paths
+// contain no model; the model appears only at authoring.
+let _pendingRule = null; // {rule, authed}
+
+const _RULE_PHRASE_RES = [
+  // condition → action ("if/whenever/next time … goes to/visits/opens … send/show/…")
+  /\b(?:if|whenever|every\s+time|each\s+time|next\s+time|when)\b[\s\S]{0,160}?\b(?:go(?:es)?\s+(?:to|on)|visits?|opens?|uses?|comes?\s+to|lands?\s+on|navigates?\s+to|browses?)\b[\s\S]{0,200}?\b(?:send|email|notify|show|warn|block|alert|tell|display|text|ping|let\s+me\s+know)/i,
+  // action → condition ("email me when I visit X")
+  /\b(?:send|email|notify|show|warn|alert|tell|display|text|ping|let\s+me\s+know)\b[\s\S]{0,160}?\b(?:when|whenever|every\s+time|next\s+time)\b[\s\S]{0,160}?\b(?:go(?:es)?\s+(?:to|on)|visits?|opens?|uses?|comes?\s+to|lands?\s+on|navigates?\s+to|browses?)/i,
+];
+const _isRulePhrase = (t) => _RULE_PHRASE_RES.some((re) => re.test(t));
+
+const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
+
+// Live focused-window context for "this site/app/file" references.
+async function _fetchActiveAppContext() {
+  try {
+    const res = await fetch(`http://127.0.0.1:${MEMORY_PORT}/memory.getActiveAppContext`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requestId: 'cg_rule_' + Date.now() }),
+      signal: AbortSignal.timeout(4000),
+    });
+    const j = await res.json();
+    return j?.data?.app || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+const _RULE_PARSE_SYS = [
+  'Convert the user\'s conditional rule request into ONE JSON object. Output ONLY JSON, no prose.',
+  'Schema: {"when":{...},"then":{...},"fireOnce":false,"cooldownMs":60000,"seam":"observation"}',
+  'when keys — use only what the sentence implies:',
+  '  hostMatch: bare domain ("tiktok.com"), urlMatch: URL substring or "re:<regex>",',
+  '  appName: exact app name, fileMatch: file path/name substring or "re:<regex>",',
+  '  titleMatch: window-title regex, ocrMatch: regex over on-screen text,',
+  '  promptMatch: regex over future requests (guard-style rules)',
+  'then.action: "block" (prevent), "ask" (require passphrase), "notify" (screen note),',
+  '  "show_card" (screen display — add "kind":"emoji" + "emoji":"😄" + "durationMs":4000 for emoji),',
+  '  "enqueue_task" (run a task — "prompt" is the literal task instruction; may use {{host}}/{{url}}/{{appName}} slots)',
+  'Rules:',
+  '- "send/email/notify someone" → enqueue_task with a complete prompt ("send an email to X saying \'Y\'")',
+  '- "show emoji/icon on screen" → show_card with kind emoji',
+  '- "block/don\'t allow/restrict" → block; "next time"/"once" → fireOnce:true',
+  '- site/app/file rules → seam "observation"; prompt/request rules → seam "entry" or omit',
+].join('\n');
+
+const _WHEN_KEYS = ['hostMatch', 'urlMatch', 'appName', 'fileMatch', 'titleMatch', 'ocrMatch', 'promptMatch', 'service', 'intent', 'entities', 'varMatch'];
+const _THEN_KEYS = ['action', 'title', 'body', 'msg', 'reason', 'prompt', 'kind', 'emoji', 'durationMs', 'mood', 'severity', 'deterministicPlan', 'agentId'];
+
+// Observation matchers — presence of any of these means the rule watches the
+// ambient monitor, so a model-emitted promptMatch would AND-poison it (the
+// observation ctx has prompt:'' and it could never fire).
+const _OBS_WHEN_KEYS = new Set(['hostMatch', 'urlMatch', 'appName', 'fileMatch', 'titleMatch', 'ocrMatch']);
+// Emoji words → glyphs for "show a happy emoji" phrasing.
+const _EMOJI_WORDS = { happy: '😄', smile: '😊', sad: '😢', heart: '❤️', party: '🎉', star: '⭐', warning: '⚠️', angry: '😠', laugh: '😂', thumbs: '👍', fire: '🔥', cat: '🐱', dog: '🐶' };
+
+function _sanitizeRuleDraft(p, text) {
+  const when = {};
+  for (const k of _WHEN_KEYS) if (p.when && p.when[k] !== undefined) when[k] = p.when[k];
+  if (!Object.keys(when).length) return null;
+  // Observation rules can't also gate on promptMatch — the monitor ctx has no
+  // prompt field and the AND would never fire.
+  if (Object.keys(when).some((k) => _OBS_WHEN_KEYS.has(k))) delete when.promptMatch;
+  const then = {};
+  for (const k of _THEN_KEYS) if (p.then && p.then[k] !== undefined) then[k] = p.then[k];
+  if (!then.action) then.action = then.prompt ? 'enqueue_task' : 'notify';
+  // Emoji phrasing coerces a display action into the emoji kind — the screen
+  // contract renders it centered + auto-dismissed; model word choice isn't
+  // trusted for this.
+  if (/emoji|emoticon/i.test(text || '') && (then.action === 'show_card' || then.action === 'notify')) {
+    const word = (String(text).match(/\b(\w+)\s+emoji\b/i) || [])[1] || '';
+    then.action = 'show_card';
+    then.kind = 'emoji';
+    then.emoji = then.emoji || _EMOJI_WORDS[word.toLowerCase()] || '😄';
+    if (typeof then.durationMs !== 'number') then.durationMs = 4000;
+  }
+  const rule = { when, then };
+  // "next time"/"once" phrasing forces fireOnce — deterministic, not modeled.
+  if (p.fireOnce === true || /\bnext\s+time\b|\bjust\s+once\b|\bonly\s+once\b/i.test(text || '')) rule.fireOnce = true;
+  if (typeof p.cooldownMs === 'number' && p.cooldownMs >= 0) rule.cooldownMs = p.cooldownMs;
+  if (p.seam) rule.seam = p.seam;
+  return rule;
+}
+
+async function _parseRuleNl(text) {
+  try {
+    const r = await askEarly(
+      [{ role: 'system', content: _RULE_PARSE_SYS }, { role: 'user', content: text }],
+      { maxTokens: 400, temperature: 0, taskType: 'classification' },
+    );
+    const raw = r.fullText || r.firstSentence || '';
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    return _sanitizeRuleDraft(JSON.parse(m[0]), text);
+  } catch (_) {
+    return null;
+  }
+}
+
+function _describeRule(rule) {
+  const w = rule.when || {};
+  const conds = [];
+  if (w.hostMatch) conds.push(`host is ${w.hostMatch}`);
+  if (w.urlMatch) conds.push(`URL contains ${w.urlMatch}`);
+  if (w.appName) conds.push(`app is ${w.appName}`);
+  if (w.fileMatch) conds.push(`file matches ${w.fileMatch}`);
+  if (w.titleMatch) conds.push(`title matches /${w.titleMatch}/`);
+  if (w.ocrMatch) conds.push(`screen text matches /${w.ocrMatch}/`);
+  if (w.promptMatch) conds.push(`prompts match /${w.promptMatch}/`);
+  const t = rule.then || {};
+  let act;
+  switch (t.action) {
+    case 'enqueue_task': act = `run "${t.prompt}"`; break;
+    case 'block': act = `block it${t.reason ? ` (${t.reason})` : ''}`; break;
+    case 'ask': act = 'require the guardian passphrase first'; break;
+    case 'show_card': act = t.kind === 'emoji' ? `show ${t.emoji || 'an emoji'} on screen` : `show a card${t.title ? ` "${t.title}"` : ''}`; break;
+    default: act = `notify${t.title ? ` "${t.title}"` : ''}`;
+  }
+  const firing = rule.fireOnce
+    ? 'fires once'
+    : `fires every match${rule.cooldownMs ? ` (${Math.round(rule.cooldownMs / 1000)}s cooldown)` : ' (60s cooldown)'}`;
+  return `when ${conds.join(' and ') || 'matched'} → ${act} — ${firing}`;
+}
+
+async function _authorRule(text) {
+  const [draft, ctx] = await Promise.all([
+    _parseRuleNl(text),
+    /\b(?:this|the)\s+(?:site|page|app|file|tab|window)\b/i.test(text) ? _fetchActiveAppContext() : Promise.resolve(null),
+  ]);
+  if (!draft) {
+    return _guardianReply(
+      'I couldn\'t turn that into a rule — try "guardian add <pass> {json}", or rephrase ' +
+      '(e.g. "if I go to example.com, show a happy emoji").'
+    );
+  }
+  // "this site/app/file" — seed the matcher from the live focused window.
+  if (ctx) {
+    if (ctx.url) draft.when.urlMatch = ctx.url;
+    else if (ctx.appName && !draft.when.appName) draft.when.appName = ctx.appName;
+    if (ctx.filePath && /\bfile\b/i.test(text)) draft.when.fileMatch = ctx.filePath;
+  }
+  const needsPass = _rulesMod.hasPassphrase();
+  _pendingRule = { rule: draft, authed: false };
+  return _guardianReply(
+    `Here's the rule I understood:\n  ${_describeRule(draft)}\n` +
+    `Say "rule confirm${needsPass ? ' <passphrase>' : ''}" to set it, or "rule cancel" to drop it.`
+  );
+}
 const _decision = require('./decision.cjs');
 
 // ── Thought engine prompt producer ─────────────────────────────────────────────
@@ -236,6 +472,38 @@ async function _capabilityGate(text, opts = {}) {
       }
     }
 
+    // ── Explicit-tool pin (tier 1) ────────────────────────────────────────
+    // A prompt that names a registered CLI/API/MCP tool ("use nylas to
+    // delete it") resolves it deterministically — no search recall or LLM
+    // pick needed. Selection order: explicit name > artifact referent >
+    // decision-model > remote select-best > planning.
+    try {
+      const _explicit = artifactReferent.resolveExplicitTool(text);
+      if (_explicit) {
+        // Non-strong matches (bare token / phrase) are lexical guesses — the
+        // decision model confirms the tool fits the prompt's context before
+        // it may short-circuit the whole gate.
+        let _ok = _explicit.tier === 'strong';
+        if (!_ok) {
+          let _who = _explicit.agentId;
+          try {
+            const _desc = require('../../shared/service-map.cjs').describeAgent(_explicit.agentId);
+            if (_desc) _who = `${_explicit.agentId} (service "${_desc.service || '?'}", type ${_desc.type || '?'}${_desc.cliTool ? `, drives ${_desc.cliTool}` : ''}${_desc.keywords?.length ? ` — for: ${_desc.keywords.slice(0, 5).join(', ')}` : ''})`;
+          } catch (_) {}
+          _ok = (await _decision.confirmJudgment({
+            site: 'capability-pin',
+            question: `A binder wants to route this request to the tool ${_who} because the word "${_explicit.matched}" appears in it. The word may be ordinary vocabulary (e.g. "commit messages" names git output, not the Messages app). Does the request actually intend to invoke that tool/service?`,
+            state: String(text || '').slice(0, 800),
+          })) === 'YES';
+        }
+        if (_ok) {
+          logger.info('[capability-gate] explicit tool pin', { agentId: _explicit.agentId, matched: _explicit.matched, tier: _explicit.tier });
+          return { pin: _explicit.agentId, reason: `explicit-tool:${_explicit.matched}` };
+        }
+        logger.info('[capability-gate] tool pin vetoed by context', { agentId: _explicit.agentId, matched: _explicit.matched, tier: _explicit.tier });
+      }
+    } catch (_) {}
+
     const res = await fetch(`http://127.0.0.1:${COMMAND_PORT}/capability.search`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -268,6 +536,34 @@ async function _capabilityGate(text, opts = {}) {
     // CLI/API/MCP second) and picks. select-best still runs: its pick orders
     // the list and flags whether the prompt is missing required details.
     if (results.length) {
+      // ── Decision-model select (tier 3) ─────────────────────────────────
+      // Local phi4 pick over the search candidates (~50–300ms) before paying
+      // the remote select-best call — same local→remote pattern as classify.
+      // Confident pick → pin; 'none' → fall through like a no-fit result;
+      // anything else → remote select-best runs unchanged.
+      try {
+        const _dec = require('./decision.cjs');
+        if (_dec.decisionEnabled()) {
+          const _cands = results.slice(0, 10);
+          const _opts = _cands.map(c => `${c.id || c.agentId} — ${String(c.summary || c.detail || c.service || '').slice(0, 100)}`);
+          const _dr = await _dec.askDecision([{
+            id: 'tool', type: 'choice',
+            question: 'Which capability best serves this request? Pick the last option (none) if none fit.',
+            options: [..._opts, 'none'],
+          }], { state: `Request: ${query}` });
+          const _pick = _dr?.answers?.tool;
+          if (_pick && _pick.index != null && _pick.index < _cands.length && (_pick.confidence ?? 0) >= 0.55) {
+            const _pinId = _cands[_pick.index].id || _cands[_pick.index].agentId;
+            logger.info('[capability-gate] decision-model pin', { agentId: _pinId, conf: _pick.confidence });
+            return { pin: _pinId, reason: 'decision-tool' };
+          }
+          if (_pick && _pick.index === _cands.length && (_pick.confidence ?? 0) >= 0.55) {
+            logger.info('[capability-gate] decision-model: no capability fits — passing through');
+            return null;
+          }
+        }
+      } catch (_) { /* decision model unavailable → remote select-best below */ }
+
       const inferBody = JSON.stringify({ query, screenText: screenCtx?.ocrText || null });
       // select-best awaited immediately; infer runs in background and is only
       // awaited by branches that consume it (options/clarify). The pin path
@@ -791,6 +1087,43 @@ async function processMessage(args) {
     };
   }
 
+  // ── Guardian command lane ─────────────────────────────────────────────────
+  // `guardian …` commands are deterministic and bypass classify entirely — a
+  // passphrase answer must never be re-blocked by the rule it answers. A stale
+  // pending ask clears when a non-guardian prompt arrives.
+  if (_pendingGuardian && !/^guardian\s+allow\b/i.test(text.trim())) {
+    _pendingGuardian = null;
+  }
+  if (/^guardian\s+/i.test(text.trim())) {
+    return _guardianCommand(text.trim(), args);
+  }
+
+  // ── Rule authoring lane — plan-confirmed ─────────────────────────────────
+  // A pending draft is committed only on explicit "rule confirm" (+passphrase
+  // when set); any other prompt abandons it, mirroring the pending-ask stash.
+  if (_pendingRule && !/^(?:rule\s+)?(?:confirm|yes|no|cancel)\b/i.test(text.trim())) {
+    _pendingRule = null;
+  }
+  if (_pendingRule && /^(?:rule\s+)?(?:confirm|yes)\b/i.test(text.trim())) {
+    const stash = _pendingRule;
+    const pw = text.trim().replace(/^(?:rule\s+)?(?:confirm|yes)\s*/i, '');
+    if (_rulesMod.hasPassphrase() && !stash.authed && !_rulesMod.verifyPassphrase(pw)) {
+      return _guardianReply('Passphrase required — say: rule confirm <passphrase>');
+    }
+    _pendingRule = null;
+    const r = _rulesMod.addRule(stash.rule);
+    return _guardianReply(r.ok ? `Rule set: ${_describeRule(r.rule)}` : `Couldn't set the rule: ${r.error}`);
+  }
+  if (_pendingRule) { // no/cancel after the confirms above
+    _pendingRule = null;
+    return _guardianReply('Rule cancelled.');
+  }
+  // Conditional trigger phrasing — "if I go to X, send Y" authors a rule,
+  // not a task. Deterministic detect → bounded parse → confirm → addRule.
+  if (_rulesMod && _isRulePhrase(text.trim())) {
+    return _authorRule(text.trim());
+  }
+
   logger.info('[Process] Start', {
     source, language: language || 'auto',
     textPreview: text.substring(0, 80),
@@ -841,12 +1174,6 @@ async function processMessage(args) {
   // Exact-string removal via selectedText — a `]` inside the blob would
   // truncate a non-greedy tag regex (observed: captured log lines like "[0]").
   const _selLines = String(selectedText || '').split('\n').map(s => s.trim()).filter(s => s.length > 2);
-  // [File:]/[Folder:] chips are path POINTERS, not content — generalQuick can't
-  // open them, so a selection made only of file refs isn't self-contained QA
-  // context; the prompt needs the real classifier's guards (action veto,
-  // deictic) and usually the stategraph's file tools. [Context:]/[Thought:]
-  // and raw highlight lines DO carry text and still count.
-  const hasSelectionContext = _selLines.some(l => !FILE_REF_TAG_LINE_RE.test(l));
   let classifyText = englishText;
   for (const chunk of _selLines) {
     classifyText = classifyText.split(chunk).join(' ');
@@ -855,6 +1182,16 @@ async function processMessage(args) {
     .replace(ATTACHMENT_TAG_RE, ' ')  // leftover wrappers are whitespace-only
     .replace(/\s{2,}/g, ' ')
     .trim() || englishText;
+  // Turn facts — the single derivation every downstream matcher reads
+  // (taskFacts pattern). Control/referent decisions use facts.userText —
+  // blob-stripped — never the blob-inclusive englishText.
+  const turnFacts = computeTurnFacts({ rawText: englishText, selectedText });
+  // [File:]/[Folder:] chips are path POINTERS, not content — generalQuick can't
+  // open them, so a selection made only of file refs isn't self-contained QA
+  // context; the prompt needs the real classifier's guards (action veto,
+  // deictic) and usually the stategraph's file tools. [Context:]/[Thought:]
+  // and raw highlight lines DO carry text and still count.
+  const hasSelectionContext = turnFacts.hasSelectionContext;
   // ── Selection fast lane ───────────────────────────────────────────────────
   // A [Highlighted:] blob carries its own referent — the prompt is self-contained
   // QA. Skip classify + the context-blind guards entirely; generalQuick's
@@ -867,12 +1204,76 @@ async function processMessage(args) {
   // terminal state without one can linger. An unresolvable planId is left
   // alone — it may be a fresh draft the pin is about to create.
   let _pinTerminal = false;
+  let _releasedEmptyPin = false;
+  let _escapedPin = false;
   if (planning && planning.active === true && planning.planId) {
     try {
       const _pinnedSess = planningNode.getPlanSession(planning.planId);
-      _pinTerminal = !!_pinnedSess
-        && ['done', 'failed', 'cancelled'].includes(String(_pinnedSess.status || '').toLowerCase());
+      const _st = String(_pinnedSess?.status || '').toLowerCase();
+      _pinTerminal = !!_pinnedSess && ['done', 'failed', 'cancelled'].includes(_st);
+      // Empty-draft escape — a pinned plan with ZERO tasks is mid-clarification
+      // at best (and a routing flake at worst — observed: a missing-detail
+      // misroute created an empty draft whose pin then swallowed every later
+      // prompt into "the plan is still empty"). A clearly action-shaped new
+      // command releases the pin; answer-shaped short replies stay bound.
+      if (!_pinTerminal && _pinnedSess && _st === 'drafting'
+          && (!Array.isArray(_pinnedSess.tasks) || _pinnedSess.tasks.length === 0)
+          && !/\bplan\b/i.test(String(classifyText || ''))) {
+        let _g = null;
+        try { _g = intentGuesser.guess(classifyText, { hasSelectionContext }).guessedIntent; } catch (_) {}
+        if (_g === 'command_automate' || _g === 'screen_analysis') {
+          _pinTerminal = true;
+          _releasedEmptyPin = true;
+          logger.info('[Process] Releasing pin on empty draft — new action prompt', { planId: planning.planId, guess: _g });
+          try { planningNode.releaseSession(routedSessionId); } catch (_) {}
+          // Cancel the ghost draft so findOpenPlan/short-reply capture stop
+          // treating it as awaiting input (session memory + plan file).
+          try { _pinnedSess.status = 'cancelled'; } catch (_) {}
+          try {
+            if (_pinnedSess.filePath && fs.existsSync(_pinnedSess.filePath)) {
+              const planFormat = require('../../shared/plan-format.cjs');
+              fs.writeFileSync(_pinnedSess.filePath,
+                planFormat.updateFrontmatterStatus(fs.readFileSync(_pinnedSess.filePath, 'utf8'), 'cancelled'));
+            }
+          } catch (_) {}
+        }
+      }
     } catch (_) { _pinTerminal = false; }
+  }
+  // New-topic pin escape — the pin exists to keep answers and short replies
+  // bound to a plan's pending question, but a clearly action-shaped NEW task
+  // with no plan vocabulary is new work the lane can't serve (observed: a
+  // misrouted draft pinned the UI and every later prompt — scrolls, searches,
+  // highlight questions — fell into the stale plan for ~17min). Lexical
+  // shape alone doesn't justify leaving the lane, so a semantic verdict
+  // gates the release (AGENTS.md).
+  if (planning && planning.active === true && !_pinTerminal) {
+    try {
+      const _g = intentGuesser.guess(classifyText, { hasSelectionContext }).guessedIntent;
+      const _newTaskShape = (GRAPH_ONLY_INTENTS.has(_g) || _g === 'web_search')
+        && turnFacts.wordCount > 6
+        && !turnFacts.confirmish && !turnFacts.runish
+        && !turnFacts.exitish && !turnFacts.cancelish
+        && !(turnFacts.planRef && turnFacts.planRef.meaningful)
+        && !/\bplan\b/i.test(turnFacts.userText || classifyText);
+      if (_newTaskShape) {
+        const _psess = planning.planId ? planningNode.getPlanSession(planning.planId) : null;
+        const _planDesc = _psess
+          ? `Open plan: "${_psess.title || ''}" tasks: ${(Array.isArray(_psess.tasks) ? _psess.tasks : []).map(t => (t && (t.title || t.name)) || String(t)).join('; ').slice(0, 400)}`
+          : 'Open plan: (none found)';
+        const _v = await _decision.confirmJudgment({
+          site: 'pin-escape',
+          question: 'The user is in a plan-drafting lane. Is their message a NEW task unrelated to the open plan (it should leave the lane and run normally) rather than an answer, edit, or question ABOUT the plan?',
+          state: `${_planDesc}\nUser message: ${classifyText}`,
+        });
+        if (_v === 'YES') {
+          _pinTerminal = true;
+          _escapedPin = true;
+          try { planningNode.releaseSession(routedSessionId); } catch (_) {}
+          logger.info('[Process] Pin escape — new-topic action prompt released from planning lane', { planId: planning.planId, guess: _g });
+        }
+      }
+    } catch (_) { /* escape check fails open — pin stays */ }
   }
   if (planning && planning.active === true && !_pinTerminal) {
     // Planning mode pinned by the UI (toggle / continue-plan) — bypass the
@@ -952,6 +1353,57 @@ async function processMessage(args) {
     }
   }
 
+  // ── Guardian rules — entry guard ──────────────────────────────────────────
+  // Evaluated AFTER classification settles and BEFORE any lane dispatches —
+  // covers web-search, general_quick, planning, and handoff uniformly, so a
+  // blocked prompt can't reach a lane that would serve it. Matching is
+  // deterministic (regex/host/eq); `when.category` is the one bounded judgment
+  // — the rule's own category vs the prompt.
+  if (_rulesMod) {
+    try {
+      const _guardCtx = { prompt: classifyText || englishText, intent: intentName };
+      const _bypass = args._guardianBypass || null;
+      const _applyGuard = (rule) => {
+        const _act = rule.then?.action || 'block';
+        logger.warn('[Process] guardian rule matched at entry', { ruleId: rule.id, action: _act });
+        if (_act === 'ask' && _rulesMod.hasPassphrase()) {
+          _pendingGuardian = { ruleId: rule.id, args };
+          return _guardianReply(
+            `That request is restricted by guardian rule "${rule.id}". A passphrase holder can allow it: guardian allow <passphrase>`,
+            { ruleId: rule.id, guardianAction: 'ask' }
+          );
+        }
+        return _guardianReply(
+          `I can't do that — it's blocked by guardian rule "${rule.id}"${rule.then?.reason ? ` (${rule.then.reason})` : ''}.`,
+          { ruleId: rule.id, guardianAction: 'block' }
+        );
+      };
+      const _hits = _rulesMod.evaluate(_guardCtx, 'entry').filter(r => r.id !== _bypass);
+      const _guardHit = _hits.find(r => ['block', 'ask'].includes(r?.then?.action));
+      if (_guardHit) return _applyGuard(_guardHit);
+      // Category rules — `when.category` never matches deterministically; the
+      // rule's own category list gets one bounded verdict per prompt.
+      for (const _r of _rulesMod.loadRules()) {
+        if (!_r.when?.category || _r.id === _bypass || _hits.includes(_r)) continue;
+        const _seam = _r.seam || 'any';
+        if (_seam !== 'any' && _seam !== 'entry') continue;
+        const { category: _cat, ..._rest } = _r.when;
+        if (Object.keys(_rest).length && !_rulesMod.whenMatches(_rest, _guardCtx)) continue;
+        const _verdict = await askEarly([{
+          role: 'user',
+          content: `A request says: "${String(classifyText || englishText).slice(0, 400)}". Does it ask for ${_cat} content? Answer yes or no.`,
+        }]).catch(() => null);
+        const _yesText = typeof _verdict === 'string' ? _verdict : (_verdict?.text || _verdict?.content || '');
+        if (/\byes\b/i.test(_yesText)) {
+          const _res = _applyGuard({ ..._r, then: { action: 'block', ...(_r.then || {}) } });
+          if (_res) return _res;
+        }
+      }
+    } catch (e) {
+      logger.warn('[Process] guardian entry eval failed', { error: e.message });
+    }
+  }
+
   // ── Proactive-card reply → always handoff ────────────────────────────────────
   // A prompt carrying thoughtContext is a reply to a proactive card. Quick
   // intents (general_quick et al.) lack the context machinery to resolve it —
@@ -979,6 +1431,26 @@ async function processMessage(args) {
     intentName = 'handoff';
   }
 
+  // ── Artifact-referent resolution ─────────────────────────────────────────
+  // "delete that event I just set" mutates the artifact a just-completed task
+  // created. Resolve BEFORE RouteDecision so classifyTask sees the concrete
+  // referent (title + server-side id) instead of a bare pronoun, and carry
+  // the creating agent's identity into the capability gate below — the
+  // creator owns the artifact's identity (event ids, file paths).
+  let _resolvedText = englishText;
+  let _artifactRef = null;
+  if (intent === 0) {
+    try {
+      _artifactRef = artifactReferent.resolve(classifyText, taskJournal.getRecentTasks(25));
+      if (_artifactRef) {
+        _resolvedText = `${englishText} (Resolved referent — ${_artifactRef.referentDesc})`;
+        logger.info('[Process] Artifact referent resolved', {
+          agentId: _artifactRef.agentId, sourceTask: _artifactRef.taskId,
+        });
+      }
+    } catch (e) { logger.warn('[Process] artifactReferent failed', { error: e.message }); }
+  }
+
   // ── RouteDecision — the single classification envelope ─────────────────────
   // For handoff-bound prompts, classifyTask (the same schema the execution
   // graph consumes) runs ONCE here at ingress; the decision rides the handoff
@@ -992,7 +1464,7 @@ async function processMessage(args) {
   // is unchanged (the same call simply moves earlier in the run).
   let _routeDecision = null;
   if (intent === 0) {
-    _routeDecision = await classifyRoute(englishText, convHistory);
+    _routeDecision = await classifyRoute(_resolvedText, convHistory);
     const _demoteTo = (_routeDecision && _routeDecision.lane !== 'handoff')
       ? LANE_BY_INTENT[_routeDecision.lane] : undefined;
     if (_demoteTo !== undefined) {
@@ -1027,7 +1499,10 @@ async function processMessage(args) {
       : await _capabilityGate(classifyText, {
         hasFileRef: /\[File:|\[Folder:/i.test(englishText),
       });
-    if (gate?.planning) {
+    // A resolved artifact referent suppresses the capability-gap reroute —
+    // the delete/mutation target is already concrete (journal pin below);
+    // planning has nothing left to clarify.
+    if (gate?.planning && !_artifactRef) {
       logger.info('[Process] capability-gap → planning lane', { reason: gate.planning, hints: (gate.hints || []).length });
       intent = 6; intentName = 'planning'; confidence = 0.9;
       classifySource = 'capability_gap';
@@ -1036,10 +1511,19 @@ async function processMessage(args) {
       _capNeedsInfo = gate.needsInfo || null;
       _capScreenCtx = gate.screenCtx || null;
       _capRecommended = gate.recommended || null;
-    } else if (gate?.pin) {
-      logger.info('[Process] capability pin', { agentId: gate.pin, reason: gate.reason || '' });
-      _capPin = gate.pin;
-      _capReason = gate.reason || null;
+    } else {
+      if (gate?.pin) {
+        logger.info('[Process] capability pin', { agentId: gate.pin, reason: gate.reason || '' });
+        _capPin = gate.pin;
+        _capReason = gate.reason || null;
+      }
+      // No explicit pin from the gate — the journal's creating agent claims
+      // the artifact ("delete that event" → the nylas.agent that created it).
+      if (!_capPin && _artifactRef) {
+        _capPin = _artifactRef.agentId;
+        _capReason = `artifact-referent:${_artifactRef.taskId}`;
+        logger.info('[Process] artifact-referent pin', { agentId: _capPin, sourceTask: _artifactRef.taskId });
+      }
     }
   }
 
@@ -1067,7 +1551,7 @@ async function processMessage(args) {
   // answers from real log data (run visibly in the diagnosis pane) regardless
   // of how the classifier routed the message. Only fires on an explicit
   // "log" mention so normal status/planning turns pass through.
-  if (/\blogs?\b/i.test(englishText)) {
+  if (turnFacts.logMention) {
     try {
       const { probeLog } = require('./nodes/statusCheck.cjs');
       const lp = await probeLog(englishText);
@@ -1095,23 +1579,32 @@ async function processMessage(args) {
   //     (_probePlan answers from disk)
   //   - the dismiss sentinel "none of these — start a new plan" → planning
   //     (fresh-draft escape)
-  if (!result && (intent === 0 || intent === 1 || intent === 3) && /\bplan\b|none of these/i.test(englishText)) {
+  if (!result && (intent === 0 || intent === 1 || intent === 3) && /\bplan\b|none of these/i.test(turnFacts.userText)) {
     try {
       const sysMap = require('../../shared/system-map.cjs');
-      const s = String(englishText || '');
+      const s = turnFacts.userText;
       if (/^none of these\b|\bstart (?:a )?(?:new|fresh) plan\b/i.test(s)) {
         logger.info('[Server] Fresh-plan sentinel → planning lane');
         intent = 6;
         intentName = 'planning';
-      } else {
-        const refM = s.match(/\bthe\s+([\w][\w .-]{0,40}?)\s+plan\b/i)
-          || s.match(/\bplan\s+(?:for|about|on)\s+([\w][\w .-]{1,40})/i)
-          || s.match(/\b([\w][\w .-]{0,40}?)\s+plan\b/i);
-        const informational = /\b(?:thought|think|remember|had|have|has|was|were|is|are|there|what|which|show|tell|do we|did we|find|search|look|any)\b/i.test(s);
-        if (refM && refM[1] && sysMap.findPlans(refM[1].trim()).length) {
-          const to = informational ? 3 : 6;
-          if (to !== intent) {
-            logger.info('[Server] Plan referent re-route', { ref: refM[1].trim(), from: intent, to, informational });
+      } else if (turnFacts.planRef && turnFacts.planRef.meaningful) {
+        // findPlans fuzzes on ANY token overlap ("my current" bound a "current
+        // price" plan on one word) — require a real score before re-routing.
+        const hits = sysMap.findPlans(turnFacts.planRef.token).filter(h => (h.score || 0) >= 6);
+        if (hits.length) {
+          // Question-shaped informational hits can still be "asking about the
+          // word" — one semantic verdict before hijacking the lane.
+          let _referent = !turnFacts.planRef.informational || !turnFacts.isQuestion;
+          if (!_referent) {
+            _referent = (await _decision.confirmJudgment({
+              site: 'plan-referent',
+              question: 'Is this message referring to an actual saved plan, or does the word "plan" just appear inside a question/quoted text?',
+              state: String(s || '').slice(0, 800),
+            })) !== 'NO'; // model-down keeps today's reroute behavior
+          }
+          const to = turnFacts.planRef.informational ? 3 : 6;
+          if (_referent && to !== intent) {
+            logger.info('[Server] Plan referent re-route', { ref: turnFacts.planRef.token, from: intent, to, informational: turnFacts.planRef.informational });
             intent = to;
             intentName = to === 6 ? 'planning' : 'status_check';
           }
@@ -1126,7 +1619,7 @@ async function processMessage(args) {
       // (intentGuesser.guess is a pure synchronous regex — ~1ms, no LLM/async)
       const { guessedIntent: _gi0 } = intentGuesser.guess(classifyText, { hasSelectionContext });
       const handoffResult = await handoff({
-        englishPrompt: englishText,
+        englishPrompt: _resolvedText,
         source,
         originalPrompt: originalText,
         detectedLanguage,
@@ -1167,7 +1660,7 @@ async function processMessage(args) {
       if (result.metadata.shouldHandoff) {
         const { guessedIntent: _gi1 } = intentGuesser.guess(classifyText, { hasSelectionContext });
         const handoffResult = await handoff({
-          englishPrompt: englishText,
+          englishPrompt: _resolvedText,
           source,
           originalPrompt: originalText,
           detectedLanguage,
@@ -1209,12 +1702,13 @@ async function processMessage(args) {
       try { if (typeof onReplyChunk === 'function') onReplyChunk('\x00SEARCHING\x00google-serp'); } catch (_) {}
       const _er = await webSearchExpress.execute({
         englishText, originalText, detectedLanguage, context, onReplyChunk,
+        routeDecision: _routeDecision,
       });
       if (!_er) {
         logger.info('[Process] Search express abstained → handoff');
         const { guessedIntent: _gi8 } = intentGuesser.guess(classifyText, { hasSelectionContext });
         const handoffResult = await handoff({
-          englishPrompt: englishText,
+          englishPrompt: _resolvedText,
           source,
           originalPrompt: originalText,
           detectedLanguage,
@@ -1342,7 +1836,7 @@ async function processMessage(args) {
       if (result?.metadata?.shouldHandoff) {
         const { guessedIntent: _gi7 } = intentGuesser.guess(classifyText, { hasSelectionContext });
         const handoffResult = await handoff({
-          englishPrompt: englishText,
+          englishPrompt: _resolvedText,
           source,
           originalPrompt: originalText,
           detectedLanguage,
@@ -1377,7 +1871,7 @@ async function processMessage(args) {
       if (result.metadata.shouldHandoff) {
         const { guessedIntent: _gi5 } = intentGuesser.guess(classifyText, { hasSelectionContext });
         const handoffResult = await handoff({
-          englishPrompt: englishText,
+          englishPrompt: _resolvedText,
           source,
           originalPrompt: originalText,
           detectedLanguage,
@@ -1412,6 +1906,13 @@ async function processMessage(args) {
     }
   }
 
+  // Empty-draft/new-topic pin release — the prompt escaped a stale planning
+  // pin; tell main.js to unpin the UI (_planningMode → _exitPlanningLane) so
+  // the NEXT message classifies normally instead of re-entering planning_pinned.
+  if ((_releasedEmptyPin || _escapedPin) && result && result.metadata) {
+    result.metadata.exitPlanning = true;
+  }
+
   // ── Routing-promise / unclaimed-sentinel invariant ─────────────────────────
   // A quick lane's reply must be an answer — never prose that PROMISES routing
   // ("Let me route that to ThinkDrop now") while nothing dispatches, and never
@@ -1426,7 +1927,7 @@ async function processMessage(args) {
     });
     const { guessedIntent: _giQ } = intentGuesser.guess(classifyText, { hasSelectionContext });
     const handoffResult = await handoff({
-      englishPrompt: englishText,
+      englishPrompt: _resolvedText,
       source,
       originalPrompt: originalText,
       detectedLanguage,
@@ -1701,6 +2202,18 @@ const server = http.createServer(async (req, res) => {
         const md = lbResult?.metadata || {};
         if (md.runPlan && md.planFile) {
           _postMain('/plan.run', { planId: md.planId, planFile: md.planFile, escalated: true });
+        } else if (_lb.reason === 'no_skill_coverage' && _lbText) {
+          // User declined/abandoned planning for a coverage miss — re-dispatch
+          // the same request with _allowPlannerFallback so stategraph's
+          // coverage gate lets the bounded planner handle it ("just run it").
+          logger.info('[Server] no_skill_coverage planning exited without plan — re-dispatching with planner fallback', { taskId: body.taskId });
+          handoff({
+            englishPrompt: _lbText,
+            source: _lbTask?.source || 'text',
+            sessionId: _lbSession,
+            guessedIntent: _lbTask?.guessedIntent || null,
+            allowPlannerFallback: true,
+          }).catch(err => logger.warn('[Server] planner-fallback re-dispatch failed', { error: err?.message }));
         }
       }).catch(err => logger.warn('[Server] Loop-back planning failed', { error: err?.message }));
     }

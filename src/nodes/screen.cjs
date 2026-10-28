@@ -79,7 +79,7 @@ const EFFECT_MAP = [
 const THREE_PRESETS = new Set(['starfield', 'particles', 'wave', 'cube', 'knot', 'globe']);
 
 // Referential display words — the payload lives in prior context, not the prompt.
-const REFERENTIAL_RE = /\b(?:this|that|it|these|those|them|the\s+(?:results?|answers?|response|replies|images?|pictures?|photos?|list|data|findings|above))\b/i;
+const REFERENTIAL_RE = /\b(?:this|that|it|these|those|them|him|his|her|he|she|the\s+(?:results?|answers?|response|replies|images?|pictures?|photos?|list|data|findings|above))\b/i;
 
 // "the <name> plan" / "the <name> file" / "that markdown file" — disk referents.
 const PLAN_REF_RE = /\b(?:the\s+|my\s+|our\s+)?([\w][\w .-]{0,40}?)\s+plan\b/i;
