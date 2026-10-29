@@ -340,8 +340,13 @@ async function classify(englishText, conversationContext, opts = {}) {
   // my inbox … and put a summary on my screen" is a gather+display compound
   // that needs the service lane (nylas/gmail) first. Let it reach the
   // capability gate instead of display-short-circuiting the whole prompt.
+  // Rule/automation phrasing ("set a rule that…", "whenever X …") also vetoes
+  // the display lane — an embedded "on my screen" inside a rule is decoration,
+  // not a display command. Swallowing the whole prompt into intent=7 lost the
+  // rule (observed: "set a rule that if I goto youtube … on my screen").
   const _serviceRef = /\b(?:inbox|e-?mails?|gmail|outlook|slack|discord|calendar|notion|drive|spotify|whatsapp|imessage|messages|reminders|contacts|files?|photos?)\b/i.test(englishText);
-  if (!_serviceRef && /\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(englishText)) {
+  const _rulePhrasing = /\b(?:set|create|make|add|save)\s+(?:a\s+|me\s+(?:a\s+)?)?rules?\b|\brule\s+that\b|\bwhenever\b|\bevery\s+time\b/i.test(englishText);
+  if (!_serviceRef && !_rulePhrasing && /\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(englishText)) {
     logger.info('[Classify] Screen-output guard → screen lane', {
       inputPreview: englishText.substring(0, 60),
     });

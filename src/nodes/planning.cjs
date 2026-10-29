@@ -253,6 +253,23 @@ function _writePlanFile(sess) {
     if (sess.risks && sess.risks.length) {
       content = content.replace(/## Risks\n\s*$/m, '## Risks\n' + sess.risks.map(r => `- ${r}`).join('\n') + '\n');
     }
+    // Preserve frontmatter the writer doesn't own — newPlanContent
+    // regenerates a fixed field set, which on a saved/bound plan would
+    // silently drop skill_plan_json, slots_json, a persisted auth_bypass
+    // decision, and the original created timestamp.
+    try {
+      if (fs.existsSync(sess.filePath)) {
+        const prevFm = planFormat.parseFrontmatter(fs.readFileSync(sess.filePath, 'utf8')) || {};
+        const nextFm = planFormat.parseFrontmatter(content) || {};
+        for (const [k, v] of Object.entries(prevFm)) {
+          if (v === undefined || v === null || v === '') continue;
+          const preserve = !(k in nextFm)
+            || k === 'created'
+            || (k === 'auth_bypass' && String(nextFm[k]) === '[]' && String(v) !== '[]');
+          if (preserve) content = planFormat.setFrontmatterField(content, k, String(v));
+        }
+      }
+    } catch (_) {}
     fs.writeFileSync(sess.filePath, content, 'utf8');
     try { sess._diskMtime = fs.statSync(sess.filePath).mtimeMs; } catch (_) {}
     return true;
@@ -1128,13 +1145,18 @@ function _toolPlanFind(query) {
 // Open (and if needed reopen) a saved plan and bind this session to it.
 // Terminal plans (done/failed/cancelled) are reopened: status → ready and
 // failed/skipped tasks → pending so the run can continue where it stopped.
+// A plan whose EVERY task is done has nothing to resume — reopening it to
+// 'ready' produced a contradictory run state (queued cards over an instantly
+// complete run), so it stays done and reports alreadyComplete instead.
 function _openPlanForSession(planId, sessionId) {
   const sess2 = _loadPlanFromDisk(planId);
   if (!sess2) return { sess: null, reopened: false, error: `plan ${planId} not found on disk` };
   if (sessionId) _sessionToPlan.set(sessionId, planId);
   _activePlanId = planId;
   const isTerminal = /^(done|failed|cancelled)$/i.test(String(sess2.status || ''));
+  const allTasksDone = sess2.tasks.length > 0 && sess2.tasks.every(t => /done/i.test(String(t.status || '')));
   const allTasksTerminal = sess2.tasks.length > 0 && sess2.tasks.every(t => /done|skipped|failed|cancelled/i.test(String(t.status || '')));
+  if (allTasksDone) return { sess: sess2, reopened: false, alreadyComplete: true };
   if (!isTerminal && !allTasksTerminal) return { sess: sess2, reopened: false };
   try {
     let content = fs.readFileSync(sess2.filePath, 'utf8');
@@ -1153,12 +1175,39 @@ function _openPlanForSession(planId, sessionId) {
   }
 }
 
-function _toolPlanOpen(planId, sessionId) {
-  const { sess: opened, reopened, error } = _openPlanForSession(planId, sessionId);
-  if (error) return error;
+// A turn that binds a saved plan shouldn't leave the just-created draft
+// skeleton on disk — _getOrCreateSession writes it eagerly (Plans tab
+// placeholder), so an open-existing-plan prompt otherwise leaves a permanent
+// empty 'drafting' ghost that the stall verifier keeps tracking. Only
+// neutralize a taskless drafting stub; anything the model already drafted is
+// the user's to keep.
+function _neutralizeStubDraft(sess) {
+  try {
+    if (!sess || !sess.planId || sess.tasks.length) return;
+    if (String(sess.status || 'drafting') !== 'drafting') return;
+    if (sess.filePath && fs.existsSync(sess.filePath)) {
+      const content = fs.readFileSync(sess.filePath, 'utf8');
+      fs.writeFileSync(sess.filePath, planFormat.updateFrontmatterStatus(content, 'cancelled'), 'utf8');
+    }
+    sess.status = 'cancelled';
+    _planSessions.delete(sess.planId);
+    if (sess.sessionId && _sessionToPlan.get(sess.sessionId) === sess.planId) _sessionToPlan.delete(sess.sessionId);
+    if (_activePlanId === sess.planId) _activePlanId = null;
+  } catch (_) {}
+}
+
+function _describeOpenedPlan({ sess: opened, reopened, alreadyComplete }) {
   return `Plan "${opened.name || opened.title || opened.planId}" is now the active plan`
-    + (reopened ? ' — REOPENED: it had a terminal status; now status=ready and failed/skipped tasks are reset to pending' : '')
+    + (reopened ? ' — REOPENED: it had a terminal status; now status=ready and failed/skipped tasks are reset to pending'
+      : alreadyComplete ? ' — ALREADY COMPLETE: every task is done. Do NOT say it is queued or running; if the user wants it re-executed they must ask explicitly for a fresh run'
+      : '')
     + `.\nCurrent state:\n${_renderPlanState(opened)}\nTell the user what you found and what the next step is.`;
+}
+
+function _toolPlanOpen(planId, sessionId) {
+  const res = _openPlanForSession(planId, sessionId);
+  if (res.error) return res.error;
+  return _describeOpenedPlan(res);
 }
 
 // Parse "name[, n]" tool queries into {name, n} — shared by the log tools.
@@ -1639,7 +1688,11 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
   <tool>plan.open("plan_…")</tool>          — make a saved plan the active plan
                                             for this session. Reopens terminal
                                             (failed/cancelled) plans: resets
-                                            failed/skipped tasks to pending.
+                                            failed/skipped tasks to pending. A
+                                            fully-done plan is NOT reopened —
+                                            it stays done and the result says
+                                            so; never tell the user a complete
+                                            plan is queued to run again.
   <tool>plan.status()</tool>                — LIVE run state of the active plan
                                             (or "plan.status("plan_…")" for a
                                             specific one): running/cancelled,
@@ -1914,6 +1967,12 @@ OTHER MARKERS (optional):
     with the tasks first. If you're still gathering info, keep asking instead.
     If RUN GATE says BLOCKED, a run will be refused — never tell the user
     tasks are running; state which agent needs attention instead.
+  <plan_open>plan_id</plan_open> — declarative form of plan.open: binds the
+    saved plan as this session's active plan. Emit it when you reference a
+    saved plan you just found — saying "I reopened/found your plan" WITHOUT
+    this marker is a false claim: nothing is bound until the marker or the
+    plan.open tool actually runs. The result feeds back as a tool_results
+    note — describe that state, not the state you guessed.
   <plan_exit/> — when the user wants OUT of planning mode ("stop planning",
     "exit planning", "leave plan mode", "I'm done planning", "forget the
     planning"). Emitting this marker REALLY flips the mode off in the app —
@@ -2004,7 +2063,7 @@ function _extractTag(text, tag) {
 // Includes 'budget:token_budget' — a provider scaffolding artifact (model
 // echoes its context-window tag inside content). Not a lane marker; stripped
 // at the backend's ThinkStripper too — this is defense-in-depth.
-const _STREAM_MARKERS = new Set(['tool', 'plan_update', 'plan_name', 'plan_status', 'plan_desc', 'tool_results', 'choices', 'plan_exit', 'budget:token_budget']);
+const _STREAM_MARKERS = new Set(['tool', 'plan_update', 'plan_name', 'plan_status', 'plan_desc', 'tool_results', 'choices', 'plan_exit', 'budget:token_budget', 'plan_open']);
 
 class _StreamFilter {
   constructor(onEmit) { this.onEmit = onEmit; this.buf = ''; this.sink = null; this.visible = 0; }
@@ -2118,6 +2177,15 @@ function _stripMarkers(text) {
     .replace(/<plan_exit\s*\/?\s*>/g, '')
     .replace(/<choices>[\s\S]*?<\/choices>/g, '')
     .replace(/<tool_results>[\s\S]*?<\/tool_results>/g, '')
+    // Catch-all for plan_* variants not in the explicit list — the model
+    // invents tags (observed: <plan_open>id</plan_open> leaked verbatim into a
+    // reply). Sanitization, not routing: the plan_* namespace can't appear in
+    // legitimate prose. Paired blocks first, then an unclosed opener
+    // swallowing the rest (its payload is markup, not prose — strip before
+    // the bare-tag pass would expose it), then stray/self-closing tags.
+    .replace(/<plan_[a-z_]+>[\s\S]*?<\/plan_[a-z_]+>/gi, '')
+    .replace(/<plan_[a-z_]+>[\s\S]*$/gi, '')
+    .replace(/<\/?plan_[a-z_]+\s*\/?\s*>/gi, '')
     // Unclosed markers — an open <tool>/<tool_results> with no closer swallows
     // the rest of the reply (the model's fabricated results end mid-stream).
     .replace(/<tool_results>[\s\S]*$/g, '')
@@ -2336,7 +2404,11 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   // ── Plan referent detection (pre-binding) ─────────────────────────────────
   // Computed before session resolution: a definite referent or resume phrase
   // is allowed to bind to an existing plan even when preferFresh is set.
-  const refMatch = String(englishText || '').match(/\bthe\s+([\w][\w .-]{0,40}?)\s+plan\b/i);
+  // Definite plan referents only: "the X plan" OR "the plan regarding/about/
+  // for/named X". Post-descriptor forms still require "the" — "a plan for Y"
+  // stays an indefinite draft request, never a referent.
+  const refMatch = String(englishText || '').match(/\bthe\s+([\w][\w .-]{0,40}?)\s+plan\b/i)
+    || String(englishText || '').match(/\bthe\s+plan\s+(?:about|regarding|for|on|named|called|titled|of)\s+([\w][\w .-]{1,40})/i);
   const referentHit = !!(refMatch && !/^(?:new|next|same)$/i.test(refMatch[1].trim()));
   const unnamedResume = _isUnnamedResume(englishText);
 
@@ -2389,9 +2461,25 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     _activity(`searching saved plans for "${refMatch[1].trim()}"…`);
     const hits = sysMap.findPlans(refMatch[1]);
     const top = hits[0];
-    if (top && top.planId !== sess.planId && (!hits[1] || hits[1].score < top.score)) {
+    const clearTop = !!(top && top.planId !== sess.planId && (!hits[1] || hits[1].score < top.score));
+    // findPlans fuzzes on ANY token overlap — a weak top hit must not hijack
+    // the session. score >= 6 auto-binds (the documented reroute floor,
+    // same as the server-level referent path); below it the decision model
+    // confirms rather than silently binding the wrong plan. Model-down → no
+    // bind: a wrong bind is worse than continuing the draft.
+    let canBind = clearTop && (top.score || 0) >= 6;
+    if (clearTop && !canBind) {
+      const verdict = await decision.confirmJudgment({
+        site: 'plan-referent',
+        question: `The user's message is "${String(englishText || '').slice(0, 200)}". A saved plan "${top.name || top.title || top.planId}" fuzzy-matched it only weakly. Is the user referring to that saved plan?`,
+        state: String(conversationContext || '').slice(0, 800),
+      });
+      canBind = verdict === 'YES';
+    }
+    if (canBind) {
       const { sess: opened, reopened } = _openPlanForSession(top.planId, sessionId);
       if (opened) {
+        _neutralizeStubDraft(sess);
         logger.info('[Planning] Referent switch', { from: sess.planId, to: opened.planId, reopened });
         _activity(reopened ? `reopened plan "${opened.name || opened.planId}"` : `switched to plan "${opened.name || opened.planId}"`);
         sess = opened;
@@ -2671,9 +2759,44 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     if (await _applyPlanMarkers(cleanText, sess, unknownAgents)) planChanged = true;
     if (/<plan_run\s*\/?\s*>/.test(cleanText)) planRunSeen = true;
 
+    // <plan_open>plan_id</plan_open> — declarative "bind this saved plan"
+    // marker, a first-class protocol element (the model invented it before
+    // it existed and the raw tag leaked into replies). Consume it like a
+    // tool call: the bind must actually happen, the abandoned draft stub is
+    // neutralized, and the real state feeds back as a tool_results note so
+    // the reply describes what happened — not a fabricated reopen.
+    const planOpenId = _extractTag(cleanText, 'plan_open');
+    let planOpenNote = '';
+    if (planOpenId) {
+      const opened = _openPlanForSession(String(planOpenId).trim(), sessionId);
+      planOpenNote = opened.sess
+        ? `plan_open → ${_describeOpenedPlan(opened)}`
+        : `plan_open → REJECTED: ${opened.error}`;
+      if (opened.sess && opened.sess.planId !== sess.planId) {
+        _neutralizeStubDraft(sess);
+        sess = opened.sess;
+        sess.history.push({ role: 'user', content: englishText });
+      }
+    }
+
     const ran = await _runTools(cleanText, sessionId, { optionsTurn: _optsTurn, routePickTurn: gateReason === 'capability_options' });
     if (ran?.toolCalls?.length) sessToolCalls.push(...ran.toolCalls);
-    const toolResults = ran?.text || null;
+
+    // The plan.open TOOL binds the same way — on success this turn continues
+    // on the opened plan and the abandoned draft stub is neutralized (the
+    // tool only flipped _sessionToPlan/_activePlanId, leaving the reply
+    // metadata and stall tracking pointed at the empty draft).
+    const planOpenedViaTool = (ran?.toolCalls || []).find(c => c.tool === 'plan.open' && c.ok);
+    if (planOpenedViaTool) {
+      const bound = _planSessions.get(String(planOpenedViaTool.query || '').trim());
+      if (bound && bound.planId !== sess.planId) {
+        _neutralizeStubDraft(sess);
+        sess = bound;
+        sess.history.push({ role: 'user', content: englishText });
+      }
+    }
+
+    const toolResults = [ran?.text, planOpenNote].filter(Boolean).join('\n\n') || null;
     _recordObservedMedia(sess, toolResults);
     if (toolResults && round < MAX_TOOL_ROUNDS) {
       // Record the assistant's tool-call turn, then feed results back. A
@@ -3166,4 +3289,4 @@ function retrySteps(planId, taskNum) {
   return { ok: true };
 }
 
-module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, releaseSession, retrySteps, findOpenPlan, _isRecommended, _generateTaskSteps, _scheduleStepGen };
+module.exports = { execute, getActivePlanId, getPlanSession, clearActivePlan, releaseSession, retrySteps, findOpenPlan, _isRecommended, _generateTaskSteps, _scheduleStepGen, _stripMarkers, _openPlanForSession, _neutralizeStubDraft, _describeOpenedPlan, _writePlanFile };

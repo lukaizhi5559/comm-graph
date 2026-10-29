@@ -148,13 +148,24 @@ async function _guardianCommand(text, args) {
 // contain no model; the model appears only at authoring.
 let _pendingRule = null; // {rule, authed}
 
+// Visit-verb alternation shared by the condition↔action patterns — covers the
+// common phrasings observed missing the lane ("goto" one-word, "look at",
+// "watch", "join a call").
+const _RULE_VISIT = '(?:go(?:es)?\\s*(?:to|on)|goto|visits?|opens?|uses?|comes?\\s+to|lands?\\s+on|navigates?\\s+to|browses?|looks?\\s+at|watch(?:es|ing)?|listen(?:s|ing)?\\s+to|plays?|joins?|records?)';
 const _RULE_PHRASE_RES = [
   // condition → action ("if/whenever/next time … goes to/visits/opens … send/show/…")
-  /\b(?:if|whenever|every\s+time|each\s+time|next\s+time|when)\b[\s\S]{0,160}?\b(?:go(?:es)?\s+(?:to|on)|visits?|opens?|uses?|comes?\s+to|lands?\s+on|navigates?\s+to|browses?)\b[\s\S]{0,200}?\b(?:send|email|notify|show|warn|block|alert|tell|display|text|ping|let\s+me\s+know)/i,
+  new RegExp(`\\b(?:if|whenever|every\\s+time|each\\s+time|next\\s+time|when)\\b[\\s\\S]{0,160}?\\b${_RULE_VISIT}\\b[\\s\\S]{0,200}?\\b(?:send|email|notify|show|warn|block|alert|tell|remind|display|text|ping|let\\s+me\\s+know)`, 'i'),
   // action → condition ("email me when I visit X")
-  /\b(?:send|email|notify|show|warn|alert|tell|display|text|ping|let\s+me\s+know)\b[\s\S]{0,160}?\b(?:when|whenever|every\s+time|next\s+time)\b[\s\S]{0,160}?\b(?:go(?:es)?\s+(?:to|on)|visits?|opens?|uses?|comes?\s+to|lands?\s+on|navigates?\s+to|browses?)/i,
+  new RegExp(`\\b(?:send|email|notify|show|warn|alert|tell|remind|display|text|ping|let\\s+me\\s+know)\\b[\\s\\S]{0,160}?\\b(?:when|whenever|every\\s+time|next\\s+time)\\b[\\s\\S]{0,160}?\\b${_RULE_VISIT}`, 'i'),
+  // explicit opener — "set/create/make/add a rule that if…": the word "rule"
+  // plus a conditional marker is anchored enough to fire the (non-destructive)
+  // authoring lane.
+  /\b(?:set|create|make|add)\s+(?:a\s+|an\s+|the\s+|me\s+a\s+)?rules?\b[\s\S]{0,120}?\b(?:if|when|whenever|every\s+time|each\s+time|next\s+time)\b/i,
 ];
 const _isRulePhrase = (t) => _RULE_PHRASE_RES.some((re) => re.test(t));
+// Weak markers — not enough to enter the lane alone, but worth a semantic
+// verdict (AGENTS.md: lexical candidates → confirmJudgment for lane overrides).
+const _RULE_WEAK_RE = /\brules?\b|\bevery\s+time\b|\bwhenever\b|\beach\s+time\b|\bnext\s+time\b|\b(?:alert|remind|notify|tell|warn|ping)\s+me\s+when\b/i;
 
 const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 
@@ -1087,26 +1098,34 @@ async function processMessage(args) {
     };
   }
 
+  // Turn facts BEFORE control lanes — guardian/rule checks read userText,
+  // never rawText. Context blobs ([File:]/[Highlighted:]/[Context:]/[Thought:])
+  // can carry embedded "if I go to…" phrasing that must not author rules or
+  // answer a pending guardian ask (AGENTS.md convention). Markers are
+  // language-agnostic so this is safe before translation.
+  const preFacts = computeTurnFacts({ rawText: text, selectedText });
+  const _userText = (preFacts.userText || '').trim();
+
   // ── Guardian command lane ─────────────────────────────────────────────────
   // `guardian …` commands are deterministic and bypass classify entirely — a
   // passphrase answer must never be re-blocked by the rule it answers. A stale
   // pending ask clears when a non-guardian prompt arrives.
-  if (_pendingGuardian && !/^guardian\s+allow\b/i.test(text.trim())) {
+  if (_pendingGuardian && !/^guardian\s+allow\b/i.test(_userText)) {
     _pendingGuardian = null;
   }
-  if (/^guardian\s+/i.test(text.trim())) {
-    return _guardianCommand(text.trim(), args);
+  if (/^guardian\s+/i.test(_userText)) {
+    return _guardianCommand(_userText, args);
   }
 
   // ── Rule authoring lane — plan-confirmed ─────────────────────────────────
   // A pending draft is committed only on explicit "rule confirm" (+passphrase
   // when set); any other prompt abandons it, mirroring the pending-ask stash.
-  if (_pendingRule && !/^(?:rule\s+)?(?:confirm|yes|no|cancel)\b/i.test(text.trim())) {
+  if (_pendingRule && !/^(?:rule\s+)?(?:confirm|yes|no|cancel)\b/i.test(_userText)) {
     _pendingRule = null;
   }
-  if (_pendingRule && /^(?:rule\s+)?(?:confirm|yes)\b/i.test(text.trim())) {
+  if (_pendingRule && /^(?:rule\s+)?(?:confirm|yes)\b/i.test(_userText)) {
     const stash = _pendingRule;
-    const pw = text.trim().replace(/^(?:rule\s+)?(?:confirm|yes)\s*/i, '');
+    const pw = _userText.replace(/^(?:rule\s+)?(?:confirm|yes)\s*/i, '');
     if (_rulesMod.hasPassphrase() && !stash.authed && !_rulesMod.verifyPassphrase(pw)) {
       return _guardianReply('Passphrase required — say: rule confirm <passphrase>');
     }
@@ -1119,9 +1138,19 @@ async function processMessage(args) {
     return _guardianReply('Rule cancelled.');
   }
   // Conditional trigger phrasing — "if I go to X, send Y" authors a rule,
-  // not a task. Deterministic detect → bounded parse → confirm → addRule.
-  if (_rulesMod && _isRulePhrase(text.trim())) {
-    return _authorRule(text.trim());
+  // not a task. Anchored regexes generate candidates and fire the lane;
+  // weaker markers get a semantic verdict before overriding classify
+  // (AGENTS.md: lexical match overriding a lane needs confirmJudgment).
+  if (_rulesMod && _isRulePhrase(_userText)) {
+    return _authorRule(_userText);
+  }
+  if (_rulesMod && _RULE_WEAK_RE.test(_userText)) {
+    const verdict = await _decision.confirmJudgment({
+      site: 'rule-author',
+      question: 'Is the user asking to create a persistent conditional rule (when X happens, do Y)?',
+      state: _userText,
+    });
+    if (verdict === 'YES') return _authorRule(_userText);
   }
 
   logger.info('[Process] Start', {
@@ -2074,6 +2103,17 @@ const server = http.createServer(async (req, res) => {
       const emit = (obj) => {
         try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch (_) {}
       };
+      // Heartbeat while the turn processes — planning tool rounds emit no
+      // reply bytes, and an idle socket trips main's 90s inactivity timeout
+      // into a duplicate serial-lane run while comms is still working.
+      // Capped at 20 pings (~5min): a truly hung turn goes quiet again so
+      // main's timeout can still fire as the escape hatch.
+      let _pings = 0;
+      const heartbeat = setInterval(() => {
+        if (++_pings > 20) { clearInterval(heartbeat); return; }
+        emit({ type: 'ping' });
+      }, 15000);
+      res.on('close', () => clearInterval(heartbeat));
       try {
         const result = await processMessage({
           ...body,
@@ -2084,6 +2124,7 @@ const server = http.createServer(async (req, res) => {
         logger.error('[Server] processMessage error', { error: err.message, stack: err.stack });
         emit({ type: 'done', data: { ok: false, error: err.message } });
       }
+      clearInterval(heartbeat);
       res.end();
       return;
     }
@@ -2330,6 +2371,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────────
+// COMMS_NO_LISTEN lets tests require processMessage without binding :3015 —
+// the real service always listens; only tests set the flag.
+if (process.env.COMMS_NO_LISTEN !== '1') {
 server.listen(PORT, '127.0.0.1', () => {
   startHandoffRetrySweep();
   logger.info(`[Server] comms-graph listening on http://127.0.0.1:${PORT}`, {
@@ -2349,5 +2393,6 @@ function _shutdown(signal) {
 
 process.on('SIGTERM', () => _shutdown('SIGTERM'));
 process.on('SIGINT', () => _shutdown('SIGINT'));
+}
 
-module.exports = { server, processMessage };
+module.exports = { server, processMessage, _isRulePhrase, _RULE_WEAK_RE, _authorRule };
