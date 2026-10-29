@@ -564,9 +564,17 @@ async function _capabilityGate(text, opts = {}) {
           }], { state: `Request: ${query}` });
           const _pick = _dr?.answers?.tool;
           if (_pick && _pick.index != null && _pick.index < _cands.length && (_pick.confidence ?? 0) >= 0.55) {
-            const _pinId = _cands[_pick.index].id || _cands[_pick.index].agentId;
-            logger.info('[capability-gate] decision-model pin', { agentId: _pinId, conf: _pick.confidence });
-            return { pin: _pinId, reason: 'decision-tool' };
+            const _cand = _cands[_pick.index];
+            const _pinId = _cand.agentId || (_cand.id && String(_cand.id).endsWith('.agent') ? _cand.id : null);
+            // A capability id ('video.ffmpeg') is a route candidate, not an
+            // executable agent — pinning it poisons state._pinnedAgentId and
+            // vetoes deterministic plans downstream (observed: media_play
+            // vetoed by a 'video.ffmpeg' pin). Only registered .agent ids pin.
+            if (_pinId) {
+              logger.info('[capability-gate] decision-model pin', { agentId: _pinId, conf: _pick.confidence });
+              return { pin: _pinId, reason: 'decision-tool' };
+            }
+            logger.info('[capability-gate] decision-model pick is a capability id, not an agent — routing to select/options', { id: _cand.id, conf: _pick.confidence });
           }
           if (_pick && _pick.index === _cands.length && (_pick.confidence ?? 0) >= 0.55) {
             logger.info('[capability-gate] decision-model: no capability fits — passing through');

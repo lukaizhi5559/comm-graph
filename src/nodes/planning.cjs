@@ -1052,13 +1052,36 @@ function _groundTaskMediaUrls(tasks, sess) {
 // The planner's eyes: call this whenever the task refers to "this", "my
 // screen", "this app/site/tool" instead of asking the user to describe it.
 async function _toolScreenRead(_focus) {
+  // The memory slice alone is a stale, wrong-window ~300-char fragment — the
+  // monitor attributes captures to whatever window held focus (the overlay,
+  // Devin, a hidden Chrome utility window), which is why "look at my screen"
+  // kept answering "I can't see it". Use it for the cheap app/url header but
+  // get the body from the deterministic lane's live read: frontmost-app
+  // detect → browser scan_page (real DOM text) → live OCR, overlay hidden.
   const ctx = await screenContext().catch(() => null);
-  if (!ctx) return 'Screen context unavailable (OCR monitor not running or empty).';
-  const parts = [];
-  if (ctx.appName) parts.push(`App: ${ctx.appName}`);
-  if (ctx.url) parts.push(`URL: ${ctx.url}`);
-  if (ctx.title) parts.push(`Window: "${ctx.title}"`);
-  return `${parts.join(', ')}\nVisible text: ${ctx.ocrText || '(no OCR text captured)'}`;
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'app.agent', args: { action: 'read_screen' } },
+  }, COMMAND_API_KEY, 25000));
+
+  const head = [];
+  const appName = res?.appName || ctx?.appName;
+  const url = res?.url || ctx?.url;
+  const title = res?.windowTitle || ctx?.title;
+  if (appName) head.push(`App: ${appName}`);
+  if (url) head.push(`URL: ${url}`);
+  if (title) head.push(`Window: "${title}"`);
+
+  const text = String(res?.stdout || res?.text || res?.content || '').trim();
+  if (text) {
+    const cap = 6000;
+    const trunc = text.length > cap ? `\n… (${text.length - cap} chars truncated — focus the window and call again if the rest is needed)` : '';
+    return `${head.join(', ')}\nVisible text (${res?.via || 'live'}):\n${text.slice(0, cap)}${trunc}`;
+  }
+  // Live read failed — the stale monitor slice is better than nothing.
+  if (ctx?.ocrText) {
+    return `${head.join(', ')}\nVisible text (stale monitor slice — live read failed: ${res?.error || 'unavailable'}):\n${ctx.ocrText}`;
+  }
+  return `Screen read failed: ${res?.error || 'command-service unreachable'} — try again or tell the user the screen couldn't be read.`;
 }
 
 async function _toolCapabilitySearch(query) {
@@ -1654,14 +1677,15 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             installed, signed in, or what flags
                                             it takes. It cannot change anything.
   <tool>screen.read("optional focus")</tool> — look at the user's live screen:
-                                            returns the active app, URL, window
-                                            title, and recent OCR text. Use it
-                                            whenever the request refers to "this",
-                                            "my screen", "this app/site/tool" —
-                                            NEVER claim you can take a screenshot
-                                            or that you can't see; this IS how
-                                            you see. OCR text may lag the live
-                                            screen by a few seconds.
+                                            does a LIVE read (frontmost app →
+                                            rendered-page text for browsers →
+                                            OCR with the overlay hidden) plus
+                                            the active app, URL, and window
+                                            title. Use it whenever the request
+                                            refers to "this", "my screen",
+                                            "this app/site/tool" — NEVER claim
+                                            you can't see; this IS how you see.
+                                            Takes ~3-4s; the text is real.
   <tool>capability.select("twilio")</tool>  — after the user picks an option that
                                             is NOT already a registered agent,
                                             call this ONCE to register it as a
@@ -1865,6 +1889,15 @@ registry says "google_docs.agent"). Generic surfaces — browser.agent,
 web.agent, edit.agent, shell, cli.agent, screen.display — are execution
 lanes, not services; a task whose deliverable lives on a registered service
 names that service's agent.
+
+DEVICE/CAST AGENTS — an agent that drives a physical device (cast/Chromecast/
+TV speakers, e.g. catt) is ONLY a fit when the user explicitly names the
+device or says cast/airplay/stream-to. Playing or watching media at a URL
+the user gave is a plain open/browse task (browser/shell lane) — never
+rewrite it as "cast to a device" and never invent a device target the user
+didn't mention (observed: "play the video using the URL" became "cast to the
+available cast device using catt"). The same goes for any pick that changes
+WHERE output lands — the destination must come from the user's words.
 
 SCREEN DELIVERABLES — the GhostLayer IS the render surface for visual
 artifacts. screen.display (a task's Agents name) paints natively on the
@@ -2284,11 +2317,26 @@ async function _applyPlanMarkers(text, sess, unknownAgents) {
           // never tools. A weak hit can never pin here: not silently, and not
           // via verdict — the candidate shouldn't exist at this layer at all.
           if (_hit.tier === 'weak') continue;
+          // A 'strong' hit is only user-attested when the matched token appears
+          // in the user's own words. Planner-generated task text can
+          // manufacture strong hits that merely echo the model's own pick —
+          // observed: the planner rewrote "play the video" as "Cast … using
+          // catt", then 'using catt' strong-pinned catt.agent. A model-authored
+          // match is circular evidence → require the semantic verdict below,
+          // with no benefit of the doubt when the judge is down.
+          const _userWords = [
+            sess.originalPrompt,
+            ...(sess.history || [])
+              .filter(h => h && h.role === 'user' && !String(h.content || '').startsWith('<'))
+              .map(h => h.content),
+          ].filter(Boolean).join('\n').toLowerCase();
+          const _selfAuthored = !!_hit.matched
+            && !_userWords.includes(String(_hit.matched).toLowerCase());
           // The pin only overrides a planner-chosen agent list when context
           // agrees — lexical matching can't tell "text" (scripture) from
           // "text" (SMS), so the decision model vetoes bad binds.
           const _disagrees = (t.agents || []).length && !t.agents.includes(_hit.agentId);
-          if (_disagrees) {
+          if (_disagrees || _selfAuthored) {
             // Give the judge the agent's real identity — "messages.app.agent"
             // alone reads as agreement with the matched word — plus the plan's
             // other tasks so a git-sync plan can't pass for a messaging task.
@@ -2306,9 +2354,10 @@ async function _applyPlanMarkers(text, sess, unknownAgents) {
               logger.info('[Planning] tool pin vetoed by context', { taskNum: t.num, agentId: _hit.agentId, matched: _hit.matched });
               continue;
             }
-            if (_verdict !== 'YES' && _hit.tier !== 'strong') {
-              // Decision model down — weak lexical matches get no benefit of the doubt.
-              logger.info('[Planning] tool pin skipped — no context verdict', { taskNum: t.num, agentId: _hit.agentId, tier: _hit.tier });
+            if (_verdict !== 'YES' && (_hit.tier !== 'strong' || _selfAuthored)) {
+              // Decision model down — weak lexical matches and model-authored
+              // matches get no benefit of the doubt.
+              logger.info('[Planning] tool pin skipped — no context verdict', { taskNum: t.num, agentId: _hit.agentId, tier: _hit.tier, selfAuthored: _selfAuthored });
               continue;
             }
             logger.info('[Planning] tool pin confirmed by context', { taskNum: t.num, agentId: _hit.agentId, verdict: _verdict || 'model-down' });
