@@ -343,6 +343,113 @@ function _notifyThoughtEngine(type, info) {
   } catch (_) {}
 }
 
+// ── Loop-back escalation handling ──────────────────────────────────────────────
+// 'needs_plan'/'plan_update' completions re-enter the planning lane. Settle
+// contract: EVERY outcome resolves something — a runnable plan posts
+// /plan.run; anything else (scrubbed reply, zero tasks, timeout, throw) posts
+// /plan.fail so the held run + queue card terminalize instead of spinning
+// forever (observed: task_d8b8de8c — 40min "Generating skill plan…").
+const _LOOPBACK_MAX_ATTEMPTS = 2;      // needs_plan replans per plan/task
+const _LOOPBACK_TIMEOUT_MS = 240000;   // escalated turns run ~70s; 4min headroom
+const _loopBackAttempts = new Map();   // key planId||taskId → needs_plan count
+
+async function _handleLoopBack(body) {
+  const _lbTask = taskJournal.getTask(body.taskId);
+  let _lb = {};
+  try { _lb = JSON.parse(body.result || '{}'); } catch (_) {}
+  const _lbPlanId = _lbTask?.planMeta?.planId || _lb.planId || null;
+  // A needs_plan escalation from a plan-bound task = "this plan can't run as
+  // written" — revise the SAME plan (like plan_update) so startPlan resumes
+  // the held run. forceNewPlan is only for non-plan tasks that escalated.
+  const _isRevise = !!_lbPlanId;
+  const _lbText = _isRevise
+    ? (body.status === 'plan_update'
+      ? `[Execution feedback — revise THIS plan in place]\nReason: ${_lb.reason || 'unspecified'}\nProposed change: ${_lb.proposal || 'see reason'}\n${_lb.gatheredContext?.length ? `Known: ${JSON.stringify(_lb.gatheredContext).slice(0, 600)}` : ''}`
+      : `[Execution feedback — revise THIS plan in place]\nReason: ${_lb.reason || 'unspecified'}\nA task in this plan could not run as written — revise the plan so it executes with available capabilities (re-pin the failing task to a dispatchable skill, fix its steps, or add the missing onboarding step).\nFailing task: ${String(_lb.seedPrompt || _lbTask?.prompt || '').replace(/\s*\[Runtime readiness:[^\]]*\]/g, '')}`)
+    : (_lb.seedPrompt || _lbTask?.prompt || '');
+  const _lbSession = body.sessionId || _lbTask?.sessionId || _lastSessionId || null;
+  const _attemptKey = _lbPlanId || body.taskId;
+
+  const _settleFail = (why) => {
+    _loopBackAttempts.delete(_attemptKey);
+    logger.warn('[Server] Loop-back settling as failure', { taskId: body.taskId, planId: _lbPlanId, why });
+    _postMain('/plan.fail', { planId: _lbPlanId, taskId: body.taskId, reason: why });
+  };
+
+  // Loop guard — a plan that keeps escalating needs_plan cannot be compiled
+  // into something runnable; fail it instead of ping-ponging run→escalate.
+  // The count is LIFETIME per plan (not cleared on /plan.run) — a replan that
+  // produced a runnable-but-broken plan still ping-pongs back here otherwise.
+  if (body.status === 'needs_plan') {
+    const n = (_loopBackAttempts.get(_attemptKey) || 0) + 1;
+    _loopBackAttempts.set(_attemptKey, n);
+    if (n > _LOOPBACK_MAX_ATTEMPTS) {
+      _loopBackAttempts.delete(_attemptKey);
+      logger.warn('[Server] Loop-back escalation cap reached', { taskId: body.taskId, planId: _lbPlanId, attempts: n });
+      _settleFail(`planning could not produce a runnable plan after ${n - 1} attempt(s) — last: ${_lb.reason || 'unspecified'}`);
+      return;
+    }
+  }
+
+  logger.info(`[Server] Loop-back ${body.status} → planning lane`, {
+    taskId: body.taskId, planId: _lbPlanId, revise: _isRevise,
+    reason: _lb.reason || null,
+  });
+
+  let lbResult = null, lbErr = null;
+  try {
+    lbResult = await Promise.race([
+      planningNode.execute({
+        englishText: _lbText,
+        sessionId: _lbSession,
+        planning: _isRevise
+          ? { active: true, planId: _lbPlanId, revise: true, escalated: true, addRefs: _lb.addRefs }
+          : { active: true, escalated: true, forceNewPlan: true, refs: _lb.refs },
+      }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`loop-back planning timeout (${_LOOPBACK_TIMEOUT_MS}ms)`)), _LOOPBACK_TIMEOUT_MS)),
+    ]);
+  } catch (err) { lbErr = err; }
+
+  const md = lbResult?.metadata || {};
+  if (!lbErr && md.runPlan && md.planFile) {
+    // Escalated plans auto-run — main's plan-check fires autoStart once every
+    // checklist item clears (auth/Approval gates still hold). Attempt count is
+    // deliberately NOT cleared — the cap is lifetime per plan (see above).
+    _postMain('/plan.run', { planId: md.planId, planFile: md.planFile, escalated: true });
+    return;
+  }
+  if (!lbErr && _lb.reason === 'no_skill_coverage' && _lbText) {
+    // User declined/abandoned planning for a coverage miss — re-dispatch the
+    // same request with _allowPlannerFallback so stategraph's coverage gate
+    // lets the bounded planner handle it ("just run it").
+    _loopBackAttempts.delete(_attemptKey);
+    logger.info('[Server] no_skill_coverage planning exited without plan — re-dispatching with planner fallback', { taskId: body.taskId });
+    handoff({
+      englishPrompt: _lbText,
+      source: _lbTask?.source || 'text',
+      sessionId: _lbSession,
+      guessedIntent: _lbTask?.guessedIntent || null,
+      allowPlannerFallback: true,
+    }).catch(err => logger.warn('[Server] planner-fallback re-dispatch failed', { error: err?.message }));
+    return;
+  }
+  // The escalated turn produced no runnable plan. If it left a NEW drafting
+  // stub (≠ the plan being revised), mark it failed so it doesn't linger.
+  if (!lbErr && md.planId && md.planId !== _lbPlanId) {
+    try {
+      const planFormat = require('../../shared/plan-format.cjs');
+      const os = require('os');
+      const f = md.planFile || path.join(os.homedir(), '.thinkdrop', 'plans', `${md.planId}.md`);
+      if (fs.existsSync(f)) {
+        fs.writeFileSync(f, planFormat.updateFrontmatterStatus(fs.readFileSync(f, 'utf8'), 'failed'), 'utf8');
+      }
+    } catch (_) {}
+  }
+  _settleFail(lbErr
+    ? `planning failed: ${String(lbErr.message || lbErr).slice(0, 200)}`
+    : `planning produced no runnable plan (${_lb.reason || 'escalated'})`);
+}
+
 // ── Capability-gap guard ──────────────────────────────────────────────────────
 // Cheap read-only call into command-service /capability.search. Decides whether
 // a handoff-bound prompt should pin a ready agent or divert to planning.
@@ -1666,6 +1773,9 @@ async function processMessage(args) {
         agentId: _capPin || undefined,
         capabilityReason: _capReason || undefined,
         routeDecision: serializeDecision(_routeDecision),
+        // Session turns fetched at classify — the dispatch-time compile
+        // resolves follow-ups ("next chapter 7") against them.
+        conversationContext: convHistory || null,
       });
 
       // Generate intent-aware handoff phrase (LLM for command_automate, static pool for others)
@@ -1704,6 +1814,7 @@ async function processMessage(args) {
           guessedIntent: _gi1,
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
+          conversationContext: convHistory || null,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi1);
         // Preserve the lane's task-specific ack (routing sentences stripped) —
@@ -1752,6 +1863,7 @@ async function processMessage(args) {
           guessedIntent: _gi8,
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
+          conversationContext: convHistory || null,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi8);
         const handoffText = handoffResult.parked
@@ -1880,6 +1992,7 @@ async function processMessage(args) {
           guessedIntent: _gi7,
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
+          conversationContext: convHistory || null,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi7);
         const handoffText = handoffResult.parked
@@ -1915,6 +2028,7 @@ async function processMessage(args) {
           guessedIntent: _gi5,
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
+          conversationContext: convHistory || null,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi5);
         const handoffText = handoffResult.parked
@@ -1972,6 +2086,7 @@ async function processMessage(args) {
       sessionId: routedSessionId,
       thoughtContext,
       routeDecision: serializeDecision(_routeDecision),
+      conversationContext: convHistory || null,
     });
     const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _giQ);
     // Keep the lane's task-specific ack minus the routing sentences when one
@@ -2220,51 +2335,13 @@ const server = http.createServer(async (req, res) => {
       }
     }
     // ── Loop-back escalations — a task decided mid-run it needs planning ──
-    // 'needs_plan': stategraph escalated a non-plan task (local multi-entity
-    //   sweep, grill not converging) → draft a FRESH plan from the seed.
+    // 'needs_plan': runtime escalated — plan-bound tasks revise the SAME plan
+    //   (the run holds 'revising' and resumes); bare tasks draft a fresh one.
     // 'plan_update': a task.agent inside a plan run pushed a discovery back —
     //   revise the SAME plan file with the proposal, then auto-resume.
     if (body.status === 'needs_plan' || body.status === 'plan_update') {
-      const _lbTask = taskJournal.getTask(body.taskId);
-      let _lb = {};
-      try { _lb = JSON.parse(body.result || '{}'); } catch (_) {}
-      const _lbPlanId = _lbTask?.planMeta?.planId || _lb.planId || null;
-      const _isRevise = body.status === 'plan_update' && !!_lbPlanId;
-      const _lbText = _isRevise
-        ? `[Execution feedback — revise THIS plan in place]\nReason: ${_lb.reason || 'unspecified'}\nProposed change: ${_lb.proposal || 'see reason'}\n${_lb.gatheredContext?.length ? `Known: ${JSON.stringify(_lb.gatheredContext).slice(0, 600)}` : ''}`
-        : (_lb.seedPrompt || _lbTask?.prompt || '');
-      const _lbSession = body.sessionId || _lbTask?.sessionId || _lastSessionId || null;
-      logger.info(`[Server] Loop-back ${body.status} → planning lane`, {
-        taskId: body.taskId, planId: _lbPlanId, revise: _isRevise,
-        reason: _lb.reason || null,
-      });
-      planningNode.execute({
-        englishText: _lbText,
-        sessionId: _lbSession,
-        planning: _isRevise
-          ? { active: true, planId: _lbPlanId, revise: true, escalated: true, addRefs: _lb.addRefs }
-          : { active: true, escalated: true, forceNewPlan: true, refs: _lb.refs },
-      }).then((lbResult) => {
-        // Escalated plans auto-run: when the turn left a task list, post the
-        // run trigger — main's plan-check fires autoStart and starts the plan
-        // once every checklist item clears (auth/Approval gates still hold).
-        const md = lbResult?.metadata || {};
-        if (md.runPlan && md.planFile) {
-          _postMain('/plan.run', { planId: md.planId, planFile: md.planFile, escalated: true });
-        } else if (_lb.reason === 'no_skill_coverage' && _lbText) {
-          // User declined/abandoned planning for a coverage miss — re-dispatch
-          // the same request with _allowPlannerFallback so stategraph's
-          // coverage gate lets the bounded planner handle it ("just run it").
-          logger.info('[Server] no_skill_coverage planning exited without plan — re-dispatching with planner fallback', { taskId: body.taskId });
-          handoff({
-            englishPrompt: _lbText,
-            source: _lbTask?.source || 'text',
-            sessionId: _lbSession,
-            guessedIntent: _lbTask?.guessedIntent || null,
-            allowPlannerFallback: true,
-          }).catch(err => logger.warn('[Server] planner-fallback re-dispatch failed', { error: err?.message }));
-        }
-      }).catch(err => logger.warn('[Server] Loop-back planning failed', { error: err?.message }));
+      _handleLoopBack(body)
+        .catch(err => logger.warn('[Server] Loop-back planning failed', { error: err?.message }));
     }
     // Feed the completed task's RESULT back into conversation history. The
     // reply the user saw was only a handoff phrase ("one sec while I search"),
@@ -2403,4 +2480,4 @@ process.on('SIGTERM', () => _shutdown('SIGTERM'));
 process.on('SIGINT', () => _shutdown('SIGINT'));
 }
 
-module.exports = { server, processMessage, _isRulePhrase, _RULE_WEAK_RE, _authorRule };
+module.exports = { server, processMessage, _isRulePhrase, _RULE_WEAK_RE, _authorRule, _handleLoopBack, _loopBackAttempts };

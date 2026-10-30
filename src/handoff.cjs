@@ -72,7 +72,7 @@ function detectAgent(englishPrompt) {
  * @param {object|null} [thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<boolean>} true if notification was sent
  */
-function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planMeta = null, detectedLanguage = null, capabilityReason = null, routeDecision = null) {
+function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planMeta = null, detectedLanguage = null, capabilityReason = null, routeDecision = null, compiledPlan = null) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       taskId,
@@ -85,6 +85,12 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
       sessionId: sessionId || null,
       userApproved: userApproved === true,
       thoughtContext: thoughtContext || null,
+      // Compiler-hoist payload — typed steps comms-graph compiled for this
+      // task. stategraph's _skillPlan fast-path executes them verbatim.
+      ...(Array.isArray(compiledPlan) && compiledPlan.length ? { compiledPlan } : {}),
+      // A compiled task may still hit no_skill_coverage at runtime — grant the
+      // coverage gate's planner-escalation permission up front.
+      ...(Array.isArray(compiledPlan) && compiledPlan.length ? { allowPlannerFallback: true } : {}),
       ...(capabilityReason ? { capabilityReason } : {}),
       // RouteDecision envelope — the single upstream classification;
       // resolveReferencesV2 consumes it instead of re-classifying.
@@ -117,6 +123,156 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
     req.write(body);
     req.end();
   });
+}
+
+// ── Compiler hoist ────────────────────────────────────────────────────────────
+// comms-graph is the compile layer; stategraph is the runtime. A task-lane
+// prompt that arrives without a plan gets compiled HERE — one bounded
+// step-generation call — so the stategraph run takes the _skillPlan fast-path
+// (parseIntent passthrough → planSkills decode → execute) instead of paying
+// for the internal decompose→gather→planSkills pipeline. A failed or
+// low-quality compile degrades to a plain handoff — stategraph's internal
+// pipeline remains the fallback, unchanged.
+
+// Build the context block the bare prompt can't carry — a follow-up like
+// "next chapter 7" only resolves against earlier turns. convHistory (session
+// turns fetched for classification) is the richest channel; recent task
+// journal entries cover sessions with no fetched history.
+function _compileContextBlock(conversationContext, sessionId) {
+  const parts = [];
+  if (conversationContext) {
+    parts.push(String(conversationContext).slice(0, 1200));
+  } else {
+    try {
+      const { getRecentTasks } = require('./taskJournal.cjs');
+      const recent = getRecentTasks(8);
+      const sameSession = sessionId ? recent.filter(t => t.sessionId === sessionId) : [];
+      const pool = (sameSession.length ? sameSession : recent).slice(0, 6);
+      const lines = pool
+        .map(t => `- [${t.status}] "${String(t.prompt || '').replace(/\s+/g, ' ').slice(0, 120)}" → ${String(t.result || '(no result)').replace(/\s+/g, ' ').slice(0, 280)}`)
+        .filter(l => l.length > 12);
+      if (lines.length) parts.push(lines.join('\n'));
+    } catch (_) {}
+  }
+  return parts.join('\n').slice(0, 1800) || null;
+}
+
+// ── url-first arg bake ─────────────────────────────────────────────────────
+// A url.first.agent step should carry args.url resolved at COMPILE time — the
+// query belongs to this task and is known now. Without it, the runtime
+// resolution chain (intent-templates → caches → LLM) can serve empty/stale
+// URLs (observed: "goto the latest AI video" → youtube.com/results?search_query=
+// — an EMPTY query nav'd to a no-results page and burned the recovery loop).
+// What we bake: service→host via the site-search template table + query via
+// the service-gated extractor → deterministic template fill. Anything we
+// can't derive stays for the runtime chain — the bake never guesses.
+async function _bakeUrlFirstArgs(steps, taskText) {
+  if (!Array.isArray(steps) || !steps.length) return steps;
+  let ss = null, dr = null;
+  try { ss = require('../../mcp-services/command-service/src/skill-helpers/site-search.cjs'); } catch (_) {}
+  try { dr = require('../../mcp-services/command-service/src/skill-helpers/destination-resolver.cjs'); } catch (_) {}
+  if (!ss) return steps;
+
+  const _validUrl = (u) => {
+    if (!u || typeof u !== 'string' || u.includes('{')) return false;
+    if (!/^https?:/i.test(u)) return false;
+    try { if (dr?._hasEmptySearchParam?.(u)) return false; } catch (_) {}
+    return true;
+  };
+
+  const tmplHosts = Object.keys(ss.SITE_SEARCH_URL_TEMPLATES || {});
+  const _hostStem = (h) => String(h || '').replace(/^www\./, '').split('.')[0];
+  let baked = 0;
+
+  for (const s of steps) {
+    if (!s || s.skill !== 'url.first.agent') continue;
+    const args = s.args || {};
+    const emitted = typeof args.url === 'string' && args.url.trim() ? args.url.trim() : null;
+    if (emitted && _validUrl(emitted)) continue;
+
+    // service → host: explicit args.service, the step's agentId stem, or a
+    // template-table host stem mentioned in the task text.
+    const svcKey = String(args.service || s.agentId || '').replace(/\.agent$/, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const taskLc = String(taskText || '').toLowerCase();
+    const host = tmplHosts.find(h => _hostStem(h) === svcKey)
+      || tmplHosts.find(h => taskLc.includes(_hostStem(h)))
+      || null;
+
+    // Query extraction — same service-gated path the runtime uses.
+    const q = ss.extractServiceSearchTerm(taskText, [svcKey, host ? _hostStem(host) : ''].filter(Boolean));
+    let url = null;
+    if (q && host) {
+      try { url = await ss.buildSiteSearchUrl(host, q); } catch (_) { url = null; }
+      // "latest/newest/recent" — YouTube sort-by-upload-date (learned-rule
+      // shape made deterministic; service-specific params live here, not in
+      // the generic template).
+      if (url && host === 'youtube.com' && /\b(latest|newest|recent|new)\b/i.test(taskText || '')) {
+        url += '&sp=CAISBAgBEAE%3D';
+      }
+    }
+
+    if (url && _validUrl(url)) {
+      s.args = { ...args, url, ...(svcKey && !args.service ? { service: svcKey } : {}) };
+      baked++;
+    } else if (emitted) {
+      // Invalid emitted URL and rebake couldn't fix — strip so the runtime
+      // resolution chain runs rather than navigating a dead URL.
+      const { url: _drop, ...rest } = args;
+      s.args = rest;
+    }
+  }
+  if (baked) logger.info(`[Handoff] url.first bake — resolved ${baked} destination URL(s) at compile`);
+  return steps;
+}
+
+async function _compileTaskSteps(prompt, agentId, { conversationContext = null, sessionId = null } = {}) {
+  try {
+    const { _generateTaskSteps } = require('./nodes/planning.cjs');
+    const { normalizeTaskStepsAsync, agentFamilyMismatch } = require('../../shared/plan-steps.cjs');
+    const { validatePlanSteps } = require('../../shared/skill-contracts.cjs');
+    const steps = await _generateTaskSteps({
+      num: 1,
+      prompt,
+      title: prompt,
+      agents: agentId ? [agentId] : [],
+      doneWhen: '',
+      context: _compileContextBlock(conversationContext, sessionId),
+    });
+    if (!Array.isArray(steps) || !steps.length) return null;
+    const normalized = await normalizeTaskStepsAsync({ steps, agents: agentId ? [agentId] : [] }).catch(() => null);
+    const out = (normalized && Array.isArray(normalized.steps) && normalized.steps.length) ? normalized.steps : steps;
+    // Degenerate floor — a compile whose entire plan is `synthesize` decided
+    // nothing; the internal pipeline reads richer context than we injected.
+    if (!out.some(s => s && s.skill && s.skill !== 'synthesize')) {
+      logger.info('[Handoff] compile rejected — synthesize-only plan (no work steps)');
+      return null;
+    }
+    const mismatch = agentFamilyMismatch(out);
+    if (mismatch) {
+      logger.info('[Handoff] compile rejected — ' + mismatch);
+      return null;
+    }
+    // url-first bake — args.url resolved at compile time so the runtime
+    // executes the destination, not a resolution chain. Runs before the
+    // strict gate so baked args are contract-checked too. Extraction runs on
+    // facts.userText — raw prompt may carry [File:]/[Folder:] attachment blobs
+    // that would leak into the captured query (AGENTS.md: never match blobs).
+    const { computeTurnFacts } = require('../../shared/turn-facts.cjs');
+    const _factsText = computeTurnFacts({ rawText: prompt }).userText || prompt;
+    const baked = await _bakeUrlFirstArgs(out, _factsText).catch(() => out);
+    // Strict gate — wildcard steps (shell.run goal-mode, cli.agent task-mode)
+    // re-plan at replay; a deterministic runtime has nothing to execute. The
+    // internal pipeline has the context to compile these properly instead.
+    const v = validatePlanSteps(baked || out, { strict: true });
+    if (!v.ok) {
+      logger.info(`[Handoff] compile rejected — ${v.violations.length} contract violation(s): ${v.violations.slice(0, 3).map(x => `step${x.step}:${x.field}:${x.msg}`).join('; ')}`);
+      return null;
+    }
+    return baked || out;
+  } catch (e) {
+    logger.info(`[Handoff] compile skipped — ${e.message}`);
+    return null;
+  }
 }
 
 /**
@@ -183,7 +339,7 @@ function _releaseTask(taskId, agentIdHint) {
  * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, refs = null, capabilityReason = null, routeDecision = null, allowPlannerFallback = false }) {
+async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, refs = null, capabilityReason = null, routeDecision = null, allowPlannerFallback = false, conversationContext = null }) {
   // Plan-dispatched tasks carry the task's canonical agentId so the lock key
   // is the shared session (google_*.agent → google.agent), not prompt text.
   const agentId = pinnedAgentId || detectAgent(englishPrompt);
@@ -231,7 +387,17 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
   if (acquired) {
     // Locks acquired — notify main.js to spawn stategraph run
     updateTask(taskId, 'queued');
-    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext, planMeta, detectedLanguage, capabilityReason, routeDecision);
+    // Compiler hoist — task-lane dispatch only (no plan context already
+    // attached). Proactive thoughts and plan tasks keep their existing lanes.
+    const _canCompile = !deterministicPlan && !planId && !planTask && !thoughtContext
+      && !(Array.isArray(priorResults) && priorResults.length)
+      && !(Array.isArray(refs) && refs.length);
+    const _compiled = _canCompile ? await _compileTaskSteps(englishPrompt, agentId, { conversationContext, sessionId }) : null;
+    if (_compiled) {
+      logger.info(`[Handoff] Compiled ${_compiled.length} steps at dispatch — task ${_compiled.map(s => s.skill).join(' → ').slice(0, 160)}`);
+      updateTask(taskId, 'queued', { compiledSteps: _compiled.length });
+    }
+    const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext, planMeta, detectedLanguage, capabilityReason, routeDecision, _compiled);
     if (!notified) {
       logger.warn('[Handoff] Failed to notify main.js — task will be picked up on retry', { taskId });
     }
@@ -337,4 +503,4 @@ function startRetrySweep() {
   _sweepTimer.unref?.();
 }
 
-module.exports = { execute, complete, remove, detectAgent, isLocked, getWaitingCount, startRetrySweep };
+module.exports = { execute, complete, remove, detectAgent, isLocked, getWaitingCount, startRetrySweep, _compileTaskSteps };

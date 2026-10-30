@@ -302,12 +302,19 @@ into a concrete step list for the skill runtime. Reply with ONLY a fenced json
 block — an array of steps, each {"skill": "...", "args": {...}, "description": "..."}.
 
 Available skills:
-- url.first.agent: {url, agentId} — open a specific service/app URL. ONLY use
-  this when the task's deliverable lives on a named service AND the URL
+- url.first.agent: {url, agentId, service?} — open a specific service/app URL.
+  ONLY use when the task's deliverable lives on a named service AND the URL
   belongs to the TASK AGENTS' service (e.g. task agent google.agent →
   docs.new, sheets.new, calendar event-edit links). NEVER open a service URL
   (docs.new, mail.google.com, amazon.com/...) on a generic browser/web agent
   — it hits a sign-in wall. NEVER use it to "store" research output.
+  args.url — bake the destination NOW when the URL is a known derivable
+  pattern: youtube/google/amazon search URLs carry the task's query in the
+  params (youtube.com/results?search_query=<query>, google.com/search?q=<query>,
+  amazon.com/s?k=<query>; "latest"/"newest" video queries add &sp=CAISBAgBEAE%3D).
+  Emit the LITERAL url with the query filled — never a {placeholder}, never an
+  empty param. Omit url when the destination isn't a known pattern — the
+  runtime resolves it.
 - dom.act: {goal, agentId} — interact with the open page by intent ("set the
   title to X", "click Save"). ANY step taking an agentId arg must carry the
   exact TASK AGENTS value — never invent another agent id.
@@ -486,6 +493,9 @@ async function _generateTaskSteps(task) {
   const agents = (task.agents || []).join(' | ') || 'auto';
   const userMsg =
     `TASK AGENTS: ${agents}\n` +
+    // Session/task context the bare prompt can't carry — a follow-up like
+    // "next chapter 7" is meaningless without the turns that named the file.
+    (task.context ? `RECENT CONTEXT (earlier turns/tasks this session — resolve deictic references against it):\n${task.context}\n` : '') +
     `TASK PROMPT: ${task.prompt || task.title}\n` +
     (task.doneWhen ? `DONE WHEN: ${task.doneWhen}\n` : '') +
     `\nEmit the step list now.`;
@@ -1084,6 +1094,87 @@ async function _toolScreenRead(_focus) {
   return `Screen read failed: ${res?.error || 'command-service unreachable'} — try again or tell the user the screen couldn't be read.`;
 }
 
+// ── Live page tools — the deterministic lane reads the tab the user is on ────
+// scan_page/evaluate on 'ext:default' resolve to the MRU real tab in the
+// extension's background.js — never a stale agent-bound session.
+
+async function _toolPageRead(_focus) {
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'app.agent', args: { action: 'scan_page', sessionId: 'ext:default' } },
+  }, COMMAND_API_KEY, 25000));
+  if (!res) return `page.read failed: command-service unreachable (is it running on :${COMMAND_SERVICE_PORT}?).`;
+  const text = String(res.content || res.stdout || res.text || '').trim();
+  if (!text || res.ok === false) return `page.read failed: ${res.error || 'no page text returned'} — the browser may have no real web tab active.`;
+  const cap = 6000;
+  const trunc = text.length > cap ? `\n… (${text.length - cap} chars truncated — use page.eval with a selector for a scoped read)` : '';
+  return `URL: ${res.url || '(unknown)'}\nPage text (${res.chars || text.length} chars${res.cached ? ', cached' : ''}):\n${text.slice(0, cap)}${trunc}`;
+}
+
+async function _toolPageEval(expr) {
+  const js = String(expr || '').trim();
+  if (!js) return `Usage: page.eval("javascript expression") — scoped read on the user's live tab, e.g. page.eval("Array.from(document.querySelectorAll('ytd-comment-thread-renderer #content-text')).map(e=>e.innerText).join('\\n---\\n')")`;
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'browser.agent', args: { action: 'evaluate', sessionId: 'ext:default', text: js } },
+  }, COMMAND_API_KEY, 20000));
+  if (!res) return `page.eval failed: command-service unreachable (is it running on :${COMMAND_SERVICE_PORT}?).`;
+  if (res.ok === false) return `page.eval failed: ${res.error || 'unknown error'}`;
+  const out = res.stdout != null ? String(res.stdout) : JSON.stringify(res.result ?? null);
+  const cap = 6000;
+  return out && out.length > cap ? `${out.slice(0, cap)}\n… (${out.length - cap} chars truncated)` : (out || '(empty result)');
+}
+
+async function _toolVideoTranscript(arg) {
+  let url = String(arg || '').trim();
+  if (!url) {
+    // No URL given — resolve the tab the user is on. A PLAYING tab beats the
+    // merely-active one ("this video" usually means the one making sound).
+    const r = await fetch(`http://127.0.0.1:${COMMAND_SERVICE_PORT}/ext.sessions`, { signal: AbortSignal.timeout(4000) }).catch(() => null);
+    const list = r ? (await r.json().catch(() => null))?.sessions || [] : [];
+    const pick = list.find(s => s.playing) || list.find(s => s.sessionId === 'ext:default')
+      || list.slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0];
+    url = pick?.url || '';
+  }
+  if (!/^https?:/i.test(url)) return 'video.transcript needs a URL — pass one, or get the user onto the video page first (no live tab resolved).';
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'video.agent', args: { action: 'watch_video', videoUrl: url } },
+  }, COMMAND_API_KEY, 180000));
+  if (!res) return `video.transcript failed: command-service unreachable (is it running on :${COMMAND_SERVICE_PORT}?).`;
+  if (res.ok === false) return `video.transcript failed: ${res.error || 'unknown error'}`;
+  const text = String(res.stdout || '').trim();
+  const meta = [`URL: ${url}`, res.pageTitle ? `Title: "${res.pageTitle}"` : null, res.source ? `source: ${res.source}` : null].filter(Boolean).join(', ');
+  const cap = 6000;
+  const trunc = text.length > cap ? `\n… (${text.length - cap} chars truncated)` : '';
+  return `${meta}\n${text.slice(0, cap) || '(no content returned)'}${trunc}`;
+}
+
+async function _toolMediaPlay(_arg) {
+  // Start (or unmute+restart) playback on the user's live tab — deterministic
+  // video.play() rather than asking the model to write page JS for the one
+  // common non-read action the ambient loop needs.
+  const res = _skillEnvelope(await _postJson(COMMAND_SERVICE_PORT, '/command.automate', {
+    payload: { skill: 'browser.agent', args: { action: 'evaluate', sessionId: 'ext:default', text: `(v => v ? (v.muted = false, v.play(), 'playing') : 'no video element')(document.querySelector('video'))` } },
+  }, COMMAND_API_KEY, 15000));
+  if (!res) return `media.play failed: command-service unreachable (is it running on :${COMMAND_SERVICE_PORT}?).`;
+  if (res.ok === false) return `media.play failed: ${res.error || 'unknown error'}`;
+  const out = String(res.stdout ?? res.result ?? '').trim();
+  return out === 'playing' ? 'Playback started on the live tab.'
+    : `media.play: ${out || 'no video element found'} — the page may not have a <video>, or it may already be playing.`;
+}
+
+async function _toolJournalStatus(_arg) {
+  const r = await fetch(`http://127.0.0.1:${MEMORY_PORT}/audio.status`, { signal: AbortSignal.timeout(5000) }).catch(() => null);
+  const s = r ? await r.json().catch(() => null) : null;
+  if (!s) return `journal.status failed: memory-service unreachable (is it running on :${MEMORY_PORT}?).`;
+  if (s.mode === 'off') return 'Audio journal is OFF (AUDIO_JOURNAL_MODE=off) — ambient capture disabled.';
+  const lines = [`Mode: ${s.mode}`, `Capturing now: ${s.capturing ? 'yes' : 'no'}`, `Verdict: ${s.verdict?.recordable ? `recordable (${s.verdict.type}${s.verdict.app ? `, ${s.verdict.app}` : ''})` : 'nothing recordable'}`];
+  if (s.session) lines.push(`Session: ${s.session.app || '?'} — "${(s.session.title || '').slice(0, 60)}" — ${s.session.segs} segments since ${s.session.started}`);
+  if (s.lastSegment) lines.push(`Latest transcript: "${String(s.lastSegment).slice(0, 160)}"`);
+  if (Array.isArray(s.webMedia) && s.webMedia.length) {
+    lines.push(`Web media: ${s.webMedia.map(m => `${m.state} ${m.url || ''}`).join('; ')}`);
+  }
+  return lines.join('\n');
+}
+
 async function _toolCapabilitySearch(query) {
   const res = await _postJson(COMMAND_SERVICE_PORT, '/capability.search', {
     query,
@@ -1550,6 +1641,11 @@ const TOOL_HANDLERS = {
   'web.search':        { note: q => `searching the web for "${q}"…`,             run: (q) => _toolWebSearch(q) },
   'media.resolve':     { note: q => `finding playable media: "${q}"…`,           run: (q) => _toolMediaResolve(q) },
   'screen.read':       { note: () => 'reading the screen…',                      run: (q) => _toolScreenRead(q) },
+  'page.read':         { note: () => 'reading the live page…',                   run: (q) => _toolPageRead(q) },
+  'page.eval':         { note: () => 'extracting from the page…',                run: (q) => _toolPageEval(q) },
+  'video.transcript':  { note: () => 'pulling the video transcript…',            run: (q) => _toolVideoTranscript(q) },
+  'media.play':        { note: () => 'starting playback…',                       run: (q) => _toolMediaPlay(q) },
+  'journal.status':    { note: () => 'checking the audio journal…',              run: (q) => _toolJournalStatus(q) },
   'capability.search': { note: q => `looking up capabilities for "${q}"…`,       run: (q, ctx) => ctx?.opts?.optionsTurn
                           ? 'SKIPPED — a verified route-options list was already shown for this turn. Do not re-search; ask the user to pick from the list.'
                           : _toolCapabilitySearch(q) },
@@ -1686,6 +1782,39 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             "this app/site/tool" — NEVER claim
                                             you can't see; this IS how you see.
                                             Takes ~3-4s; the text is real.
+  <tool>page.read("optional focus")</tool>    — read the live page the user is on:
+                                            real rendered text incl. comments,
+                                            listings, article body — NOT OCR.
+                                            Use for "the comments", "the items",
+                                            "this page", "what does it say".
+                                            NEVER web.search for content visible
+                                            on the user's page — read it.
+  <tool>page.eval("js expression")</tool>     — scoped DOM read on the live tab —
+                                            e.g. pull comment texts via a
+                                            selector when page.read flattens.
+                                            READ-ONLY: extract text/attributes
+                                            only — never click, type, navigate.
+  <tool>video.transcript("url-or-empty")</tool> — pull a video's transcript +
+                                            description + comments via video.agent.
+                                            Empty arg resolves the tab the user
+                                            is on. For "watch this video for me",
+                                            "what does the video say", "summarize
+                                            this video" — do NOT say you can't
+                                            watch videos; this IS how you watch.
+  <tool>media.play("")</tool>                 — start playback on the user's live
+                                            tab (unmute + play the <video>). Pair
+                                            with journal.status when the user
+                                            wants the video recorded/journaled.
+  <tool>journal.status("")</tool>             — ambient audio journal state:
+                                            whether capture is armed, the open
+                                            session, and the latest transcript
+                                            line. Check it after media.play to
+                                            confirm recording actually works.
+AMBIENT AUDIO JOURNAL — when the user plays media or joins a call, ThinkDrop
+records + transcribes it to ~/.thinkdrop/audio/YYYY-MM-DD/ and indexes
+audio_journal memories. "What was said in the meeting" → memory.search (or
+fs.read the .md file). To WATCH A VIDEO LIVE: url.open the page if needed →
+media.play → journal.status to confirm capture is working.
   <tool>capability.select("twilio")</tool>  — after the user picks an option that
                                             is NOT already a registered agent,
                                             call this ONCE to register it as a
