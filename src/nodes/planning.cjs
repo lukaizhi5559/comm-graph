@@ -39,6 +39,7 @@ const capIndex = require('../../../shared/capability-index.cjs');
 const { PLAN_CONFIRM_RE, PLAN_RUN_RE, PLAN_RUN_NEG_RE } = require('../../../shared/plan-check-phrases.cjs');
 const { computeTurnFacts } = require('../../../shared/turn-facts.cjs');
 const { extractContextRefs, mergeRefs } = require('../../../shared/context-refs.cjs');
+const pathContext = require('../../../shared/path-context.cjs');
 const decision = require('../decision.cjs');
 
 // Tolerant LLM-JSON parse for step generation — repairs unfenced replies,
@@ -199,7 +200,7 @@ function _refreshSessionFromDisk(sess) {
         if (p._stepsHash != null) t._stepsHash = p._stepsHash;
         if (p._normalized) t._normalized = p._normalized;
         if (p._failedHash != null) t._failedHash = p._failedHash;
-      } else if (p && String(t.stepsStatus || '').toLowerCase() === 'failed') {
+      } else if (p && String(t.stepsStatus || '').toLowerCase().startsWith('failed')) {
         // Prompt edited on disk since the failure — a stale 'failed' would
         // suppress regeneration for a prompt that was never attempted.
         t.stepsStatus = null;
@@ -410,6 +411,9 @@ function _stepgenSystemPrompt(task) {
     'A `mcp.agent` step may ONLY target one of these exact server names — ' +
     'never invent a server (there is no "filesystem" server unless listed). ' +
     'Local file work uses fs.read / doc.read / shell.run / edit.agent.';
+  const envBlock =
+    `## Runtime environment\nHOME=${os.homedir()}\ncwd=${process.cwd()}\n` +
+    'Absolute paths in emitted args MUST come from this block, the KNOWN PATHS list in the task message, or paths named in attached [File:]/[Folder:] markers — NEVER invent a project root or a home-directory layout from memory (observed failure: steps compiled against /Users/luca/dev/… on a machine whose HOME is different). If the task names a project that is not in KNOWN PATHS and not attached, prefer $HOME-relative discovery commands (find/mdfind) inside a step over guessing.';
   return [
     "You are ThinkDrop's execution planner. Convert ONE task into a concrete step list for the skill runtime.",
     core,
@@ -418,6 +422,7 @@ function _stepgenSystemPrompt(task) {
     skillContracts.contractsVocabularyBlock(),
     _appKnowledgeBlock(task),
     mcpRule,
+    envBlock,
     '## Output contract\nReply with ONLY a fenced json block — an array of steps, each {"skill": "...", "args": {...}, "description": "..."}. Every step taking an agentId arg carries the exact TASK AGENTS value — never invent another agent id. synthesize is always last. No commentary — ONLY the json fence.',
   ].filter(Boolean).join('\n\n');
 }
@@ -460,7 +465,7 @@ function _appKnowledgeBlock(task) {
     : '';
 }
 
-async function _generateTaskSteps(task) {
+async function _generateTaskSteps(task, pathFeedback) {
   // Deterministic fast path — a screen.display scene/3D task needs no LLM
   // stepgen: the code is written at RUNTIME by the synthesize step (full task
   // prompt, full token budget), then referenced via {{synthesisAnswer}}.
@@ -491,11 +496,55 @@ async function _generateTaskSteps(task) {
     ];
   }
   const agents = (task.agents || []).join(' | ') || 'auto';
+  // ── Filesystem grounding ─────────────────────────────────────────────────
+  // The stepgen must never invent a project root. KNOWN PATHS carries the
+  // paths it may name: attachment paths ([File:]/[Folder:] blobs ride inside
+  // the prompt — computeTurnFacts parses them without matching on userText)
+  // ∪ path-journal entries relevant to the prompt — all re-verified live.
+  const _attachPaths = [];
+  try {
+    for (const att of computeTurnFacts({ rawText: task.prompt || '' }).attachments) {
+      if (att.kind !== 'file' && att.kind !== 'folder') continue;
+      for (const m of String(att.value).matchAll(/(?:~|\/)[^\s,'"\]]+/g)) {
+        const p = pathContext.expandPath(m[0]);
+        if (p && fs.existsSync(p)) _attachPaths.push(p);
+      }
+    }
+  } catch (_) {}
+  if (_attachPaths.length) {
+    pathContext.journalRecord(_attachPaths, { kind: 'dir', source: 'attachment' });
+  }
+  const _knownPaths = [...new Set([..._attachPaths, ...pathContext.journalRelevantPaths(task.prompt || '')])].slice(0, 15);
+  const _knownBlock = _knownPaths.length
+    ? `KNOWN PATHS (verified to exist on this machine — use these instead of inventing a root):\n${_knownPaths.map(p => `- ${p}`).join('\n')}\n`
+    : '';
+  // Repo topology — git-flavored tasks get the REAL repository list under each
+  // known dir, so "commit all repos" enumerates actual repos instead of
+  // inventing names like skill-runtime/execution-planner.
+  let _repoBlock = '';
+  try {
+    if (/\b(repo|repos|repositories|git|commit|push|pull|branch|merge)\b/i.test(String(task.prompt || ''))) {
+      const _repos = new Set();
+      for (const p of _attachPaths.concat(_knownPaths)) {
+        for (const r of pathContext.repoTopology(p)) _repos.add(r);
+        if (_repos.size >= 15) break;
+      }
+      if (_repos.size) {
+        _repoBlock = `REPOSITORIES (verified on this machine — commit/push targets may ONLY come from this list):\n${[..._repos].slice(0, 15).map(r => `- ${r}`).join('\n')}\n`;
+      }
+    }
+  } catch (_) {}
+  const _feedbackBlock = pathFeedback
+    ? `INVALID PATHS IN PRIOR DRAFT (verified NOT to exist on this machine — revise the plan to use only KNOWN PATHS/discovered repos, or drop the steps that need them):\n${pathFeedback}\n`
+    : '';
   const userMsg =
     `TASK AGENTS: ${agents}\n` +
     // Session/task context the bare prompt can't carry — a follow-up like
     // "next chapter 7" is meaningless without the turns that named the file.
     (task.context ? `RECENT CONTEXT (earlier turns/tasks this session — resolve deictic references against it):\n${task.context}\n` : '') +
+    _knownBlock +
+    _repoBlock +
+    _feedbackBlock +
     `TASK PROMPT: ${task.prompt || task.title}\n` +
     (task.doneWhen ? `DONE WHEN: ${task.doneWhen}\n` : '') +
     `\nEmit the step list now.`;
@@ -557,6 +606,45 @@ async function _generateTaskSteps(task) {
         });
       }
     } catch (_) {}
+    // ── Filesystem grounding: verify → repair → flag ───────────────────────
+    // The env/KNOWN-PATHS block above is advisory; this check is the hard
+    // floor. Input paths a step reads/chdirs into must exist on THIS machine
+    // (paths the plan itself creates are excluded). Missing paths get one
+    // journal/mdfind repair attempt — single unambiguous candidate only —
+    // and whatever survives lands on _contractViolations so the plan-review
+    // card shows "path does not exist" instead of silently executing against
+    // a hallucinated root.
+    try {
+      const _missing = pathContext.missingInputPaths(steps);
+      if (_missing.length) {
+        const _rep = pathContext.repairMissingPaths(steps, _missing);
+        if (_rep.repairs.length) {
+          logger.info('[Planning] Stepgen path repair applied', {
+            taskNum: task.num,
+            repairs: _rep.repairs.map(r => `${r.from} → ${r.to}`),
+          });
+          (task._contractViolations = task._contractViolations || []).push(
+            ..._rep.repairs.map(r => ({ step: r.stepIndex + 1, field: 'path', msg: `repaired missing path ${r.from} → ${r.to}` })));
+        }
+        if (_rep.stillMissing.length) {
+          logger.warn('[Planning] Stepgen emitted missing input paths', {
+            taskNum: task.num, missing: _rep.stillMissing.map(m => m.path),
+          });
+          (task._contractViolations = task._contractViolations || []).push(
+            ..._rep.stillMissing.map(m => ({ step: m.stepIndex + 1, field: 'path', msg: `path does not exist: ${m.path}` })));
+          // Hard gate — never write steps that execute against hallucinated
+          // paths. The caller retries once with the missing list fed back
+          // into the prompt; still bad → task fails fast at plan time
+          // instead of burning cli.agent "does not exist" loops at runtime.
+          task._missingPaths = _rep.stillMissing.map(m => m.path);
+          return null;
+        } else {
+          // Every verified path earns a journal entry — next compiles get it
+          // as a KNOWN PATH instead of re-probing.
+          pathContext.journalRecord(pathContext.collectMustExistPaths(steps).map(x => x.path));
+        }
+      }
+    } catch (_) {}
     // One normalization rule shared with planRunner's dispatch path:
     // url steps → owning service agent; session-bound steps → task's lane.
     // Async variant — unknown step hosts get one bounded live discovery
@@ -564,6 +652,7 @@ async function _generateTaskSteps(task) {
     const norm = await require('../../../shared/plan-steps.cjs')
       .normalizeTaskStepsAsync({ ...task, steps });
     task._normalized = norm; // {steps, agents, services} — consumed by _scheduleStepGen
+    task._missingPaths = null;
     return norm.steps;
   } catch (err) {
     logger.warn('[Planning] Step generation failed', { taskNum: task.num, error: err.message });
@@ -597,24 +686,37 @@ function _scheduleStepGen(sess) {
         // re-attempt holds the check card 'pending' so the run can't start.
         // Regen only happens on a prompt change (stepsStatus reset) or an
         // explicit "Retry generation" (retrySteps clears the status).
-        if (String(task.stepsStatus || '').toLowerCase() === 'failed'
+        if (String(task.stepsStatus || '').toLowerCase().startsWith('failed')
             && (!task._failedHash || task._failedHash === _promptHash(task.prompt))) continue;
         const promptAtGen = task.prompt;
         // Bounded retry — a single malformed/unfenced response used to leave
         // the task pending forever. Two attempts, then mark it failed so the
         // plan-check card can surface a retry action instead of hanging.
+        // A path-gate failure retries WITH the missing-path feedback so the
+        // second draft grounds itself instead of repeating the hallucination.
         let steps = await _generateTaskSteps(task);
-        if (!steps) steps = await _generateTaskSteps(task);
+        if (!steps && (task._missingPaths || []).length) {
+          steps = await _generateTaskSteps(task, task._missingPaths.map(p => `- ${p}`).join('\n'));
+        } else if (!steps) {
+          steps = await _generateTaskSteps(task);
+        }
         if (!steps) {
+          // Reason rides inside the status string ('failed — <why>') so the
+          // plan-check card and the plan file itself say what went wrong,
+          // not just that generation failed. startsWith('failed') consumers
+          // classify it identically.
+          const _failReason = (task._missingPaths || []).length
+            ? `failed — path does not exist: ${task._missingPaths.join(', ')}`
+            : 'failed';
           try {
             const onDisk = fs.readFileSync(sess.filePath, 'utf8');
             const diskTask = planFormat.parseTasks(onDisk).find(t => t.num === task.num);
             if (diskTask && diskTask.prompt === promptAtGen) {
               fs.writeFileSync(sess.filePath,
-                planFormat.updateTaskStepsStatus(onDisk, task.num, 'failed'), 'utf8');
+                planFormat.updateTaskStepsStatus(onDisk, task.num, _failReason), 'utf8');
               const live = sess.tasks.find(t => t.num === task.num);
               if (live) {
-                live.stepsStatus = 'failed';
+                live.stepsStatus = _failReason;
                 live._failedHash = _promptHash(promptAtGen);
               }
               _notifyPlanUpdated(sess.planId);

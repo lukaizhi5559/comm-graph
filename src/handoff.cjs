@@ -268,7 +268,27 @@ async function _compileTaskSteps(prompt, agentId, { conversationContext = null, 
       logger.info(`[Handoff] compile rejected — ${v.violations.length} contract violation(s): ${v.violations.slice(0, 3).map(x => `step${x.step}:${x.field}:${x.msg}`).join('; ')}`);
       return null;
     }
-    return baked || out;
+    // Filesystem grounding — verify → repair → reject. A compiled plan that
+    // references paths which don't exist on this machine is a guaranteed
+    // recovery-loop burn (observed: /Users/luca/dev/… hallucination; every cd
+    // failed and each failure cost a cli.agent loop). Journal/mdfind may fix
+    // a single unambiguous candidate; anything still missing rejects the
+    // compile so the internal pipeline resolves real paths at runtime.
+    const { missingInputPaths, repairMissingPaths, journalRecord, collectMustExistPaths } = require('../../shared/path-context.cjs');
+    const final = baked || out;
+    const _missing = missingInputPaths(final);
+    if (_missing.length) {
+      const _rep = repairMissingPaths(final, _missing);
+      for (const r of _rep.repairs) {
+        logger.info(`[Handoff] compile path repair — step ${r.stepIndex + 1}: ${r.from} → ${r.to}`);
+      }
+      if (_rep.stillMissing.length) {
+        logger.info(`[Handoff] compile rejected — missing path(s): ${_rep.stillMissing.map(m => `step${m.stepIndex + 1}:${m.path}`).join(', ')}`);
+        return null;
+      }
+    }
+    journalRecord(collectMustExistPaths(final).map(x => x.path));
+    return final;
   } catch (e) {
     logger.info(`[Handoff] compile skipped — ${e.message}`);
     return null;
