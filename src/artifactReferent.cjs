@@ -109,6 +109,21 @@ try { _svcMap = require('../../shared/service-map.cjs'); } catch (_) {}
 
 const _CLI_TYPES = new Set(['cli', 'api_key', 'bearer', 'basic', 'mcp']);
 
+/** Generic task-vocabulary phrases can't produce a phrase-tier explicit-tool
+ *  pin — they describe the REQUEST ("look up flights"), not the tool. A false
+ *  pin overrides the whole lane before planning sees it (observed: "look up"
+ *  in mcp.brave-search.agent's keywords pinned a Cathay-Pacific browse task
+ *  to an un-runnable draft MCP agent); a missed pin just means normal routing.
+ *  Single words are already handled by the strong-tier rule (kwAliases) —
+ *  this set only gates the multi-word substring path below. */
+const _GENERIC_PIN_PHRASES = new Set([
+  'look up', 'look for', 'look at', 'search for', 'web search', 'google search',
+  'find out', 'check for', 'check on', 'check out', 'go to', 'sign in',
+  'log in', 'log on', 'show me', 'tell me', 'read more', 'send to',
+  'fill in', 'fill out', 'type in', 'open up', 'set up', 'pay for',
+  'ask for', 'click on', 'sign up',
+]);
+
 /** Weak-tier candidates that sit at the tail of a data-artifact compound are
  *  names of things, not tool mentions — "commit messages" is git output, not
  *  Messages.app; "error messages", "log entries", "push notifications" are the
@@ -180,10 +195,11 @@ function resolveExplicitTool(text) {
       }
     }
     // Multi-word keyword/service ("google calendar", "google docs") — the
-    // whole phrase must appear in the message.
+    // whole phrase must appear in the message AND be tool-identifying
+    // (generic vocabulary phrases are filtered by _GENERIC_PIN_PHRASES).
     if (!matched) {
       const phrases = (d.keywords || []).map(k => String(k).toLowerCase())
-        .filter(al => al.includes(' ') && al.length > 4);
+        .filter(al => al.includes(' ') && al.length > 4 && !_GENERIC_PIN_PHRASES.has(al));
       for (const al of phrases) {
         if (msg.includes(al)) { matched = al; tier = 'phrase'; break; }
       }

@@ -128,4 +128,15 @@ assert(e && e.agentId === 'messages.app.agent', `bare "send messages" should sti
 e = resolveExplicitTool('use messages to text mom');
 assert(e && e.agentId === 'messages.app.agent', `strong "use messages" should still hit, got ${e && e.agentId}`);
 
+// Generic task-vocabulary phrases are not tool mentions — "look up" is a
+// keyword on mcp.brave-search.agent but describes the TASK, not the tool.
+// (Observed: this exact prompt pinned the draft MCP agent for a
+// Cathay-Pacific browse task, then the lane couldn't execute it.)
+e = resolveExplicitTool('goto cacthy pacific and look up flights from JFK to HK');
+assert(!(e && e.agentId === 'mcp.brave-search.agent'), `"look up" must not pin mcp.brave-search.agent, got ${e && e.agentId}`);
+e = resolveExplicitTool('web search for the best pizza in brooklyn');
+assert(!(e && e.agentId === 'mcp.brave-search.agent'), `"web search" must not pin mcp.brave-search.agent, got ${e && e.agentId}`);
+e = resolveExplicitTool('search for flights to hong kong');
+assert(!(e && e.agentId === 'mcp.brave-search.agent'), `"search for" must not pin mcp.brave-search.agent, got ${e && e.agentId}`);
+
 console.log('artifactReferent.test.cjs: all assertions passed');

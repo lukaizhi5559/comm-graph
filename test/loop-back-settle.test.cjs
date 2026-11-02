@@ -49,6 +49,12 @@ async function main() {
 
   const planningNode = require('../src/nodes/planning.cjs');
   const taskJournal = require('../src/taskJournal.cjs');
+  // Stub handoff BEFORE server.cjs destructures it — the no_skill_coverage
+  // branch re-dispatches through it and we don't want a real task spawned.
+  const handoffMod = require('../src/handoff.cjs');
+  const realHandoff = handoffMod.execute;
+  let handoffCalls = 0;
+  handoffMod.execute = async () => { handoffCalls++; return { parked: false, taskId: 'task_redispatched' }; };
   const { _handleLoopBack, _loopBackAttempts } = require('../src/server.cjs');
 
   const realExecute = planningNode.execute;
@@ -70,6 +76,19 @@ async function main() {
   check('revise text carries failing-task context', /could not run as written/i.test(execArgs?.englishText || ''), execArgs?.englishText);
   check('no forceNewPlan on plan-bound escalation', !execArgs?.planning?.forceNewPlan);
   check('runnable metadata → /plan.run', posts.some(p => p.url === '/plan.run' && p.body.planId === 'plan_held'), JSON.stringify(posts));
+  // Lane-jump announcement — the replan must tell main BEFORE planningNode
+  // executes so the planning-mode visuals can engage during the replan.
+  const rpIdx = posts.findIndex(p => p.url === '/plan.replanning');
+  const runIdx = posts.findIndex(p => p.url === '/plan.run');
+  check('/plan.replanning posted on entry', rpIdx >= 0, JSON.stringify(posts));
+  check('/plan.replanning precedes /plan.run', rpIdx >= 0 && runIdx > rpIdx, `replanning=${rpIdx} run=${runIdx}`);
+  check('/plan.replanning carries plan + reason + revise flag',
+    rpIdx >= 0 && posts[rpIdx].body.planId === 'plan_held'
+      && posts[rpIdx].body.status === 'needs_plan'
+      && posts[rpIdx].body.reason === 'agent_not_onboarded'
+      && posts[rpIdx].body.revise === true
+      && posts[rpIdx].body.taskId === planTask,
+    JSON.stringify(posts[rpIdx]?.body));
 
   // ── Scrubbed turn (no metadata) → /plan.fail ────────────────────────────
   posts.length = 0;
@@ -108,6 +127,8 @@ async function main() {
   await flush();
   check('cap reached → /plan.fail without calling execute', execCalls === 0 && posts.some(p => p.url === '/plan.fail' && p.body.planId === 'plan_loopy'), `calls=${execCalls}`);
   check('cap reason names attempts', /attempt/i.test(posts.find(p => p.url === '/plan.fail')?.body?.reason || ''));
+  // A capped escalation never plans — it must not flash the lane.
+  check('cap path posts no /plan.replanning', !posts.some(p => p.url === '/plan.replanning'), JSON.stringify(posts));
 
   // ── Bare (non-plan) needs_plan → forceNewPlan path ──────────────────────
   posts.length = 0; execArgs = null;
@@ -117,6 +138,11 @@ async function main() {
   await flush();
   check('bare needs_plan → forceNewPlan', execArgs?.planning?.forceNewPlan === true);
   check('bare needs_plan runnable → /plan.run for new plan', posts.some(p => p.url === '/plan.run' && p.body.planId === 'plan_new'));
+  // Bare escalation still announces the lane — planId is null until drafted.
+  const bareRp = posts.find(p => p.url === '/plan.replanning');
+  check('bare needs_plan → /plan.replanning with null planId',
+    !!bareRp && bareRp.body.planId === null && bareRp.body.revise === false && bareRp.body.reason === 'local_multi_entity',
+    JSON.stringify(bareRp?.body));
 
   // ── plan_update still revises same plan (regression guard) ──────────────
   posts.length = 0; execArgs = null;
@@ -128,6 +154,10 @@ async function main() {
   await flush();
   check('plan_update revises same plan', execArgs?.planning?.planId === 'plan_upd' && execArgs?.planning?.revise === true);
   check('plan_update runnable → /plan.run', posts.some(p => p.url === '/plan.run' && p.body.planId === 'plan_upd'));
+  const updRp = posts.find(p => p.url === '/plan.replanning');
+  check('plan_update → /plan.replanning revise on same plan',
+    !!updRp && updRp.body.planId === 'plan_upd' && updRp.body.status === 'plan_update' && updRp.body.revise === true,
+    JSON.stringify(updRp?.body));
 
   // ── Timeout → /plan.fail ────────────────────────────────────────────────
   posts.length = 0;
@@ -142,7 +172,23 @@ async function main() {
   await flush();
   check('timeout-shaped rejection → /plan.fail', posts.some(p => p.url === '/plan.fail' && p.body.planId === 'plan_slow'), JSON.stringify(posts));
 
+  // ── no_skill_coverage → planner fallback → /plan.replanning.end ──────────
+  // This branch settles with NEITHER /plan.run nor /plan.fail — it needs its
+  // own signal or the escalation pin in main would leak.
+  posts.length = 0; handoffCalls = 0;
+  const covTask = taskJournal.createTask({
+    prompt: 'x', sessionId: 'sess_x', planMeta: { planId: 'plan_cov', planTaskNum: 1, planTask: true },
+  });
+  execImpl = async () => ({ metadata: {} }); // planning exited, nothing runnable
+  await _handleLoopBack({ taskId: covTask, status: 'needs_plan', result: escResult({ reason: 'no_skill_coverage' }) });
+  await flush();
+  const covEnd = posts.find(p => p.url === '/plan.replanning.end');
+  check('no_skill_coverage → /plan.replanning.end', !!covEnd && covEnd.body.planId === 'plan_cov' && covEnd.body.outcome === 'planner_fallback', JSON.stringify(posts));
+  check('coverage path settles neither run nor fail', !posts.some(p => p.url === '/plan.fail' || p.url === '/plan.run'));
+  check('coverage path re-dispatches via handoff', handoffCalls === 1, `calls=${handoffCalls}`);
+
   planningNode.execute = realExecute;
+  handoffMod.execute = realHandoff;
   mainSrv.close();
   console.log(`\n${passed}/${tests} passed`);
   process.exit(passed === tests ? 0 : 1);

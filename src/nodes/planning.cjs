@@ -1264,7 +1264,9 @@ async function _toolMediaPlay(_arg) {
 }
 
 async function _toolJournalStatus(_arg) {
-  const r = await fetch(`http://127.0.0.1:${MEMORY_PORT}/audio.status`, { signal: AbortSignal.timeout(5000) }).catch(() => null);
+  const headers = {};
+  if (MCP_API_KEY) headers.Authorization = `Bearer ${MCP_API_KEY}`;
+  const r = await fetch(`http://127.0.0.1:${MEMORY_PORT}/audio.status`, { signal: AbortSignal.timeout(5000), headers }).catch(() => null);
   const s = r ? await r.json().catch(() => null) : null;
   if (!s) return `journal.status failed: memory-service unreachable (is it running on :${MEMORY_PORT}?).`;
   if (s.mode === 'off') return 'Audio journal is OFF (AUDIO_JOURNAL_MODE=off) — ambient capture disabled.';
@@ -1848,8 +1850,11 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             doesn't have a direct fact.
   <tool>profile.set("name|John")</tool>     — write a canonical profile attribute;
   <tool>episodic.search("query|days")</tool> — activity/capture history: what the
-                                            user was watching/reading/doing. Use
-                                            for "what have I been watching/doing".
+                                            user was watching/reading/doing AND
+                                            what was said (ambient audio journal
+                                            transcripts). Use for "what have I
+                                            been watching/doing" and "what did
+                                            that video/meeting say".
   <tool>memory.getAppUsageSummary("hours")</tool> — per-app usage durations
                                             ("apps I used", "how long in X").
                                             each result line starts with its
@@ -1914,9 +1919,12 @@ TOOLS — when you need facts about the user or the world, emit ONE of:
                                             confirm recording actually works.
 AMBIENT AUDIO JOURNAL — when the user plays media or joins a call, ThinkDrop
 records + transcribes it to ~/.thinkdrop/audio/YYYY-MM-DD/ and indexes
-audio_journal memories. "What was said in the meeting" → memory.search (or
-fs.read the .md file). To WATCH A VIDEO LIVE: url.open the page if needed →
-media.play → journal.status to confirm capture is working.
+audio_journal rows in episodic memory. "What was said in the meeting",
+"what did that video/podcast say" (already played) → episodic.search FIRST
+(or fs.read the .md file). video.transcript is for content NOT yet watched
+or the live tab right now — not for replaying recall. To WATCH A VIDEO LIVE:
+url.open the page if needed → media.play → journal.status to confirm capture
+is working.
   <tool>capability.select("twilio")</tool>  — after the user picks an option that
                                             is NOT already a registered agent,
                                             call this ONCE to register it as a
@@ -2490,6 +2498,13 @@ async function _applyPlanMarkers(text, sess, unknownAgents) {
       try {
         const svcMap = require('../../../shared/service-map.cjs');
         const LOCAL = new Set(['shell', 'none', 'general_knowledge', 'synthesize']);
+        // plan_update rewrites tasks wholesale — drop stale entries for the
+        // taskNums being rewritten so an Agents line the model just fixed
+        // doesn't keep its old blocker (entries below re-add what persists).
+        const rewrittenNums = new Set(newTasks.map(t => t.num));
+        for (let i = unknownAgents.length - 1; i >= 0; i--) {
+          if (rewrittenNums.has(unknownAgents[i].taskNum)) unknownAgents.splice(i, 1);
+        }
         for (const t of newTasks) {
           const bad = (t.agents || []).filter(a => {
             const n = String(a).toLowerCase();
@@ -2995,6 +3010,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   let stallChecked = false;
   let stallRecovered = false;
   let repeatCorrected = false;
+  let phantomCorrected = false;
 
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
     _activity(round === 0 ? 'planning · thinking…' : `planning · still working — round ${round + 1} of ${MAX_TOOL_ROUNDS + 1}`, 'plan');
@@ -3085,6 +3101,25 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       sess.history.push({ role: 'assistant', content: cleanText });
       sess.history.push({ role: 'user', content: `<tool_results>\n${toolResults}${fabricatedResults ? '\n\nNOTE: a <tool_results> block you wrote was removed — results are system-generated. Trust ONLY the entries above.' : ''}\n</tool_results>` });
       toolNotes = (toolNotes ? toolNotes + '\n' : '') + toolResults;
+      continue;
+    }
+
+    // ── Phantom-agent correction ─────────────────────────────────────────
+    // A task whose Agents line names an unregistered agent blocks the run —
+    // the check card shows it, but the planner was never told, so the reply
+    // could still claim "ready to run" over a plan that can't start. Reject
+    // the update like a failed tool call (once) so the model re-pins a real
+    // agentId this same turn instead of handing the user a dead card.
+    if (unknownAgents.length && !phantomCorrected && round < MAX_TOOL_ROUNDS) {
+      phantomCorrected = true;
+      const bad = [...new Set(unknownAgents.map(u =>
+        `${u.agent}${u.suggested ? ` (did you mean ${u.suggested}?)` : ''}`))].join('; ');
+      _activity('unregistered agent name — re-pinning…', 'warn');
+      logger.warn('[Planning] Phantom agent names in plan_update — corrective round', { planId: sess.planId, round, unknownAgents });
+      sess.history.push({ role: 'assistant', content: cleanText });
+      sess.history.push({ role: 'user', content: '<tool_results>\nplan_update → REJECTED AGENTS: '
+        + bad
+        + '. These names match no registered agent — rewrite the <plan_update> with an agentId from REGISTERED AGENTS, a generic surface (browser.agent, web.agent, cli.agent, shell, none), or call <tool>capability.select("what the task needs")</tool> to discover the right route. Do NOT leave the plan blocked and claim it is ready.\n</tool_results>' });
       continue;
     }
 
@@ -3346,6 +3381,19 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     logger.warn('[Planning] Final reply scrubbed — claim prose with zero tool calls', { planId: sess.planId });
   }
 
+  // Blocked-plan honesty — phantom agents that survived the corrective round
+  // (the model ignored it) make "ready to run" prose a lie: the check card
+  // will block. State the blocker in the reply itself rather than letting the
+  // words imply a start that's impossible.
+  if (unknownAgents.length) {
+    const names = [...new Set(unknownAgents.map(u => u.agent))].join(', ');
+    if (!/not a registered agent|unregistered|isn't registered/i.test(spoken)) {
+      const verb = unknownAgents.length > 1 ? "aren't" : "isn't";
+      spoken = spoken.trimEnd() + ` — heads-up: ${names} ${verb} a registered agent, so the plan can't start yet. Name a different route and I'll swap it in.`;
+      logger.warn('[Planning] Reply annotated — plan blocked by unregistered agents', { planId: sess.planId, unknownAgents });
+    }
+  }
+
   // A clarifying question during drafting must mark the session awaiting input —
   // otherwise findOpenPlan() sees an empty plan as closed and the user's answer
   // ("metallic blue, dark wheels") dispatches as a brand-new handoff task.
@@ -3376,6 +3424,10 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       // stall check's recovery is visible rather than silent.
       toolCalls: sessToolCalls,
       stallRecovered,
+      // The turn is parked on a user answer (clarifying question / missing
+      // detail) — the feed can show "awaiting your reply" instead of looking
+      // like work in progress.
+      needsInfo: sess._needsInfo || null,
     },
   };
 }

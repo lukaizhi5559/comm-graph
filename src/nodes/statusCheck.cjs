@@ -10,6 +10,9 @@
 
 const logger = require('../logger.cjs');
 const http = require('http');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { ask, buildMessages } = require('../llm-providers.cjs');
 const { formatStatusSummary, getActiveTasks, getRecentTasks } = require('../taskJournal.cjs');
 const sysMap = require('../../../shared/system-map.cjs');
@@ -105,6 +108,61 @@ function _probeInstalled(englishText) {
   } catch (_) { return null; }
 }
 
+// ── Ambient-state questions → audio journal probe ────────────────────────────
+// "is a video being recorded / are you recording / is the audio journal on" is
+// a STATE question — dispatching it as a task produced a needs_plan dead card.
+// The probe reads the journal's live state (extension media probe + ambient
+// capture verdict) over /audio.status — Bearer required, the route is authed.
+const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
+const MCP_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.MCP_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
+const AUDIO_DIR = process.env.AUDIO_JOURNAL_DIR || path.join(os.homedir(), '.thinkdrop', 'audio');
+const _AMBIENT_STATE_RE = /\b(?:is|are|was|were|did|does|am)\b[^.?!]{0,60}?\b(?:being\s+)?(?:record\w*|captur\w*|transcrib\w*)\b|\b(?:are|is)\s+you\s+(?:record\w*|captur\w*|transcrib\w*|tracking)\b|\b(?:can|could|do|are|is)\s+you\s+(?:hear|hearing|listen\w*)\b|\b(?:audio|ambient)\s+journal\b|\bjournal\s+on\b/i;
+
+function isAmbientStateQuery(userText) {
+  return _AMBIENT_STATE_RE.test(String(userText || ''));
+}
+
+// Newest journal file under ~/.thinkdrop/audio/<day>/<hhmm-slug>.md — used so
+// a "did you record" question can point at real output, not guess.
+function _lastJournalFile() {
+  try {
+    const days = fs.readdirSync(AUDIO_DIR, { withFileTypes: true })
+      .filter(d => d.isDirectory()).map(d => d.name).sort().reverse();
+    for (const day of days) {
+      const files = fs.readdirSync(path.join(AUDIO_DIR, day)).filter(f => f.endsWith('.md')).sort().reverse();
+      if (files.length) return { name: files[0], day };
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function _probeAmbient(englishText) {
+  const facts = computeTurnFacts({ rawText: englishText });
+  if (!facts.isQuestion || !isAmbientStateQuery(facts.userText)) return null;
+  const headers = {};
+  if (MCP_KEY) headers.Authorization = `Bearer ${MCP_KEY}`;
+  const r = await fetch(`http://127.0.0.1:${MEMORY_PORT}/audio.status`, { signal: AbortSignal.timeout(4000), headers }).catch(() => null);
+  const st = r && r.ok ? await r.json().catch(() => null) : null;
+  if (!st) return `I couldn't reach the audio journal (memory-service :${MEMORY_PORT}) — ambient capture state is unknown.`;
+  if (st.mode === 'off') return 'No — the audio journal is OFF (AUDIO_JOURNAL_MODE=off), so nothing is being recorded.';
+  const sess = st.session;
+  if (st.capturing && sess) {
+    const bits = [`Yes — the audio journal is capturing ${sess.type || 'ambient'} audio right now: "${String(sess.title || sess.app || '?').slice(0, 80)}"`];
+    if (sess.segs) bits.push(`${sess.segs} transcript segments so far`);
+    if (st.lastSegment) bits.push(`latest: "${String(st.lastSegment).slice(0, 140)}"`);
+    return bits.join(' — ') + '.';
+  }
+  if (st.capturing) return 'Yes — ambient capture is armed and listening; no transcript segments have landed yet.';
+  const playing = (st.webMedia || []).find(m => m.state === 'playing');
+  if (playing || (st.verdict && st.verdict.recordable)) {
+    const title = (playing && (playing.mediaTitle || playing.title)) || (st.verdict && st.verdict.title) || '';
+    return `Media is playing${title ? ` ("${String(title).slice(0, 60)}")` : ''} and the journal's recordable verdict is true — capture arms on the next tick (about 10s).`;
+  }
+  const last = _lastJournalFile();
+  return 'No — nothing is being captured right now.'
+    + (last ? ` The most recent journal is ${last.name} (${last.day}) — play media and it arms automatically.` : ' Play a video or join a call and it arms automatically.');
+}
+
 // ── Status query patterns ──────────────────────────────────────────────────────
 const STATUS_PATTERNS = [
   /\bhow\s+(is|'s)\s+(that|it|the)\b/i,
@@ -157,6 +215,17 @@ function _probePlan(englishText) {
 }
 
 async function execute(englishText, systemPrompt) {
+  // Ambient-state questions ("is it recording / is the journal on") answer
+  // from the journal's live state — never a dispatched task.
+  const ambientProbe = await _probeAmbient(englishText);
+  if (ambientProbe) {
+    return {
+      text: ambientProbe,
+      fullText: ambientProbe,
+      metadata: { source: 'status_check_ambient_probe', intent: 3 },
+    };
+  }
+
   // Plan-existence questions answer from disk, not the task journal — a saved
   // plan is "something we had" even when nothing is running right now.
   const planProbe = _probePlan(englishText);
@@ -246,4 +315,4 @@ async function execute(englishText, systemPrompt) {
   };
 }
 
-module.exports = { execute, isStatusQuery, probeLog: _probeLog };
+module.exports = { execute, isStatusQuery, probeLog: _probeLog, isAmbientStateQuery, probeAmbient: _probeAmbient };

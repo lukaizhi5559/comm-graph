@@ -138,8 +138,82 @@ function _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, gue
 // "next chapter 7" only resolves against earlier turns. convHistory (session
 // turns fetched for classification) is the richest channel; recent task
 // journal entries cover sessions with no fetched history.
-function _compileContextBlock(conversationContext, sessionId) {
+// ── live tabs ──────────────────────────────────────────────────────────────
+// The stepgen can't see the user's browser — a compiled "watch this video"
+// step used to emit video.agent with NO videoUrl, fail, and fall into the
+// terminal recovery lane. Feed it the extension's bound sessions (playing
+// flags included) instead; _bakeVideoArgs then pins live-video steps to a
+// real tab. Resolution is skill-driven: it fires on video.agent step
+// identity + missing args, never on prompt text.
+const _COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
+
+async function _extSessions(timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    try {
+      const req = require('http').get(
+        { hostname: '127.0.0.1', port: _COMMAND_PORT, path: '/ext.sessions', timeout: timeoutMs },
+        (res) => {
+          let data = '';
+          res.on('data', c => { data += c; });
+          res.on('end', () => {
+            try {
+              const parsed = JSON.parse(data);
+              const list = parsed?.sessions || parsed?.data?.sessions || parsed;
+              resolve(Array.isArray(list) ? list : []);
+            } catch (_) { resolve([]); }
+          });
+        }
+      );
+      req.on('error', () => resolve([]));
+      req.on('timeout', () => { req.destroy(); resolve([]); });
+    } catch (_) { resolve([]); }
+  });
+}
+
+// Hosts/picking live in shared/live-tabs.cjs — same binding order as the
+// stategraph runtime guard so compile-time and runtime resolution agree.
+const _lt = require('../../shared/live-tabs.cjs');
+const _liveTabsContext = _lt.liveTabsContext;
+
+/**
+ * video.agent arg bake — for live-watch actions missing a URL, resolve the
+ * tab the user means NOW (compile time) from extension session/media state.
+ * Runs after _bakeUrlFirstArgs, before the strict gate.
+ *   watch_video / watch_from_page → bake videoUrl (extraction then runs on a
+ *     background tab — the user's page is never navigated).
+ *   watch_live → bake sessionId + videoUrl so playback binds the resolved tab.
+ * Discovery (find_and_watch / query steps) never binds a live tab — a "find
+ * me a video" request must not hijack whatever happens to be open.
+ */
+function _bakeVideoArgs(steps, sessions) {
+  if (!Array.isArray(steps) || !steps.length) return steps;
+  for (const s of steps) {
+    if (!_lt.wantsLiveTab(s)) continue;   // discovery steps never bind a live tab
+    // A bg/extraction session is never a valid live target — a planner that
+    // emitted one (e.g. sessionId:'ext:bg:video_extract') must be corrected:
+    // strip it so pickVideoTab re-resolves a real tab instead of the step
+    // dying on 'no <video> element on ext:bg:video_extract'.
+    if (_lt.isBackgroundSession(s.args && s.args.sessionId)) {
+      delete s.args.sessionId;
+      logger.info(`[Handoff] video.agent bake — stripped bg sessionId from ${(s.args && s.args.action) || 'watch_video'}`);
+    }
+    const tab = (sessions && sessions.length) ? _lt.pickVideoTab(sessions) : null;
+    if (!tab) continue;
+    const args = s.args || {};
+    const action = args.action || 'watch_video';
+    const next = { ...args };
+    if (tab.url) next.videoUrl = tab.url;
+    next.sessionId = tab.sessionId;
+    if (action === 'watch_live') next.liveTab = true;
+    s.args = next;
+    logger.info(`[Handoff] video.agent bake — ${action} bound to ${tab.sessionId} (${tab.url || 'no url'})`);
+  }
+  return steps;
+}
+
+function _compileContextBlock(conversationContext, sessionId, liveTabsBlock) {
   const parts = [];
+  if (liveTabsBlock) parts.push(liveTabsBlock);
   if (conversationContext) {
     parts.push(String(conversationContext).slice(0, 1200));
   } else {
@@ -230,13 +304,14 @@ async function _compileTaskSteps(prompt, agentId, { conversationContext = null, 
     const { _generateTaskSteps } = require('./nodes/planning.cjs');
     const { normalizeTaskStepsAsync, agentFamilyMismatch } = require('../../shared/plan-steps.cjs');
     const { validatePlanSteps } = require('../../shared/skill-contracts.cjs');
+    const _sessions = await _extSessions().catch(() => []);
     const steps = await _generateTaskSteps({
       num: 1,
       prompt,
       title: prompt,
       agents: agentId ? [agentId] : [],
       doneWhen: '',
-      context: _compileContextBlock(conversationContext, sessionId),
+      context: _compileContextBlock(conversationContext, sessionId, _liveTabsContext(_sessions)),
     });
     if (!Array.isArray(steps) || !steps.length) return null;
     const normalized = await normalizeTaskStepsAsync({ steps, agents: agentId ? [agentId] : [] }).catch(() => null);
@@ -260,6 +335,7 @@ async function _compileTaskSteps(prompt, agentId, { conversationContext = null, 
     const { computeTurnFacts } = require('../../shared/turn-facts.cjs');
     const _factsText = computeTurnFacts({ rawText: prompt }).userText || prompt;
     const baked = await _bakeUrlFirstArgs(out, _factsText).catch(() => out);
+    _bakeVideoArgs(baked || out, _sessions);
     // Strict gate — wildcard steps (shell.run goal-mode, cli.agent task-mode)
     // re-plan at replay; a deterministic runtime has nothing to execute. The
     // internal pipeline has the context to compile these properly instead.

@@ -48,7 +48,7 @@ const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const webSearchExpress = require('./nodes/webSearchExpress.cjs');
 const { execute: memoryStore } = require('./nodes/memoryStore.cjs');
 const planningNode = require('./nodes/planning.cjs');
-const { execute: statusCheck } = require('./nodes/statusCheck.cjs');
+const { execute: statusCheck, isAmbientStateQuery } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const screenNode = require('./nodes/screen.cjs');
 const { execute: handoff, complete: handoffComplete, remove: handoffRemove, startRetrySweep: startHandoffRetrySweep } = require('./handoff.cjs');
@@ -396,6 +396,20 @@ async function _handleLoopBack(body) {
     reason: _lb.reason || null,
   });
 
+  // Announce the lane jump — the replan runs minutes inside planningNode and
+  // main's planning visuals (chip/glow/Plans dot/readiness card) all key off
+  // _planningMode. Without this post the amber "Replanning" border is the
+  // only sign the run bounced back into planning. Posted AFTER the cap
+  // guard so a capped escalation never flashes the lane.
+  _postMain('/plan.replanning', {
+    taskId: body.taskId,
+    planId: _lbPlanId,
+    status: body.status,
+    reason: _lb.reason || null,
+    revise: _isRevise,
+    sessionId: _lbSession,
+  });
+
   let lbResult = null, lbErr = null;
   try {
     lbResult = await Promise.race([
@@ -424,6 +438,9 @@ async function _handleLoopBack(body) {
     // lets the bounded planner handle it ("just run it").
     _loopBackAttempts.delete(_attemptKey);
     logger.info('[Server] no_skill_coverage planning exited without plan — re-dispatching with planner fallback', { taskId: body.taskId });
+    // Settle the escalation pin — this path resolves with neither /plan.run
+    // nor /plan.fail, so without this the replanning lane stays open forever.
+    _postMain('/plan.replanning.end', { taskId: body.taskId, planId: _lbPlanId, outcome: 'planner_fallback' });
     handoff({
       englishPrompt: _lbText,
       source: _lbTask?.source || 'text',
@@ -767,6 +784,22 @@ async function _capabilityGate(text, opts = {}) {
           // Bare use of a .agent-suffixed unregistered id would pin a phantom.
           let pinned = candId ? await _materializePin(candId) : null;
           if (!pinned) pinned = sel?.pick?.agentId || null;
+          // Structural veto — a headless capability (mcp/cli) can't drive a
+          // DOM for a task the route decision calls interactive browser work
+          // (observed: "goto cathay pacific…" pinned draft
+          // mcp.brave-search.agent on the "look up" keyword, vetoed the
+          // page_nav_scan template, and bound the wrong agent family).
+          // Registry type is a fact, not a lexical guess — no confirmation
+          // needed. Registered browser agents still pin.
+          if (pinned && opts.routeDecision?.taskType === 'browser') {
+            try {
+              const _ptype = String(require('../../shared/service-map.cjs').describeAgent(pinned)?.type || '').toLowerCase();
+              if (_ptype && _ptype !== 'browser') {
+                logger.info('[capability-gate] pin vetoed — headless capability for browser task', { agentId: pinned, type: _ptype });
+                return null;
+              }
+            } catch (_) { /* descriptor unreadable — let the pin stand */ }
+          }
           if (pinned) {
             logger.info('[capability-gate] exact ready route → pin + handoff', { agentId: pinned, pick: candId });
             return { pin: pinned, reason: sel?.reason || 'exact+ready' };
@@ -1642,6 +1675,7 @@ async function processMessage(args) {
       ? null
       : await _capabilityGate(classifyText, {
         hasFileRef: /\[File:|\[Folder:/i.test(englishText),
+        routeDecision: _routeDecision,
       });
     // A resolved artifact referent suppresses the capability-gap reroute —
     // the delete/mutation target is already concrete (journal pin below);
@@ -1674,6 +1708,19 @@ async function processMessage(args) {
   logger.info('[Process] Classified', {
     intent, intentName, confidence, classifySource,
   });
+
+  // ── Ambient-state question → status_check ────────────────────────────────
+  // "is a video being recorded / are you recording this" is a STATE question —
+  // dispatched as a task it escalated needs_plan and left a dead "Replanning"
+  // card instead of an answer. Route it to the journal probe; the planning
+  // lane (intent 6) keeps its own turns — journal.status answers there.
+  if (intent !== 6 && intent !== 3 && turnFacts.isQuestion
+      && isAmbientStateQuery(turnFacts.userText)) {
+    logger.info('[Process] ambient-state question → status_check', { was: intentName });
+    intent = 3;
+    intentName = 'status_check';
+    classifySource = 'ambient_state_guard';
+  }
 
   // ── Thought engine: feed the prompt as a candidate input (fire-and-forget) ────
   // For card replies send the REPLY text only (not the card blob) plus the
@@ -2425,17 +2472,17 @@ const server = http.createServer(async (req, res) => {
   // ── Task cancel (from main.js) — mark task as cancelled in journal ───────────────
   if (req.url === '/comms.cancel' && req.method === 'POST') {
     const body = await _readBody(req);
-    if (!body.taskId && !body.planId) {
-      return _send(res, 400, { error: 'taskId or planId is required' });
+    if (!body.taskId && !body.planId && !(Array.isArray(body.taskIds) && body.taskIds.length)) {
+      return _send(res, 400, { error: 'taskId, taskIds, or planId is required' });
     }
-    // Plan-scoped cancel: mark EVERY task in the plan cancelled first, THEN
-    // remove each — removes can resume a parked sibling on lock release, and
-    // the resume path skips tasks already marked cancelled.
+    // Batch/plan-scoped cancel: mark EVERY task cancelled first, THEN remove
+    // each — removes can resume a parked sibling on lock release, and the
+    // resume path skips tasks already marked cancelled.
     const taskIds = body.planId
       ? taskJournal.getAllTasks()
           .filter((t) => t.planMeta && t.planMeta.planId === body.planId)
           .map((t) => t.id)
-      : [body.taskId];
+      : Array.isArray(body.taskIds) ? body.taskIds : [body.taskId];
     for (const id of taskIds) {
       taskJournal.updateTask(id, 'cancelled', { error: 'cancelled by user' });
     }
