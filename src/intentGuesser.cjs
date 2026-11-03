@@ -153,8 +153,14 @@ const INTENT_PATTERNS = [
       if (/\b(email|e-mail|text|dm|message|call|phone|facetime)\s+(my\s+|me\s+)?(mom|dad|wife|husband|boss|team|him|her|them|back|up|again)\b/i.test(text)) return true;
       // "<comm-noun> <person>" — but never "email is X" / "text was Y" (fact
       // statements, not messaging verbs): require a name-like capitalized or
-      // verb-free token, excluding determiners/copulas.
-      if (/\b(email|e-mail|text|dm|message|call|phone|facetime)\s+(my\s+|me\s+)?(?!is\b|are\b|was\b|were\b|a\b|an\b|the\b|my\b|at\b|in\b|on\b|number\b|address\b|code\b)[a-z]{2,}\b/i.test(text)) return true;
+      // verb-free token, excluding determiners/copulas. Prepositions and
+      // referential words are excluded too — "message for this" is a request
+      // ABOUT a thread, not messaging to a recipient (observed: a LinkedIn
+      // highlight + "I need a response to the recent message for this"
+      // matched "message for" → command_automate → browser takeover instead
+      // of a text draft). "call up/back/again" survive via line ~153's
+      // transport rule, so excluding those adverbs here is safe.
+      if (/\b(email|e-mail|text|dm|message|call|phone|facetime)\s+(my\s+|me\s+)?(?!is\b|are\b|was\b|were\b|a\b|an\b|the\b|my\b|at\b|in\b|on\b|number\b|address\b|code\b|for\b|of\b|about\b|to\b|with\b|from\b|as\b|by\b|into\b|over\b|per\b|via\b|regarding\b|concerning\b|this\b|that\b|it\b|these\b|those\b|recent\b|latest\b|new\b|next\b|last\b|same\b|previous\b|current\b|thread\b|back\b|up\b|again\b|out\b)[a-z]{2,}\b/i.test(text)) return true;
       // Post/share/upload to a platform: "post this on social media", "share to twitter"
       if (/\b(post|tweet|share|upload|publish|comment)\b.{0,30}\b(on|to)\s+(my\s+)?\w+/i.test(text)) return true;
       // Platform-free social/action verbs: "tweet hello world", "dm sarah",

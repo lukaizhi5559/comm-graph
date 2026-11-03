@@ -187,6 +187,62 @@ async function main() {
   check('coverage path settles neither run nor fail', !posts.some(p => p.url === '/plan.fail' || p.url === '/plan.run'));
   check('coverage path re-dispatches via handoff', handoffCalls === 1, `calls=${handoffCalls}`);
 
+  // ── Journal settle — every loop-back exit reaches a REAL terminal status ──
+  // Regression (2026-11-03): the escalated task stayed 'needs_plan' forever —
+  // a "Replanning" queue card spun 10+min with no cancel affordance and
+  // resurrected on restart via tasks:restored's ACTIONABLE set.
+  posts.length = 0;
+  const runTask = taskJournal.createTask({ prompt: 'give me code for hello world', sessionId: 'sess_x' });
+  taskJournal.updateTask(runTask, 'needs_plan', { result: '{}' });
+  execImpl = async () => ({ metadata: { runPlan: true, planId: 'plan_runs', planFile: '/tmp/plan_runs.md' } });
+  await _handleLoopBack({ taskId: runTask, status: 'needs_plan', result: escResult({ reason: 'no_skill_coverage' }) });
+  await flush();
+  check('run path settles journal task → done', taskJournal.getTask(runTask)?.status === 'done', taskJournal.getTask(runTask)?.status);
+  const runPost = posts.find(p => p.url === '/plan.run');
+  check('/plan.run carries the escalated taskId', runPost?.body?.taskId === runTask, JSON.stringify(runPost?.body));
+
+  posts.length = 0;
+  const failTask = taskJournal.createTask({ prompt: 'x', sessionId: 'sess_x' });
+  taskJournal.updateTask(failTask, 'needs_plan', { result: '{}' });
+  execImpl = async () => ({ metadata: {} });
+  await _handleLoopBack({ taskId: failTask, status: 'needs_plan', result: escResult({ reason: 'agent_not_onboarded' }) });
+  await flush();
+  check('fail path settles journal task → failed', taskJournal.getTask(failTask)?.status === 'failed', taskJournal.getTask(failTask)?.status);
+
+  posts.length = 0; handoffCalls = 0;
+  const fbTask = taskJournal.createTask({ prompt: 'write code for hello world', sessionId: 'sess_x' });
+  taskJournal.updateTask(fbTask, 'needs_plan', { result: '{}' });
+  execImpl = async () => ({ metadata: {} });
+  await _handleLoopBack({ taskId: fbTask, status: 'needs_plan', result: escResult({ reason: 'no_skill_coverage', seedPrompt: 'write code for hello world' }) });
+  await flush();
+  check('fallback path settles journal task → done', taskJournal.getTask(fbTask)?.status === 'done', taskJournal.getTask(fbTask)?.status);
+  const fbEnd = posts.find(p => p.url === '/plan.replanning.end');
+  check('fallback replanning.end carries taskId + taskStatus', fbEnd?.body?.taskId === fbTask && fbEnd?.body?.taskStatus === 'done', JSON.stringify(fbEnd?.body));
+
+  // ── Cancel mid-replan — the outcome must be dropped, not launched ────────
+  posts.length = 0;
+  const cxTask = taskJournal.createTask({ prompt: 'x', sessionId: 'sess_x' });
+  taskJournal.updateTask(cxTask, 'needs_plan', { result: '{}' });
+  execImpl = async () => {
+    // Simulates the /comms.cancel sweep settling the escalation while the
+    // planning race is still in flight.
+    taskJournal.settleEscalation(cxTask, 'cancelled', { error: 'cancelled by user' });
+    return { metadata: { runPlan: true, planId: 'plan_cx', planFile: '/tmp/plan_cx.md' } };
+  };
+  await _handleLoopBack({ taskId: cxTask, status: 'needs_plan', result: escResult({ reason: 'agent_not_onboarded' }) });
+  await flush();
+  check('cancelled mid-replan → no /plan.run', !posts.some(p => p.url === '/plan.run'), JSON.stringify(posts));
+  check('cancelled mid-replan → replanning.end(cancelled)', posts.some(p => p.url === '/plan.replanning.end' && p.body.outcome === 'cancelled'), JSON.stringify(posts));
+  check('cancelled mid-replan → journal stays cancelled', taskJournal.getTask(cxTask)?.status === 'cancelled');
+
+  // ── settleEscalation guards ──────────────────────────────────────────────
+  const normTask = taskJournal.createTask({ prompt: 'x', sessionId: 'sess_x' });
+  check('settleEscalation refuses non-escalated task', taskJournal.settleEscalation(normTask, 'done') === false);
+  taskJournal.updateTask(normTask, 'needs_plan', { result: '{}' });
+  check('settleEscalation refuses non-terminal target', taskJournal.settleEscalation(normTask, 'running') === false);
+  check('settleEscalation needs_plan → cancelled', taskJournal.settleEscalation(normTask, 'cancelled', { error: 'x' }) === true && taskJournal.getTask(normTask).status === 'cancelled');
+  check('settleEscalation is one-way (cancelled → done refused)', taskJournal.settleEscalation(normTask, 'done') === false);
+
   planningNode.execute = realExecute;
   handoffMod.execute = realHandoff;
   mainSrv.close();

@@ -42,7 +42,7 @@ const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona
 const { classify, INTENTS, GRAPH_ONLY_INTENTS } = require('./classify.cjs');
 const { sanitizeContext, isRoutingPromise, stripRoutingPromises } = require('./refusal.cjs');
 const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE, isLocalFileEdit, NAMED_APP_RE } = require('../../shared/text-patterns.cjs');
-const { computeTurnFacts } = require('../../shared/turn-facts.cjs');
+const { computeTurnFacts, deriveRequestText } = require('../../shared/turn-facts.cjs');
 const { replaceVocalizationTags, createVocalizationMapper } = require('../../shared/vocalization-tags.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
 const webSearchExpress = require('./nodes/webSearchExpress.cjs');
@@ -166,6 +166,36 @@ const _isRulePhrase = (t) => _RULE_PHRASE_RES.some((re) => re.test(t));
 // Weak markers — not enough to enter the lane alone, but worth a semantic
 // verdict (AGENTS.md: lexical candidates → confirmJudgment for lane overrides).
 const _RULE_WEAK_RE = /\brules?\b|\bevery\s+time\b|\bwhenever\b|\beach\s+time\b|\bnext\s+time\b|\b(?:alert|remind|notify|tell|warn|ping)\s+me\s+when\b/i;
+
+// ── Paste-scoped judgment state ─────────────────────────────────────────────
+// A paste+question turn ("<quoted block> … what does X mean?") makes whole-text
+// judgments unreliable — pasted vocabulary reads as intent (observed: a pasted
+// routing audit containing "AGENTS.md rule" scored YES on "is the user asking
+// to create a rule"). Verdicts judge the ASK (facts.requestText), keeping the
+// sentence that carried the lexical match in view so legit requests retain
+// their rule/service phrasing.
+function _evidenceSentence(text, re) {
+  const s = String(text || '');
+  const m = s.match(re);
+  if (!m || m.index == null) return null;
+  const before = s.slice(0, m.index);
+  // A sentence boundary is punctuation FOLLOWED by whitespace — the dot in
+  // "AGENTS.md" / "comms-graph.log" doesn't end a sentence.
+  let start = 0;
+  for (const b of before.matchAll(/[.!?]\s|\n/g)) start = b.index + b[0].length;
+  const tail = s.slice(m.index);
+  const rel = tail.search(/[.!?]\s|\n/);
+  const end = rel === -1 ? s.length : m.index + rel + 1;
+  return s.slice(start, end).trim().slice(0, 240) || null;
+}
+
+function _focusState(facts, evidenceRe) {
+  const userText = (facts && facts.userText) || '';
+  const ask = (facts && facts.requestText) || userText;
+  if (ask === userText || !evidenceRe) return ask;
+  const ev = _evidenceSentence(userText, evidenceRe);
+  return ev && !ask.includes(ev) ? `Ask: ${ask}\nCandidate evidence: "${ev}"` : ask;
+}
 
 const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 
@@ -370,8 +400,18 @@ async function _handleLoopBack(body) {
   const _lbSession = body.sessionId || _lbTask?.sessionId || _lastSessionId || null;
   const _attemptKey = _lbPlanId || body.taskId;
 
+  // Journal settle — the loop-back IS the task's continuation (needs_plan /
+  // plan_update are pseudo-terminal statuses the entry waits in while we
+  // replan). EVERY exit below must move the entry to a real terminal status —
+  // otherwise the queue card spins "Replanning" forever with no cancel
+  // affordance and resurrects on restart via tasks:restored.
+  const _settleTask = (status, result) => {
+    try { taskJournal.settleEscalation(body.taskId, status, { result }); } catch (_) {}
+  };
+
   const _settleFail = (why) => {
     _loopBackAttempts.delete(_attemptKey);
+    _settleTask('failed', `Replanning failed — ${why}`);
     logger.warn('[Server] Loop-back settling as failure', { taskId: body.taskId, planId: _lbPlanId, why });
     _postMain('/plan.fail', { planId: _lbPlanId, taskId: body.taskId, reason: why });
   };
@@ -425,11 +465,24 @@ async function _handleLoopBack(body) {
   } catch (err) { lbErr = err; }
 
   const md = lbResult?.metadata || {};
+
+  // Cancelled mid-replan — the cancel sweep settles escalation entries via
+  // settleEscalation while this race is still in flight. Its outcome must be
+  // dropped: launching the plan or re-dispatching would resurrect work the
+  // user explicitly aborted.
+  if (!lbErr && taskJournal.getTask(body.taskId)?.status === 'cancelled') {
+    _loopBackAttempts.delete(_attemptKey);
+    logger.info('[Server] Loop-back resolved after user cancel — dropping outcome', { taskId: body.taskId, planId: _lbPlanId });
+    _postMain('/plan.replanning.end', { taskId: body.taskId, planId: _lbPlanId, outcome: 'cancelled' });
+    return;
+  }
+
   if (!lbErr && md.runPlan && md.planFile) {
     // Escalated plans auto-run — main's plan-check fires autoStart once every
     // checklist item clears (auth/Approval gates still hold). Attempt count is
     // deliberately NOT cleared — the cap is lifetime per plan (see above).
-    _postMain('/plan.run', { planId: md.planId, planFile: md.planFile, escalated: true });
+    _settleTask('done', `Replanned — running as plan ${md.planId || ''}`.trim());
+    _postMain('/plan.run', { planId: md.planId, planFile: md.planFile, escalated: true, taskId: body.taskId });
     return;
   }
   if (!lbErr && _lb.reason === 'no_skill_coverage' && _lbText) {
@@ -437,10 +490,11 @@ async function _handleLoopBack(body) {
     // same request with _allowPlannerFallback so stategraph's coverage gate
     // lets the bounded planner handle it ("just run it").
     _loopBackAttempts.delete(_attemptKey);
+    _settleTask('done', 'Re-dispatched — handled directly by the planner');
     logger.info('[Server] no_skill_coverage planning exited without plan — re-dispatching with planner fallback', { taskId: body.taskId });
     // Settle the escalation pin — this path resolves with neither /plan.run
     // nor /plan.fail, so without this the replanning lane stays open forever.
-    _postMain('/plan.replanning.end', { taskId: body.taskId, planId: _lbPlanId, outcome: 'planner_fallback' });
+    _postMain('/plan.replanning.end', { taskId: body.taskId, planId: _lbPlanId, outcome: 'planner_fallback', taskStatus: 'done' });
     handoff({
       englishPrompt: _lbText,
       source: _lbTask?.source || 'text',
@@ -627,8 +681,11 @@ async function _capabilityGate(text, opts = {}) {
           } catch (_) {}
           _ok = (await _decision.confirmJudgment({
             site: 'capability-pin',
-            question: `A binder wants to route this request to the tool ${_who} because the word "${_explicit.matched}" appears in it. The word may be ordinary vocabulary (e.g. "commit messages" names git output, not the Messages app). Does the request actually intend to invoke that tool/service?`,
-            state: String(text || '').slice(0, 800),
+            question: `A binder wants to route this request to the tool ${_who} because the word "${_explicit.matched}" appears in it. The word may be ordinary vocabulary (e.g. "commit messages" names git output, not the Messages app), or part of pasted/quoted material the user is asking about. Does the request itself intend to invoke that tool/service?`,
+            state: _focusState(
+              { userText: text, requestText: deriveRequestText(text) },
+              new RegExp(String(_explicit.matched || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+            ),
           })) === 'YES';
         }
         if (_ok) {
@@ -685,7 +742,7 @@ async function _capabilityGate(text, opts = {}) {
             id: 'tool', type: 'choice',
             question: 'Which capability best serves this request? Pick the last option (none) if none fit.',
             options: [..._opts, 'none'],
-          }], { state: `Request: ${query}` });
+          }], { state: `Request: ${deriveRequestText(text)}${screenCtx ? ` — screen context: ${[screenCtx.appName, screenCtx.host].filter(Boolean).join(' ')}` : ''}` });
           const _pick = _dr?.answers?.tool;
           if (_pick && _pick.index != null && _pick.index < _cands.length && (_pick.confidence ?? 0) >= 0.55) {
             const _cand = _cands[_pick.index];
@@ -1137,13 +1194,18 @@ function _logConversationTurn(userText, assistantText, intentName, preRoutedSess
   };
   // If we already routed during history fetch, reuse that sessionId — do NOT
   // route again (a second route call could rotate the session a second time).
+  // userText may be null — a deduped completion logs only the real result.
   if (preRoutedSessionId) {
-    _post('message.add', { sessionId: preRoutedSessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+    if (userText) {
+      _post('message.add', { sessionId: preRoutedSessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+    }
     if (assistantText) {
       _post('message.add', { sessionId: preRoutedSessionId, text: assistantText, sender: 'assistant', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts, ..._searchMd } });
     }
     return;
   }
+  // No session to post into and nothing to route on — nothing to do.
+  if (!userText) return;
   // Fallback: route then log (used only when history fetch failed/unavailable)
   const routeBody = JSON.stringify({
     version: 'mcp.v1', service: 'conversation', action: 'session.route',
@@ -1289,16 +1351,29 @@ async function processMessage(args) {
   // not a task. Anchored regexes generate candidates and fire the lane;
   // weaker markers get a semantic verdict before overriding classify
   // (AGENTS.md: lexical match overriding a lane needs confirmJudgment).
-  if (_rulesMod && _isRulePhrase(_userText)) {
-    return _authorRule(_userText);
-  }
-  if (_rulesMod && _RULE_WEAK_RE.test(_userText)) {
+  // Paste+question turns scope the verdict to the ask — quoted "rule"/"if I
+  // go to…" vocabulary in pasted material is not intent (observed: pasted
+  // audit text + "what does envelope mean" → rule-author YES → dead end).
+  const _RULE_EVIDENCE_RE = /\brules?\b|\b(?:if|when|whenever|every\s+time|each\s+time|next\s+time)\b/i;
+  const _ruleCheck = async () => {
+    const focus = _focusState(preFacts, _RULE_EVIDENCE_RE);
     const verdict = await _decision.confirmJudgment({
       site: 'rule-author',
-      question: 'Is the user asking to create a persistent conditional rule (when X happens, do Y)?',
-      state: _userText,
+      question: 'Is the user\'s request — ignoring any quoted or pasted material they are asking ABOUT — asking to create a persistent conditional rule (when X happens, do Y)?',
+      state: focus,
     });
-    if (verdict === 'YES') return _authorRule(_userText);
+    return verdict === 'YES' ? focus : null;
+  };
+  if (_rulesMod && _isRulePhrase(_userText)) {
+    // The ASK itself phrased conditionally → author directly (cheap path). A
+    // match that only exists in pasted/quoted material → the verdict decides
+    // on the scoped state first.
+    const ok = _isRulePhrase(preFacts.requestText || _userText) ? _userText : await _ruleCheck();
+    if (ok) return _authorRule(ok);
+  }
+  if (_rulesMod && _RULE_WEAK_RE.test(_userText)) {
+    const ok = await _ruleCheck();
+    if (ok) return _authorRule(ok);
   }
 
   logger.info('[Process] Start', {
@@ -1363,6 +1438,17 @@ async function processMessage(args) {
   // (taskFacts pattern). Control/referent decisions use facts.userText —
   // blob-stripped — never the blob-inclusive englishText.
   const turnFacts = computeTurnFacts({ rawText: englishText, selectedText });
+  // RouteDecision envelope — ONE task classification per turn, fired at
+  // ingress in parallel with the guards/classifier below. The selection
+  // veto, executor lanes (web_search/screen), and the handoff all consume
+  // the SAME verdict instead of re-deriving "what is this prompt" at each
+  // hop — a lexical pin can no longer put a task-shaped prompt on a
+  // context-free executor (observed: "search for it" → public SERP;
+  // highlight + "message for this" → browser takeover). classifyRoute never
+  // rejects (returns null) — the catch is belt-and-suspenders; null means
+  // every consumer keeps its pre-envelope behavior.
+  const _routeDecisionP = classifyRoute(classifyText, convHistory)
+    .catch(err => { logger.warn('[Process] RouteDecision error', { error: err?.message }); return null; });
   // [File:]/[Folder:] chips are path POINTERS, not content — generalQuick can't
   // open them, so a selection made only of file refs isn't self-contained QA
   // context; the prompt needs the real classifier's guards (action veto,
@@ -1374,6 +1460,7 @@ async function processMessage(args) {
   // QA. Skip classify + the context-blind guards entirely; generalQuick's
   // 0-sentinel self-corrects to shouldHandoff when tools are genuinely needed.
   let intent, intentName, confidence, classifySource;
+  let _routeDecision = null; // awaited once; shared by every consumer below
   let _openPlan = null, _resumePlanId = null;
   // Stale-pin escape — a UI pin on a finished plan must not keep trapping
   // new prompts in the lane ("planning mode not being handed off"). The pin
@@ -1440,8 +1527,8 @@ async function processMessage(args) {
           : 'Open plan: (none found)';
         const _v = await _decision.confirmJudgment({
           site: 'pin-escape',
-          question: 'The user is in a plan-drafting lane. Is their message a NEW task unrelated to the open plan (it should leave the lane and run normally) rather than an answer, edit, or question ABOUT the plan?',
-          state: `${_planDesc}\nUser message: ${classifyText}`,
+          question: 'The user is in a plan-drafting lane. Is their request — ignoring any pasted or quoted material they are asking ABOUT — a NEW task unrelated to the open plan (it should leave the lane and run normally) rather than an answer, edit, or question ABOUT the plan?',
+          state: `${_planDesc}\nUser message: ${turnFacts.requestText || classifyText}`,
         });
         if (_v === 'YES') {
           _pinTerminal = true;
@@ -1466,11 +1553,47 @@ async function processMessage(args) {
     // guesser is a free synchronous regex pre-check, no LLM cost.
     const { guessedIntent: _selGuess } = intentGuesser.guess(classifyText, { hasSelectionContext });
     if (GRAPH_ONLY_INTENTS.has(_selGuess)) {
-      logger.info('[Process] Selection action veto → handoff', { guessedIntent: _selGuess });
-      intent = 0;
-      intentName = 'handoff';
-      confidence = 0.85;
-      classifySource = 'selection_action_veto';
+      // The guesser is only a PROPOSAL — a lexical match can't tell "do
+      // something with a service" from "produce text using the highlight"
+      // (observed: a LinkedIn thread highlight + "I need a response to the
+      // recent message for this" matched command_automate → the graph took
+      // over and closed the user's LinkedIn tab, when a drafted reply was
+      // wanted). The RouteDecision envelope arbitrates on structure first
+      // (local/scheduling/app taskTypes can't be served by drafting);
+      // service/messaging/browser taskTypes are shared by drafts AND real
+      // sends, so those get a semantic verdict (AGENTS.md). Fail-open lands
+      // on general_quick — its 0-sentinel self-corrects to handoff when the
+      // work genuinely needs the graph, and drafting is the low-blast-radius
+      // lane under ambiguity.
+      _routeDecision = _routeDecision || await _routeDecisionP;
+      let _selAction = false;
+      if (_routeDecision?.taskType && !['query', 'ambiguous', 'messaging', 'browser'].includes(_routeDecision.taskType)) {
+        _selAction = true;
+      } else {
+        try {
+          const _v = await _decision.confirmJudgment({
+            site: 'selection-veto',
+            question: 'The user sent highlighted text with their message. Does their request — ignoring any pasted or quoted material they are asking ABOUT — want the system to PERFORM an action (send, post, automate on a service; change files or settings), or PRODUCE TEXT using the highlight (draft a reply, summarize, explain, answer a question)?',
+            options: ['ACTION', 'TEXT'],
+            state: `User message: ${turnFacts.requestText || classifyText}`,
+          });
+          logger.info(`[semantic-gate-evidence] site=selection-veto verdict=${_v || 'null'} input=${classifyText.substring(0, 60)}`);
+          _selAction = _v === 'ACTION';
+        } catch (_) { _selAction = false; }
+      }
+      if (_selAction) {
+        logger.info('[Process] Selection action veto → handoff', { guessedIntent: _selGuess, taskType: _routeDecision?.taskType || null });
+        intent = 0;
+        intentName = 'handoff';
+        confidence = 0.85;
+        classifySource = 'selection_action_veto';
+      } else {
+        logger.info('[Process] Selection action veto denied — drafting lane', { guessedIntent: _selGuess, taskType: _routeDecision?.taskType || null });
+        intent = 1;
+        intentName = 'general_quick';
+        confidence = 0.9;
+        classifySource = 'selection_fastlane';
+      }
     } else {
       intent = 1;
       intentName = 'general_quick';
@@ -1484,7 +1607,7 @@ async function processMessage(args) {
     _openPlan = planningNode.findOpenPlan(routedSessionId);
 
     ({ intent, intentName, confidence, source: classifySource, resumePlanId: _resumePlanId } =
-      await classify(classifyText, context, { hasSelectionContext, openPlan: _openPlan }));
+      await classify(classifyText, context, { hasSelectionContext, openPlan: _openPlan, facts: turnFacts, routeDecisionP: _routeDecisionP }));
   }
 
   // ── Bogus resume guard ─────────────────────────────────────────────────────
@@ -1503,6 +1626,18 @@ async function processMessage(args) {
       planId: _resumePlanId, textPreview: _t.slice(0, 60),
     });
     _resumePlanId = null;
+    // The planning intent was PINNED by the resume guard — dropping only the
+    // plan id leaves intent:6 alive and the new-topic prompt still enters the
+    // planning lane (observed: "Answer the questions base upon the resume"
+    // drafted a fill+submit plan after its resume was dropped). Re-classify
+    // with no open plan so the prompt routes on its own merits.
+    if (classifySource === 'plan_resume_guard') {
+      ({ intent, intentName, confidence, source: classifySource } =
+        await classify(classifyText, context, { hasSelectionContext, openPlan: null }));
+      logger.info('[Process] Re-classified after dropped resume', {
+        intent, intentName, classifySource, textPreview: _t.slice(0, 60),
+      });
+    }
   }
 
   // ── Short reply while a plan awaits input → resume planning ────────────────
@@ -1628,20 +1763,55 @@ async function processMessage(args) {
     } catch (e) { logger.warn('[Process] artifactReferent failed', { error: e.message }); }
   }
 
+  // ── Executor-lane veto — the envelope arbitrates executor pins ─────────────
+  // web_search/screen are EXECUTORS: they run a context-free surface (public
+  // SERP / screen capture+display). A guard regex can pin them with zero
+  // context — the envelope (same classification the graph consumes, started
+  // in parallel at ingress) is the authority on whether the prompt is really
+  // a standalone public-web lookup / screen display:
+  //   intent 8 vetoes on any task/follow-up/service/clarification signal —
+  //   "search for it" (a pronoun follow-up) or "search my downloads" are not
+  //   public-web queries.
+  //   intent 7 vetoes on service/action taskTypes — "show me my calendar on
+  //   screen" needs gathered data a capture can't provide.
+  // Envelope unavailable (model down) → keep the pin (express lanes exist for
+  // speed; we can't know better without the verdict).
+  if (intent === 8 || intent === 7) {
+    _routeDecision = _routeDecision || await _routeDecisionP;
+    if (_routeDecision) {
+      const _vetoSignals = intent === 8
+        ? (_routeDecision.isFollowUp === true
+            || !!_routeDecision.targetService
+            || _routeDecision.needsClarification === true
+            || (_routeDecision.taskType && _routeDecision.taskType !== 'query'))
+        : (!!_routeDecision.targetService
+            || _routeDecision.requiresDOM === true
+            || (_routeDecision.taskType && _routeDecision.taskType !== 'query' && _routeDecision.taskType !== 'ambiguous'));
+      if (_vetoSignals) {
+        logger.info(`[Process] RouteDecision vetoes ${intentName} → handoff`, {
+          taskType: _routeDecision.taskType, targetService: _routeDecision.targetService || null,
+          isFollowUp: _routeDecision.isFollowUp, was: classifySource,
+        });
+        intent = 0;
+        intentName = 'handoff';
+        confidence = Math.min(confidence || 0.9, 0.85);
+        classifySource = 'route_verdict_veto';
+      }
+    }
+  }
+
   // ── RouteDecision — the single classification envelope ─────────────────────
-  // For handoff-bound prompts, classifyTask (the same schema the execution
-  // graph consumes) runs ONCE here at ingress; the decision rides the handoff
-  // into state._routeDecision so resolveReferencesV2 consumes it instead of
+  // The envelope was fired at ingress in parallel with classify() — consumers
+  // above (selection veto, executor-lane veto) may have already awaited it;
+  // handoff-bound prompts await whatever remains. It rides the handoff into
+  // state._routeDecision so resolveReferencesV2 consumes it instead of
   // re-classifying — the two layers can no longer disagree about what the
   // prompt is. When the envelope says the prompt isn't a task at all (a
   // question, a memory op), demote to the right lane rather than dispatch a
   // doomed task — this is the "what's the absolute path" → WebSearch-about-
-  // "user" bug class. Cheap triage above still covers non-task prompts; this
-  // call only ever runs for prompts already bound for the graph, so latency
-  // is unchanged (the same call simply moves earlier in the run).
-  let _routeDecision = null;
+  // "user" bug class.
   if (intent === 0) {
-    _routeDecision = await classifyRoute(_resolvedText, convHistory);
+    _routeDecision = _routeDecision || await _routeDecisionP;
     const _demoteTo = (_routeDecision && _routeDecision.lane !== 'handoff')
       ? LANE_BY_INTENT[_routeDecision.lane] : undefined;
     if (_demoteTo !== undefined) {
@@ -1741,8 +1911,9 @@ async function processMessage(args) {
   // Deterministic log-read fast path — "check the X log / show me the logs"
   // answers from real log data (run visibly in the diagnosis pane) regardless
   // of how the classifier routed the message. Only fires on an explicit
-  // "log" mention so normal status/planning turns pass through.
-  if (turnFacts.logMention) {
+  // "log" mention in the ASK — a pasted block that merely mentions logs
+  // isn't a request for the log file.
+  if (turnFacts.logMention && /\blogs?\b/i.test(turnFacts.requestText || '')) {
     try {
       const { probeLog } = require('./nodes/statusCheck.cjs');
       const lp = await probeLog(englishText);
@@ -1789,8 +1960,8 @@ async function processMessage(args) {
           if (!_referent) {
             _referent = (await _decision.confirmJudgment({
               site: 'plan-referent',
-              question: 'Is this message referring to an actual saved plan, or does the word "plan" just appear inside a question/quoted text?',
-              state: String(s || '').slice(0, 800),
+              question: 'Is the user\'s request — ignoring any pasted or quoted material they are asking ABOUT — referring to an actual saved plan, or does the word "plan" just appear inside a question/quoted text?',
+              state: _focusState(turnFacts, /\bplans?\b/i),
             })) !== 'NO'; // model-down keeps today's reroute behavior
           }
           const to = turnFacts.planRef.informational ? 3 : 6;
@@ -2399,8 +2570,20 @@ const server = http.createServer(async (req, res) => {
       const tPrompt = t?.prompt || null;
       if (tPrompt) {
         const resultText = String(body.result).slice(0, 800);
-        _addTurn(tPrompt, resultText, t.intent || 'handoff');
-        _logConversationTurn(tPrompt, resultText, t.intent || 'handoff', body.sessionId || t.sessionId || null);
+        // Dedupe — a loop-back re-dispatch / plan rerun creates a SECOND
+        // journal task carrying the same user prompt; logging it again
+        // doubles the utterance in history AND the transcript (observed:
+        // "give me code for hollow World…" appeared twice). Supersede the
+        // pending turn's placeholder ack and log only the real result.
+        const _last = _conversationHistory[_conversationHistory.length - 1];
+        if (_last && _last.user === tPrompt.substring(0, 200)) {
+          _last.assistant = resultText.substring(0, 200);
+          _last.ts = Date.now();
+          _logConversationTurn(null, resultText, t.intent || 'handoff', body.sessionId || t.sessionId || null);
+        } else {
+          _addTurn(tPrompt, resultText, t.intent || 'handoff');
+          _logConversationTurn(tPrompt, resultText, t.intent || 'handoff', body.sessionId || t.sessionId || null);
+        }
       }
     }
     return _send(res, 200, { ok: true });
@@ -2472,19 +2655,41 @@ const server = http.createServer(async (req, res) => {
   // ── Task cancel (from main.js) — mark task as cancelled in journal ───────────────
   if (req.url === '/comms.cancel' && req.method === 'POST') {
     const body = await _readBody(req);
-    if (!body.taskId && !body.planId && !(Array.isArray(body.taskIds) && body.taskIds.length)) {
-      return _send(res, 400, { error: 'taskId, taskIds, or planId is required' });
+    if (!body.taskId && !body.planId && !body.all && !(Array.isArray(body.taskIds) && body.taskIds.length)) {
+      return _send(res, 400, { error: 'taskId, taskIds, planId, or all is required' });
     }
     // Batch/plan-scoped cancel: mark EVERY task cancelled first, THEN remove
     // each — removes can resume a parked sibling on lock release, and the
     // resume path skips tasks already marked cancelled.
-    const taskIds = body.planId
+    // all:true lets a cancel sweep nuke non-terminal entries without a prior
+    // GET /tasks — a list call that silently fails (timeout/service busy)
+    // used to leave the journal (and its UI cards) alive after "cancel".
+    const taskIds = body.all
+      ? taskJournal.getAllTasks()
+          .filter((t) => t.id && t.id !== body.exceptTaskId
+            && !['done', 'failed', 'cancelled'].includes(t.status))
+          .map((t) => t.id)
+      : body.planId
       ? taskJournal.getAllTasks()
           .filter((t) => t.planMeta && t.planMeta.planId === body.planId)
           .map((t) => t.id)
       : Array.isArray(body.taskIds) ? body.taskIds : [body.taskId];
     for (const id of taskIds) {
-      taskJournal.updateTask(id, 'cancelled', { error: 'cancelled by user' });
+      // Escalation entries (needs_plan / plan_update) are pseudo-terminal —
+      // updateTask refuses them, which made in-flight replans un-cancellable
+      // (observed: "Replanning" card that survived every cancel). The
+      // settleEscalation status also arms _handleLoopBack's post-race check
+      // to drop the replan outcome instead of launching it.
+      const _t = taskJournal.getTask(id);
+      if (_t && (_t.status === 'needs_plan' || _t.status === 'plan_update')) {
+        if (taskJournal.settleEscalation(id, 'cancelled', { error: 'cancelled by user' })) {
+          _postMain('/plan.replanning.end', {
+            taskId: id, planId: _t.planMeta?.planId || null, outcome: 'cancelled',
+          });
+        }
+      } else {
+        taskJournal.updateTask(id, 'cancelled', { error: 'cancelled by user' });
+      }
     }
     for (const id of taskIds) {
       try { handoffRemove(id); } catch (_) {}
@@ -2527,4 +2732,4 @@ process.on('SIGTERM', () => _shutdown('SIGTERM'));
 process.on('SIGINT', () => _shutdown('SIGINT'));
 }
 
-module.exports = { server, processMessage, _isRulePhrase, _RULE_WEAK_RE, _authorRule, _handleLoopBack, _loopBackAttempts };
+module.exports = { server, processMessage, _isRulePhrase, _RULE_WEAK_RE, _authorRule, _handleLoopBack, _loopBackAttempts, _focusState, _evidenceSentence };

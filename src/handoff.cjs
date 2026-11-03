@@ -330,9 +330,9 @@ async function _compileTaskSteps(prompt, agentId, { conversationContext = null, 
       agents: agentId ? [agentId] : [],
       doneWhen: '',
       context: _compileContextBlock(conversationContext, sessionId, _liveTabsContext(_sessions)),
-    });
+    }, null, _sessions);
     if (!Array.isArray(steps) || !steps.length) return null;
-    const normalized = await normalizeTaskStepsAsync({ steps, agents: agentId ? [agentId] : [] }).catch(() => null);
+    const normalized = await normalizeTaskStepsAsync({ steps, agents: agentId ? [agentId] : [] }, { extSessions: _sessions }).catch(() => null);
     const out = (normalized && Array.isArray(normalized.steps) && normalized.steps.length) ? normalized.steps : steps;
     // Degenerate floor — a compile whose entire plan is `synthesize` decided
     // nothing; the internal pipeline reads richer context than we injected.
@@ -586,6 +586,12 @@ const _notifyAttempts = new Map(); // taskId → attempt count
 const SWEEP_INTERVAL_MS = 15 * 1000;
 const STALE_QUEUED_MS   = 20 * 1000; // queued with no ack for this long = notify missed
 const MAX_NOTIFY_ATTEMPTS = 3;
+// User-blocked statuses die after 10min unanswered — a parked ask_user /
+// approval / auth card used to sit forever (observed: 447min "Needs input").
+// The stamp lives on the journal entry (taskJournal.updateTask waitingSince)
+// so restarts keep aging the same wait rather than restarting it.
+const STALE_WAITING_MS = 10 * 60 * 1000;
+const WAITING_STATUSES = new Set(['waiting-for-input', 'awaiting-approval', 'auth-required']);
 
 let _sweepTimer = null;
 function startRetrySweep() {
@@ -593,6 +599,15 @@ function startRetrySweep() {
   _sweepTimer = setInterval(async () => {
     const journal = require('./taskJournal.cjs');
     for (const task of journal.getActiveTasks()) {
+      // Stale user-blocked tasks — nobody answered; cancel + remove so the
+      // card clears and any lock-parked siblings can proceed.
+      if (WAITING_STATUSES.has(task.status)
+          && Date.now() - (task.waitingSince || task.createdAt || 0) > STALE_WAITING_MS) {
+        logger.info('[Handoff] User-blocked task timed out — auto-cancelling', { taskId: task.id, status: task.status });
+        journal.updateTask(task.id, 'cancelled', { error: 'timed out waiting for user input' });
+        try { remove(task.id); } catch (_) {}
+        continue;
+      }
       if (task.status !== 'queued') continue;
       if (Date.now() - (task.createdAt || 0) < STALE_QUEUED_MS) continue;
       const attempts = (_notifyAttempts.get(task.id) || 0) + 1;

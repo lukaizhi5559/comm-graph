@@ -72,6 +72,13 @@ function _load() {
         item.doneAt = item.doneAt || now;
         staleCount++;
       }
+      // Seed waitingSince for persisted user-blocked entries — the stamp was
+      // added after this journal was written; without it they can never age
+      // out of the stale-waiting sweep.
+      if (['waiting-for-input', 'awaiting-approval', 'auth-required'].includes(item.status)
+          && !item.waitingSince) {
+        item.waitingSince = item.createdAt || now;
+      }
       _tasks.set(item.id, item);
     }
     if (staleCount > 0) {
@@ -184,6 +191,15 @@ function updateTask(id, status, extra = {}) {
     updates.doneAt = Date.now();
     updates.planFile = null; // terminal tasks must not retain reviewable-plan state
   }
+  // User-blocked statuses get a parked-since stamp so the stale sweep can
+  // auto-cancel work nobody answered (observed: a waiting-for-input card sat
+  // 447min). Any status change clears it.
+  const _WAITING_STATUSES = new Set(['waiting-for-input', 'awaiting-approval', 'auth-required']);
+  if (_WAITING_STATUSES.has(status)) {
+    if (!task.waitingSince) updates.waitingSince = Date.now();
+  } else {
+    updates.waitingSince = null;
+  }
   // 'auth-required' is an intermediate state (not terminal) — do NOT set doneAt.
   _tasks.set(id, { ...task, ...updates });
   _save();
@@ -192,6 +208,33 @@ function updateTask(id, status, extra = {}) {
   if (TERMINAL_STATUSES.has(status) && _onTerminalFn) {
     try { _onTerminalFn(_tasks.get(id)); } catch (_) { /* hook must never break journal */ }
   }
+}
+
+/**
+ * Settle an escalated task (needs_plan / plan_update) into a REAL terminal
+ * status once its loop-back into planning resolves. updateTask can't do this:
+ * those statuses are pseudo-terminal by design so late graph updates can't
+ * resurrect the entry — but the loop-back IS the task's continuation. When it
+ * runs / falls back / fails / is cancelled, the entry must reach a terminal
+ * status or the UI keeps a live "Replanning" card forever (observed: a 10+min
+ * zombie card with no cancel affordance that also resurrected on restart via
+ * tasks:restored's ACTIONABLE set).
+ * The terminal hook does NOT re-fire — needs_plan already fired it once.
+ * @param {string} id
+ * @param {'done'|'failed'|'cancelled'} status
+ * @param {Object} [extra]
+ * @returns {boolean} true when the entry was in an escalation status and moved.
+ */
+const ESCALATION_STATUSES = new Set(['needs_plan', 'plan_update']);
+const SETTLE_STATUSES = new Set(['done', 'failed', 'cancelled']);
+function settleEscalation(id, status, extra = {}) {
+  const task = _tasks.get(id);
+  if (!task || !ESCALATION_STATUSES.has(task.status) || !SETTLE_STATUSES.has(status)) return false;
+  _tasks.set(id, { ...task, status, ...extra, doneAt: Date.now(), planFile: null, waitingSince: null });
+  _save();
+  _broadcast();
+  logger.info('[TaskJournal] Escalation settled', { id, status });
+  return true;
 }
 
 /**
@@ -364,6 +407,7 @@ module.exports = {
   setOnTerminal,
   createTask,
   updateTask,
+  settleEscalation,
   updateProgress,
   setResult,
   patchArtifacts,

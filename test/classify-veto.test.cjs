@@ -4,8 +4,9 @@
  *
  * Regression: providers flake toward intent 0 on trivially classifiable
  * prompts (observed: cerebras returned "0" then "1" for "tell me a joke"
- * across runs — a 33s graph trip each time). A confident keyword hit must
- * veto a parsed 0, but NEVER a specific non-zero intent.
+ * across runs — a 33s graph trip each time). A confident keyword hit may
+ * veto a parsed 0 — but only through a semantic verdict (CHAT adopts,
+ * GRAPH/null keep the model's pick), never a specific non-zero intent.
  *
  * ask is lazily destructured from llm-providers inside classify(), so
  * patching the module export here reaches the unit under test.
@@ -13,13 +14,24 @@
 const assert = require('assert');
 const { classify } = require('../src/classify.cjs');
 const providers = require('../src/llm-providers.cjs');
+const decision = require('../src/decision.cjs');
 
 const realAsk = providers.ask;
+const realConfirm = decision.confirmJudgment;
 let tests = 0, passed = 0;
 
 async function withAsk(impl, fn) {
   providers.ask = impl;
   try { return await fn(); } finally { providers.ask = realAsk; }
+}
+// Keyword veto of a successful model pick requires a semantic verdict now
+// (AGENTS.md — a lexical override needs confirmJudgment; observed: "Do you
+// still know the path" → keyword vetoed the model's correct handoff →
+// general_quick answered blind). 'CHAT' adopts the keyword; 'GRAPH'/null
+// keep the model's pick.
+async function withVerdict(verdict, fn) {
+  decision.confirmJudgment = async () => verdict;
+  try { return await fn(); } finally { decision.confirmJudgment = realConfirm; }
 }
 function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS: ${name}`); } else { console.error(`  FAIL: ${name}`); } }
 
@@ -27,15 +39,27 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
   console.log('\nclassify keyword-veto tests');
 
   await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
-    const r = await classify('tell me a joke');
-    check('LLM "0" vetoed by keyword hit → general_quick',
-      r.intent === 1 && r.source === 'keyword_fallback');
+    await withVerdict('CHAT', async () => {
+      const r = await classify('tell me a joke');
+      check('LLM "0" + CHAT verdict → keyword adopts → general_quick',
+        r.intent === 1 && r.source === 'keyword_fallback');
+    });
   });
 
   await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
-    const r = await classify('good morning');
-    check('LLM "0" vetoed for greeting → general_quick',
-      r.intent === 1 && r.source === 'keyword_fallback');
+    await withVerdict('GRAPH', async () => {
+      const r = await classify('tell me a joke');
+      check('LLM "0" + GRAPH verdict → keyword veto denied, handoff kept',
+        r.intent === 0 && r.source === 'keyword_veto_denied');
+    });
+  });
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    await withVerdict('CHAT', async () => {
+      const r = await classify('good morning');
+      check('LLM "0" + CHAT verdict → keyword adopts → general_quick',
+        r.intent === 1 && r.source === 'keyword_fallback');
+    });
   });
 
   await withAsk(async () => ({ text: '5', provider: 'mock' }), async () => {
@@ -63,15 +87,19 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
   });
 
   await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
-    const r = await classify('note: buy milk tomorrow');
-    check('LLM "0" vetoed by memory_store keyword hit',
-      r.intent === 5 && r.source === 'keyword_fallback');
+    await withVerdict('CHAT', async () => {
+      const r = await classify('note: buy milk tomorrow');
+      check('LLM "0" + CHAT verdict → memory_store keyword adopted',
+        r.intent === 5 && r.source === 'keyword_fallback');
+    });
   });
 
   await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
-    const r = await classify('cancel that');
-    check('LLM "0" vetoed by control_signal keyword hit',
-      r.intent === 4 && r.source === 'keyword_fallback');
+    await withVerdict('CHAT', async () => {
+      const r = await classify('cancel that');
+      check('LLM "0" + CHAT verdict → control_signal keyword adopted',
+        r.intent === 4 && r.source === 'keyword_fallback');
+    });
   });
 
   // ── control_signal false positives must NOT veto (observed drops) ──────────
@@ -221,15 +249,23 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
   });
 
   await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
-    const r = await classify('tweet the status update');
-    check('status keyword + command_automate guess → action veto → handoff',
-      r.intent === 0 && r.source === 'action_veto');
+    // Model-0 + keyword status hit → keyword-veto gate runs first; a null
+    // verdict fails open to the model's handoff (the action veto may still
+    // fire when a CHAT verdict adopts the keyword and the guesser flags
+    // command_automate). Either gate lands on handoff — never status_check.
+    await withVerdict(null, async () => {
+      const r = await classify('tweet the status update');
+      check('status keyword + command_automate guess → handoff, never status_check',
+        r.intent === 0);
+    });
   });
 
   await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
-    const r = await classify('what is the status');
-    check('bare status question still → status_check (no artifact subject)',
-      r.intent === 3 && r.intentName === 'status_check');
+    await withVerdict('CHAT', async () => {
+      const r = await classify('what is the status');
+      check('bare status question still → status_check (no artifact subject)',
+        r.intent === 3 && r.intentName === 'status_check');
+    });
   });
 
   console.log(`\n${passed}/${tests} passed`);

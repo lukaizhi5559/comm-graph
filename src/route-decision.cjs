@@ -122,6 +122,10 @@ function deriveLane(tc) {
     return 'handoff';
   }
   if (tc.suggestedIntent === 'memory_store') return 'memory_store';
+  // "Show/display X on screen" — the screen lane captures + answers +
+  // displays on the GhostLayer. Only reached when no screen-follow-up signal
+  // fired above (those need the graph's live-context resolution instead).
+  if (tc.suggestedIntent === 'screen_display') return 'screen_display';
   // A clean standalone lookup the envelope calls web_search can ride the
   // express executor (~1.5s) instead of a full graph run.
   if (tc.suggestedIntent === 'web_search') return 'web_search';
@@ -130,6 +134,29 @@ function deriveLane(tc) {
   // memory_quick lane produced shallow/wrong answers.
   if (tc.suggestedIntent === 'greeting' || tc.suggestedIntent === 'general_knowledge') return 'general_quick';
   return 'handoff';
+}
+
+/**
+ * Plan shape — whether an automation-shaped prompt is a single concrete
+ * deliverable (the bounded planner can just run it) vs genuinely plan-shaped
+ * work (multi-step / recurring / service-coordinating / unclear / follow-up).
+ * gatherPlanContext's no_skill_coverage gate consumes 'single' to suppress
+ * the escalation into conversational planning — observed: "give me code for
+ * hello world in python" bounced into a ~96s planning lane + 2 clarifying
+ * questions when the bounded planner would have simply written the file.
+ * Returns 'single' | 'complex' | null — null means "unknown, let the gate
+ * decide on its own" (the conservative default).
+ */
+function derivePlanShape(tc) {
+  if (!tc || !tc.taskType) return null;
+  if (tc.isRecurring || tc.suggestedIntent === 'multi_step' || tc.needsClarification
+      || tc.isFollowUp || tc.targetService || SERVICE_TASK_TYPES.has(tc.taskType)) {
+    return 'complex';
+  }
+  if (tc.taskType === 'local_file' || tc.taskType === 'local_system' || tc.taskType === 'query') {
+    return 'single';
+  }
+  return null;
 }
 
 /**
@@ -170,8 +197,9 @@ async function classifyRoute(userMessage, conversationHistory) {
     );
     if (!tc || typeof tc !== 'object' || !tc.taskType) return null;
     const lane = deriveLane(tc);
-    logger.info(`[route-decision] taskType=${tc.taskType} suggestedIntent=${tc.suggestedIntent || 'null'} lane=${lane}${tc.targetService ? ` service=${tc.targetService}` : ''}`);
-    return { ...tc, lane };
+    const planShape = derivePlanShape(tc);
+    logger.info(`[route-decision] taskType=${tc.taskType} suggestedIntent=${tc.suggestedIntent || 'null'} lane=${lane} planShape=${planShape || 'null'}${tc.targetService ? ` service=${tc.targetService}` : ''}`);
+    return { ...tc, lane, planShape };
   } catch (e) {
     logger.warn(`[route-decision] classifyTask failed — continuing without envelope: ${e.message}`);
     return null;
@@ -186,4 +214,4 @@ function serializeDecision(tc) {
   return out;
 }
 
-module.exports = { classifyRoute, deriveLane, canSkipCapabilityGate, serializeDecision, SERVICE_TASK_TYPES, LANE_BY_INTENT, fetchExtSessions: _fetchExtSessions, _llmBackend };
+module.exports = { classifyRoute, deriveLane, derivePlanShape, canSkipCapabilityGate, serializeDecision, SERVICE_TASK_TYPES, LANE_BY_INTENT, fetchExtSessions: _fetchExtSessions, _llmBackend };

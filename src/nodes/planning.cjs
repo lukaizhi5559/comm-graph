@@ -465,7 +465,7 @@ function _appKnowledgeBlock(task) {
     : '';
 }
 
-async function _generateTaskSteps(task, pathFeedback) {
+async function _generateTaskSteps(task, pathFeedback, extSessions) {
   // Deterministic fast path — a screen.display scene/3D task needs no LLM
   // stepgen: the code is written at RUNTIME by the synthesize step (full task
   // prompt, full token budget), then referenced via {{synthesisAnswer}}.
@@ -537,6 +537,20 @@ async function _generateTaskSteps(task, pathFeedback) {
   const _feedbackBlock = pathFeedback
     ? `INVALID PATHS IN PRIOR DRAFT (verified NOT to exist on this machine — revise the plan to use only KNOWN PATHS/discovered repos, or drop the steps that need them):\n${pathFeedback}\n`
     : '';
+  // Bound extension tabs — the stepgen must see the user's live pages or it
+  // emits session-less turn.loop/dom.act steps that mint a phantom session at
+  // run time (observed: a step to "read the job application form currently
+  // open" generated turn.loop.agent with no sessionId → no live tab). Bound
+  // page work rides ext:default; url.first.agent is for NEW destinations.
+  let _liveTabsBlock = '';
+  try {
+    const _lt = require('../../../shared/live-tabs.cjs');
+    const _ctx = _lt.liveTabsContext(Array.isArray(extSessions) ? extSessions : []);
+    if (_ctx) {
+      _liveTabsBlock = _ctx + '\n'
+        + 'The extension is CONNECTED — work on a listed page or its service runs on `sessionId:"ext:default"` (the user\'s real tab: dom.act / form.fill.agent / turn.loop.agent; browser.act getPageText for reads). `url.first.agent` is for NEW destinations only — re-navigating abandons the page the user means. Do NOT emit app.agent for work these tabs can serve.\n';
+    }
+  } catch (_) {}
   const userMsg =
     `TASK AGENTS: ${agents}\n` +
     // Session/task context the bare prompt can't carry — a follow-up like
@@ -545,6 +559,7 @@ async function _generateTaskSteps(task, pathFeedback) {
     _knownBlock +
     _repoBlock +
     _feedbackBlock +
+    _liveTabsBlock +
     `TASK PROMPT: ${task.prompt || task.title}\n` +
     (task.doneWhen ? `DONE WHEN: ${task.doneWhen}\n` : '') +
     `\nEmit the step list now.`;
@@ -650,7 +665,7 @@ async function _generateTaskSteps(task, pathFeedback) {
     // Async variant — unknown step hosts get one bounded live discovery
     // (redirect-follow → web.search), then persist to learned_domains.
     const norm = await require('../../../shared/plan-steps.cjs')
-      .normalizeTaskStepsAsync({ ...task, steps });
+      .normalizeTaskStepsAsync({ ...task, steps }, { extSessions });
     task._normalized = norm; // {steps, agents, services} — consumed by _scheduleStepGen
     task._missingPaths = null;
     return norm.steps;
@@ -678,6 +693,11 @@ function _scheduleStepGen(sess) {
   _activity(`generating steps for ${sess.tasks.length} task${sess.tasks.length > 1 ? 's' : ''}…`, 'plan');
   setImmediate(async () => {
     try {
+      // Bound extension tabs once per pass — the stepgen is blind without them
+      // (observed: turn.loop.agent steps emitted with no sessionId for a page
+      // that was already open, falling back to a phantom default session).
+      const _extSessions = await require('../route-decision.cjs')
+        .fetchExtSessions().catch(() => []);
       for (const task of sess.tasks) {
         if (Array.isArray(task.steps) && task.steps.length
             && task._stepsHash === _promptHash(task.prompt)) continue;
@@ -694,11 +714,11 @@ function _scheduleStepGen(sess) {
         // plan-check card can surface a retry action instead of hanging.
         // A path-gate failure retries WITH the missing-path feedback so the
         // second draft grounds itself instead of repeating the hallucination.
-        let steps = await _generateTaskSteps(task);
+        let steps = await _generateTaskSteps(task, null, _extSessions);
         if (!steps && (task._missingPaths || []).length) {
-          steps = await _generateTaskSteps(task, task._missingPaths.map(p => `- ${p}`).join('\n'));
+          steps = await _generateTaskSteps(task, task._missingPaths.map(p => `- ${p}`).join('\n'), _extSessions);
         } else if (!steps) {
-          steps = await _generateTaskSteps(task);
+          steps = await _generateTaskSteps(task, null, _extSessions);
         }
         if (!steps) {
           // Reason rides inside the status string ('failed — <why>') so the
@@ -2096,6 +2116,16 @@ exact block format for every task:
 </plan_update>
 
 RULES for tasks:
+- SCOPE — create ONLY tasks that implement what the user explicitly asked.
+  Never append committing/mutation tasks (submit a form, send, post, book,
+  buy, publish, delete, transfer) the user did not request. When the natural
+  next step is a commit, END the plan at the draft/review task — the user
+  asks for the commit themselves.
+- Live-app reads — a task that reads/extracts from an already-open external
+  page/app exists ONLY when the prompt references that page/app ("this
+  form", "the application on my screen", the site's name). A request that
+  carries its own inputs (attached files, inline text) never gets
+  live-browser extraction tasks.
 - Each Task = ONE deliverable for ONE service/action — never mix services in
   one Task. "Doc + Calendar + Sheet" = 3 tasks.
 - Prompt must stand alone: include titles, dates, column names — the run has

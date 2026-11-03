@@ -22,9 +22,10 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('./logger.cjs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { BARE_AFFIRM_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE, isContextDependent, CONTROL_SIGNAL_RE } = require('../../shared/text-patterns.cjs');
+const { BARE_AFFIRM_RE, BARE_DECLINE_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE, isContextDependent, CONTROL_SIGNAL_RE } = require('../../shared/text-patterns.cjs');
 const { isLocalMultiEntityTask } = require('../../shared/context-refs.cjs');
 const _ds = require('../../shared/decision-state.cjs');
+const { deriveRequestText } = require('../../shared/turn-facts.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
@@ -147,28 +148,20 @@ const GRAPH_ONLY_INTENTS = new Set(['command_automate', 'screen_analysis', 'memo
 // in the open plan, or the referent is bare "it"/"the plan".
 const _INSTALL_PROBE_RE = /\b(?:is|was|did)\s+(?:the\s+plan|it|that|([a-z0-9@._-]+))\s+(installed|set up|done|finished|working|running|complete|still going)\b/i;
 
-// Résumé/CV document signals — when "resume" is the only plan-resume match
-// AND these appear, the word is a noun (a biodata doc), not "resume the plan".
-// Observed: "Analyze the attached resume and compare…" pinned into planning
-// three times while a stale plan was open.
-const _RESUME_DOC_RE = /\b(?:attached|attach|pdf|cv|biodata|doc(?:ument)?|file|highlighted|job|career|experien|analy[sz]e|review|compare|upload|edit|read|scan|hiring|applicant|candidate|application|portfolio)\b/i;
-const _RESUME_VERB_CONTEXT_RE = /\b(?:continue|resume|keep going|carry on|pick up)\b[^.]{0,25}\b(?:plan|tasks?|setup|install|workflow|checklist)\b/i;
-
+// Plan-resume is a lane override — lexical matches can only PROPOSE it, never
+// pin it (AGENTS.md). Every candidate returns 'ambiguous' and the caller's
+// confirmJudgment decides; no regex path may blind-pin planning intent.
+// Observed: "Answer the questions base upon the resume" — the noun "resume"
+// hit \bresume\b and pinned a stale unrelated plan into a fill+submit draft.
 function _isPlanResume(englishText, openPlan) {
   const t = String(englishText || '');
-  if (PLAN_RESUME_RE.test(t)) {
-    // Ambiguous: "resume" appears with document context and no resume-the-plan
-    // phrasing — could be a résumé/CV. The guard asks semantically instead of
-    // blind-pinning (AGENTS.md: lexical overrides need a verdict).
-    if (_RESUME_DOC_RE.test(t) && !_RESUME_VERB_CONTEXT_RE.test(t)) return 'ambiguous';
-    return 'yes';
-  }
+  if (PLAN_RESUME_RE.test(t)) return 'ambiguous';
   const m = t.match(_INSTALL_PROBE_RE);
   if (!m) return 'no';
   const entity = (m[1] || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (!entity) return 'yes'; // bare "it"/"the plan" — referent is the open plan
+  if (!entity) return 'ambiguous'; // bare "it"/"the plan" — maybe the open plan
   const haystack = `${openPlan.title || ''} ${(openPlan.taskTitles || []).join(' ')}`.toLowerCase();
-  return haystack.includes(entity) ? 'yes' : 'no';
+  return haystack.includes(entity) ? 'ambiguous' : 'no';
 }
 
 // Multi-deliverable complexity scorer — catches prompts that never SAY "plan"
@@ -229,6 +222,12 @@ async function classify(englishText, conversationContext, opts = {}) {
   }
   const hasSelectionContext = !!opts.hasSelectionContext;
   const openPlan = opts.openPlan || null;
+  // The "ask" — in a paste+question turn the request lives in the trailing
+  // segment; judgments about intent scope to it while matchers may still
+  // generate candidates on full text (shared/turn-facts.cjs). Prefer the
+  // canonical fact when the caller threaded it through.
+  const _askText = (opts.facts && opts.facts.requestText) || deriveRequestText(englishText);
+  const _askIsQuestion = /\?\s*$|^(?:what|who|whom|whose|which|when|where|why|how|does|do|did|is|are|was|were|can|could|should|would|will|may|explain|define|describe)\b/i.test(_askText);
   // Bound tabs fetched in parallel with the guards — the local intent model
   // can't see open pages otherwise and demotes page actions to quick lanes
   // (observed: "click the first result" with a bound tab → local=general_quick
@@ -253,28 +252,32 @@ async function classify(englishText, conversationContext, opts = {}) {
   // consumed by _tryResolvePendingApproval upstream.
   const _planResumeVerdict = openPlan ? _isPlanResume(englishText, openPlan) : 'no';
   if (_planResumeVerdict === 'ambiguous') {
-    // Lexical collision — "resume" the document vs resume-the-plan. Never
-    // blind-pin: the semantic verdict decides (fail-open to normal classify).
+    // Every resume candidate is semantic — the verdict compares the prompt
+    // against the open plan's topic (résumé/CV docs, unrelated new topics,
+    // and quoted "resume the plan" strings in attachments all resolve NO).
+    // Fail-open to normal classify: a missed resume loses the fast-path,
+    // never a false pin.
     const _dec = require('./decision.cjs');
     const _prv = await _dec.confirmJudgment({
       site: 'plan-resume',
-      question: 'The user message contains the word "resume". Are they asking to RESUME the paused plan, or talking about a résumé/CV document? Answer YES only if they mean resume the plan.',
+      question: 'A plan is paused and awaiting continuation. Does this message ask to CONTINUE / RESUME / RUN / CHECK ON that plan, or is it an unrelated new request (including a "resume" that means a résumé/CV document, or plan-shaped words inside attached content)? Answer YES only if it continues the paused plan.',
       state: _ds.buildDecisionState({
         site: 'plan-resume',
-        message: englishText,
-        extras: [`Paused plan: "${openPlan.title}" — ${openPlan.pendingCount}/${openPlan.totalTasks} undone`],
+        message: _askText,
+        extras: [
+          `Paused plan: "${openPlan.title}" — ${openPlan.pendingCount}/${openPlan.totalTasks} undone`,
+          (openPlan.taskTitles || []).length ? `Its tasks: ${(openPlan.taskTitles || []).slice(0, 3).join('; ')}` : null,
+        ].filter(Boolean),
       }),
     });
     logger.info(`[semantic-gate-evidence] site=plan-resume verdict=${_prv || 'null'} input=${englishText.substring(0, 60)}`);
     if (_prv === 'YES') {
+      logger.info('[Classify] Plan-resume guard → planning', {
+        inputPreview: englishText.substring(0, 60),
+        planId: openPlan.planId,
+      });
       return { intent: 6, intentName: 'planning', confidence: 0.9, source: 'plan_resume_guard', resumePlanId: openPlan.planId };
     }
-  } else if (_planResumeVerdict === 'yes') {
-    logger.info('[Classify] Plan-resume guard → planning', {
-      inputPreview: englishText.substring(0, 60),
-      planId: openPlan.planId,
-    });
-    return { intent: 6, intentName: 'planning', confidence: 0.9, source: 'plan_resume_guard', resumePlanId: openPlan.planId };
   }
 
   const normalized = englishText.toLowerCase().trim()
@@ -289,6 +292,39 @@ async function classify(englishText, conversationContext, opts = {}) {
         offerPreview: lastAsst.substring(0, 80),
       });
       return { intent: 0, intentName: 'handoff', confidence: 0.9, source: 'offer_consent_guard' };
+    }
+  }
+
+  // Offer-echo consent — a short non-affirmative reply to an assistant offer
+  // may be an imperative paraphrase of consent: "search for it" after "want
+  // me to search your computer?" IS the offered action in the user's words.
+  // Without this, the reply routes on naked lexical content ("search" →
+  // web_search → a public SERP for the resolved subject — observed). Bare
+  // declines/follow-ups keep their lanes below; anything longer than a
+  // short echo is a new request. OFFER_RE only proposes — the verdict
+  // decides (AGENTS.md).
+  if (conversationContext && !BARE_AFFIRM_RE.test(normalized)
+      && !BARE_DECLINE_RE.test(normalized) && !BARE_FOLLOWUPS.has(normalized)
+      && (opts.facts?.wordCount ?? normalized.split(/\s+/).length) <= 8) {
+    const lastAsst = _lastAssistantTurn(conversationContext);
+    if (lastAsst && OFFER_RE.test(lastAsst)) {
+      const _oeV = await require('./decision.cjs').confirmJudgment({
+        site: 'offer-echo',
+        question: 'The assistant just offered to do something for the user. Does the user\'s reply ACCEPT the offer — telling the assistant to perform the offered action, possibly by repeating the action in their own words (e.g. "search for it" after "want me to search your computer?")? Answer NO for questions about the offer, declines, or new unrelated requests.',
+        state: _ds.buildDecisionState({
+          site: 'offer-echo',
+          message: englishText,
+          extras: [`Assistant offer: "${lastAsst.substring(0, 200)}"`],
+        }),
+      });
+      logger.info(`[semantic-gate-evidence] site=offer-echo verdict=${_oeV || 'null'} input=${englishText.substring(0, 60)}`);
+      if (_oeV === 'YES') {
+        logger.info('[Classify] Offer-echo consent → handoff', {
+          inputPreview: englishText.substring(0, 60),
+          offerPreview: lastAsst.substring(0, 80),
+        });
+        return { intent: 0, intentName: 'handoff', confidence: 0.85, source: 'offer_echo_guard' };
+      }
     }
   }
 
@@ -315,7 +351,7 @@ async function classify(englishText, conversationContext, opts = {}) {
         const _v = await require('./decision.cjs').confirmJudgment({
           site: 'recall-vs-draft',
           question: 'Does the user want you to inspect or recall the CHAT TRANSCRIPT itself (your prior conversation together), or are they asking you to draft/edit/polish message content (a reply, an email, a pasted draft)?',
-          state: _ds.buildDecisionState({ site: 'recall-vs-draft', message: englishText }),
+          state: _ds.buildDecisionState({ site: 'recall-vs-draft', message: _askText }),
         });
         logger.info(`[semantic-gate-evidence] site=recall-vs-draft verdict=${_v || 'null'} input=${englishText.substring(0, 60)}`);
         if (_v === 'NO') _pinRecall = false;
@@ -443,9 +479,23 @@ async function classify(englishText, conversationContext, opts = {}) {
   // Personal/screen/service referents already returned above; this keeps the
   // ~1.5s SERP path for shapes that can't mean anything else — ambiguous
   // lookups pay the local-decision classify instead.
-  if (/^(?:please\s+)?(?:search|google|look\s+up|find|look\s+for|show\s+me\s+(?:pictures?|images|photos|pics|videos|clips)\s+of)\b/i.test(englishText)) {
+  // Context guards before the web pin (observed: "search for it" accepted an
+  // offer to "search your computer" → this pin ran a public SERP for the
+  // resolved subject). A bare-pronoun prompt or a reply to an assistant offer
+  // is not a standalone lookup — let the context-aware path decide.
+  const _searchCtxDependent = isContextDependent(englishText);
+  const _searchOfferReply = !!conversationContext
+    && OFFER_RE.test(_lastAssistantTurn(conversationContext) || '');
+  if (!_searchCtxDependent && !_searchOfferReply
+      && /^(?:please\s+)?(?:search|google|look\s+up|find|look\s+for|show\s+me\s+(?:pictures?|images|photos|pics|videos|clips)\s+of)\b/i.test(englishText)) {
     logger.info('[Classify] Explicit-search guard → web_search', { inputPreview: englishText.substring(0, 60) });
     return { intent: 8, intentName: 'web_search', confidence: 0.9, source: 'search_guard' };
+  }
+  if (/^(?:please\s+)?(?:search|google|look\s+up|find|look\s+for)\b/i.test(englishText)) {
+    logger.info('[Classify] Search guard skipped — context-dependent or offer reply', {
+      inputPreview: englishText.substring(0, 60),
+      contextDependent: _searchCtxDependent, offerReply: _searchOfferReply,
+    });
   }
 
   // ── Pre-compute the keyword fallback (synchronous, free) ─────────────────────
@@ -469,18 +519,36 @@ async function classify(englishText, conversationContext, opts = {}) {
   // answered "tweet going live" — nothing ever ran.
   let _guessedIntent = null;
   try { _guessedIntent = require('./intentGuesser.cjs').guess(englishText, { hasSelectionContext }).guessedIntent; } catch (_) {}
-  const _vetoQuick = (result) => {
-    // status_check (3) is non-executable too — it only reads the task journal.
-    // Observed: "…explain the status for each repo… commit it" — the status
-    // keyword vetoed the LLM's handoff and the prompt died as a canned
-    // journal summary while intentGuesser saw command_automate.
+  // Action veto, gated on the RouteDecision envelope when the caller passed
+  // it (opts.routeDecisionP — fired at ingress for every prompt). The guesser
+  // is a regex hint: it PROPOSES "this looks actionable", but the envelope —
+  // which sees conversation history — decides whether the prompt really is a
+  // task. Veto stands unless the envelope affirmatively reports a passive
+  // shape (query, or ambiguous with no service/follow-up signal); envelope
+  // unavailable → keep the veto (a faked action is worse than a slow answer).
+  const _vetoQuickGated = async (result) => {
     if ((result.intent === 1 || result.intent === 3 || result.intent === 4 || result.intent === 5 || result.intent === 8) && GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
-      logger.info('[Classify] Action veto — quick tier cannot serve graph-only intent', {
-        llmIntent: result.intent, guessedIntent: _guessedIntent,
+      let _passive = false, _rd = null;
+      try {
+        _rd = opts.routeDecisionP ? await opts.routeDecisionP : null;
+        _passive = !!_rd && (_rd.taskType === 'query'
+          || (_rd.taskType === 'ambiguous' && !_rd.targetService && !_rd.isFollowUp));
+      } catch (_) { _passive = false; }
+      if (!_passive) {
+        logger.info('[Classify] Action veto — quick tier cannot serve graph-only intent', {
+          llmIntent: result.intent, guessedIntent: _guessedIntent,
+          inputPreview: englishText.substring(0, 60),
+        });
+        return { intent: 0, intentName: 'handoff', confidence: 0.85, source: 'action_veto' };
+      }
+      logger.info('[Classify] Action veto denied by route envelope — keeping quick lane', {
+        llmIntent: result.intent, guessedIntent: _guessedIntent, taskType: _rd?.taskType,
         inputPreview: englishText.substring(0, 60),
       });
-      return { intent: 0, intentName: 'handoff', confidence: 0.85, source: 'action_veto' };
     }
+    return _vetoQuick(result);
+  };
+  const _vetoQuick = (result) => {
     // Control-vocab guard: intent 4 can only abort a RUNNING task — the
     // utterance must carry control vocabulary ("cancel", "stop", "nevermind").
     // Observed: "use nylas to delte it" drew control_signal → the lane has no
@@ -510,7 +578,7 @@ async function classify(englishText, conversationContext, opts = {}) {
     return result;
   };
 
-  const _adoptKeyword = (reason) => {
+  const _adoptKeyword = async (reason) => {
     // Context-dependency guard: a prompt whose subject is a pronoun with no
     // named referent ("how long has he been in office") can only be answered
     // after resolveReferences binds the pronoun — a standalone quick tier
@@ -532,7 +600,44 @@ async function classify(englishText, conversationContext, opts = {}) {
       confidence: keywordHit.confidence, reason,
       inputPreview: englishText.substring(0, 60),
     });
-    return _vetoQuick({ ...keywordHit, source: 'keyword_fallback' });
+    return _vetoQuickGated({ ...keywordHit, source: 'keyword_fallback' });
+  };
+
+  // Keyword-vs-model arbitration — a lexical hit may PROPOSE a quick lane,
+  // but overriding the model's successfully-parsed pick needs a semantic
+  // verdict (AGENTS.md): "which lane" is a judgment a heuristic can't make.
+  // Observed: "Do you still know the path to the thinkdrop project" — model
+  // picked handoff, the do-you keyword vetoed it to general_quick, which
+  // answered blind and offered a computer search it couldn't serve. The
+  // verdict asks the real question (needs tools/memory vs answerable as
+  // chat); fail-open keeps the MODEL's pick — a wrong demotion is worse
+  // than a chat message sent to the graph. Used ONLY when the model
+  // answered intent 0 — deterministic keyword still fills llm_unparseable /
+  // llm_empty / llm_error holes below (no model answer to protect).
+  const _adoptKeywordGated = async (reason) => {
+    // Context-dependent prompts resolve to handoff either way — skip the call.
+    if (isContextDependent(englishText) && keywordHit.intent !== 4) return _adoptKeyword(reason);
+    try {
+      const _v = await require('./decision.cjs').confirmJudgment({
+        site: 'keyword-veto',
+        question: 'Does this message need tools, memory retrieval, file/device access, or a real action to answer correctly (GRAPH), or can it be answered directly as chat or general knowledge (CHAT)?',
+        options: ['GRAPH', 'CHAT'],
+        state: _ds.buildDecisionState({
+          site: 'keyword-veto',
+          message: _askText,
+          history: String(conversationContext || '').split('\n').filter(Boolean).slice(-3),
+        }),
+      });
+      logger.info(`[semantic-gate-evidence] site=keyword-veto verdict=${_v || 'null'} input=${englishText.substring(0, 60)}`);
+      if (_v === 'CHAT') return _adoptKeyword(reason);
+      logger.info('[Classify] Keyword veto blocked by verdict — keeping handoff', {
+        wouldBe: keywordHit.intentName, reason, verdict: _v,
+        inputPreview: englishText.substring(0, 60),
+      });
+      return { intent: 0, intentName: 'handoff', confidence: 0.85, source: 'keyword_veto_denied' };
+    } catch (_) {
+      return { intent: 0, intentName: 'handoff', confidence: 0.7, source: 'keyword_veto_denied' };
+    }
   };
 
   // ── Missing-details → planning (decision-model check) ──────────────────────
@@ -544,7 +649,7 @@ async function classify(englishText, conversationContext, opts = {}) {
   // for intent 0/5 only, one call, fail-open to the original pick.
   const _missingDetailCheck = async (result) => {
     if (!result || (result.intent !== 0 && result.intent !== 5)) return result;
-    if (_isQuestion || englishText.trim().split(/\s+/).length < 3) return result;
+    if (_isQuestion || _askIsQuestion || englishText.trim().split(/\s+/).length < 3) return result;
     if (!decision.decisionEnabled()) return result;
     // Resolvable-referent skip — "the current web page/screen/tab" IS the
     // target; the stategraph resolves it against live context, so nothing is
@@ -571,7 +676,7 @@ async function classify(englishText, conversationContext, opts = {}) {
         question: 'This user statement would be executed or stored as-is. Is it missing details needed to act correctly (missing target, date, recipient, or subject) OR ambiguous about what the user wants done? Answer NO for clear instructions, questions, and complete statements — including actions on an artifact already established in the conversation (e.g. "delete that event I just set" after an event was created is complete), and actions whose target is the user\'s current page, screen, tab, site, or window (e.g. "scroll to the bottom of the current web page" is complete — the open page is the target).',
         state: _ds.buildDecisionState({
           site: 'missing-detail',
-          message: englishText,
+          message: _askText,
           history: _ctxStr.split('\n').filter(Boolean).slice(-3),
         }),
       });
@@ -654,13 +759,13 @@ async function classify(englishText, conversationContext, opts = {}) {
           // quick-intent domain and outweighs a forced single-digit guess
           // that landed on the catch-all. Never vetoes a specific
           // non-zero intent — the LLM remains primary for real routing.
-          if (intent === 0 && keywordHit) return _adoptKeyword('veto_llm_handoff');
+          if (intent === 0 && keywordHit) return _adoptKeywordGated('veto_llm_handoff');
           logger.info('[Classify] Force-prompt result', {
             intent, intentName: info.name, provider, text: trimmed,
             inputPreview: englishText.substring(0, 60),
             ...(attempt > 1 ? { attempt } : {}),
           });
-          return _vetoQuick({ intent, intentName: info.name, confidence: 0.92, source: attempt > 1 ? 'force_prompt_retry' : 'force_prompt' });
+          return _vetoQuickGated({ intent, intentName: info.name, confidence: 0.92, source: attempt > 1 ? 'force_prompt_retry' : 'force_prompt' });
         }
         // LLM returned something but not a clean number — try to extract.
         // Only trust a SINGLE distinct digit: providers sometimes echo a
@@ -673,11 +778,11 @@ async function classify(englishText, conversationContext, opts = {}) {
           const intent = parseInt(uniqueDigits[0], 10);
           const info = INTENTS[intent];
           if (info) {
-            if (intent === 0 && keywordHit) return _adoptKeyword('veto_llm_handoff');
+            if (intent === 0 && keywordHit) return _adoptKeywordGated('veto_llm_handoff');
             logger.info('[Classify] Force-prompt (extracted)', {
               intent, intentName: info.name, provider, raw: trimmed,
             });
-            return _vetoQuick({ intent, intentName: info.name, confidence: 0.75, source: 'force_prompt_extracted' });
+            return _vetoQuickGated({ intent, intentName: info.name, confidence: 0.75, source: 'force_prompt_extracted' });
           }
         }
         // CoT-leaking providers (gemini-free) reason at length but end with the
@@ -691,12 +796,12 @@ async function classify(englishText, conversationContext, opts = {}) {
           const intent = parseInt(tailMatch[1], 10);
           const info = INTENTS[intent];
           if (info) {
-            if (intent === 0 && keywordHit) return _adoptKeyword('veto_llm_handoff');
+            if (intent === 0 && keywordHit) return _adoptKeywordGated('veto_llm_handoff');
             logger.info('[Classify] Force-prompt (tail-extracted)', {
               intent, intentName: info.name, provider,
               rawTail: trimmed.slice(-80),
             });
-            return _vetoQuick({ intent, intentName: info.name, confidence: 0.7, source: 'force_prompt_tail' });
+            return _vetoQuickGated({ intent, intentName: info.name, confidence: 0.7, source: 'force_prompt_tail' });
           }
         }
         logger.warn('[Classify] Force-prompt returned unparseable response', { raw: trimmed, provider, attempt });
@@ -738,12 +843,12 @@ async function classify(englishText, conversationContext, opts = {}) {
       logger.warn('[Classify] Adaptive: both legs failed — defaulting to handoff');
       result = { intent: 0, intentName: 'handoff', confidence: 0.3, source: 'adaptive_none' };
     }
-    if (result.intent === 0 && keywordHit) return _missingDetailCheck(_adoptKeyword('veto_llm_handoff'));
+    if (result.intent === 0 && keywordHit) return _missingDetailCheck(await _adoptKeywordGated('veto_llm_handoff'));
     logger.info('[Classify] Adaptive result', {
       intent: result.intent, intentName: result.intentName, source: result.source,
       inputPreview: englishText.substring(0, 60),
     });
-    return _missingDetailCheck(_vetoQuick(result));
+    return _missingDetailCheck(await _vetoQuickGated(result));
   }
 
   // Local-first: authoritative when enabled and not in shadow mode.
@@ -751,13 +856,13 @@ async function classify(englishText, conversationContext, opts = {}) {
     try {
       const li = await _localIntent();
       if (li != null) {
-        if (li === 0 && keywordHit) return _adoptKeyword('veto_llm_handoff');
+        if (li === 0 && keywordHit) return _adoptKeywordGated('veto_llm_handoff');
         const info = INTENTS[li];
         logger.info('[Classify] Local decision result', {
           intent: li, intentName: info.name,
           inputPreview: englishText.substring(0, 60),
         });
-        return _missingDetailCheck(_vetoQuick({ intent: li, intentName: info.name, confidence: 0.9, source: 'decision_local' }));
+        return _missingDetailCheck(await _vetoQuickGated({ intent: li, intentName: info.name, confidence: 0.9, source: 'decision_local' }));
       }
       logger.debug('[Classify] Local decision unavailable — falling back to remote');
     } catch (e) {

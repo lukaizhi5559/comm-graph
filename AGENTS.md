@@ -1,5 +1,39 @@
 # comms-graph conventions
 
+## RouteDecision envelope — ONE task classification per turn
+
+`src/route-decision.cjs` (`classifyRoute`) runs stategraph's `classifyTask`
+ONCE at ingress, in parallel with `classify()`. The envelope `{taskType,
+suggestedIntent, targetService, isFollowUp, planShape, …, lane}` is the
+authoritative "what is this prompt" — downstream layers consume it, they do
+not re-derive intent:
+
+- **Executor lanes are vetoed by it.** intent 7 (screen) / 8 (web_search) are
+  executors with context-free surfaces — a regex pin alone cannot put a
+  task-shaped, follow-up, service-named, or clarification-needed prompt on
+  them (observed: "search for it" → public SERP for a local-filesystem
+  question).
+- **The handoff carries it** via `routeDecision` → `state._taskClassification`
+  — `parseIntentV2`, `gatherPlanContext`, `resolveReferencesV2` consume the
+  seeded verdict. `planShape: 'single'` suppresses `no_skill_coverage`
+  escalation: a single local deliverable runs the bounded planner instead of
+  a named-plan grill.
+- **Lexical layers are hints only.** `intentGuesser`, `classifier-fallback`,
+  and guard regexes PROPOSE — a lane override on lexical evidence alone needs
+  either the envelope's structural answer or a `confirmJudgment` verdict
+  (sites: `keyword-veto`, `offer-echo`, `selection-veto`, `pin-escape`,
+  `plan-referent`). Never add another independent intent classifier.
+- **Ambiguity favors the low-blast-radius lane.** When "produce text" vs
+  "act on a service" is undecidable (e.g. highlight + "reply to this"), pick
+  drafting — `generalQuick`'s 0-sentinel self-corrects to handoff; a wrong
+  browser takeover cannot be undone (observed: LinkedIn tab driven+closed).
+- **Loop-back settle contract.** A `needs_plan`/`plan_update` task is
+  pseudo-terminal — `taskJournal.settleEscalation(id, status)` moves it to a
+  real terminal status when the replan resolves (run/fallback/fail/cancel);
+  `/plan.replanning.end` + task-scoped `plan_replanning_end` progress clear
+  the card. `updateTask` correctly refuses these statuses — only the
+  loop-back may settle them.
+
 ## Turn facts — never re-derive, never match raw text
 
 `shared/turn-facts.cjs` (`computeTurnFacts`) is the single derivation of "what
@@ -28,3 +62,24 @@ is this turn" — same pattern as stategraph's `taskFacts`
   capability select, spec-completeness, memory attributes).
 - `findPlans` fuzzes on any token overlap — reroute/probe callers require
   `score >= 6`.
+
+## requestText — judgments read the ask, matchers read the turn
+
+`facts.requestText` (turn-facts.cjs, `deriveRequestText`) is the segment of
+`userText` carrying the user's actual request — the trailing ask in a
+paste+question turn, or the whole text when it's short/single-sentence.
+
+- Matchers/candidates still run on full `userText` (a pasted "if I go to…"
+  SHOULD generate a rule candidate; a pasted "commit messages" SHOULD
+  generate a tool candidate).
+- Verdicts about intent read the ASK: `confirmJudgment` state must be
+  `requestText` — or `_focusState(facts, evidenceRe)` when the matched
+  evidence sentence should stay in view — never whole `userText` /
+  `englishText`. Whole-text state on a paste+question turn judges the pasted
+  material as intent (observed: pasted audit containing "AGENTS.md rule" +
+  "what does envelope mean" → rule-author verdict YES → guardian dead end).
+- Deterministic token checks that gate a lane (`logMention`, plan-ref entry)
+  likewise require the token inside `requestText`.
+- Content judgments are exempt — "does required info exist anywhere" sees
+  the full turn (spec-completeness: a pasted address legitimately supplies a
+  missing recipient).
