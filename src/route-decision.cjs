@@ -186,4 +186,4 @@ function serializeDecision(tc) {
   return out;
 }
 
-module.exports = { classifyRoute, deriveLane, canSkipCapabilityGate, serializeDecision, SERVICE_TASK_TYPES, LANE_BY_INTENT, fetchExtSessions: _fetchExtSessions };
+module.exports = { classifyRoute, deriveLane, canSkipCapabilityGate, serializeDecision, SERVICE_TASK_TYPES, LANE_BY_INTENT, fetchExtSessions: _fetchExtSessions, _llmBackend };

@@ -47,6 +47,20 @@ function _nounMatchRe(message) {
   return null;
 }
 
+/** A "message/draft/post/email" referent can only bind an artifact a comm or
+ *  browser surface could own — local/system task output ("commit messages",
+ *  build logs) is never the thing on screen to reply to (observed: "this
+ *  message" bound to a git-status shell run; the injected referent then
+ *  poisoned classification into local_file). */
+const _COMM_NOUN_RE = /\b(messages?|msgs?|drafts?|posts?|tweets?|e-?mails?|emails?|texts?|dms?|comments?|replies|invites?|invitations?)\b/i;
+const _NON_COMM_AGENTS = new Set([
+  'shell', 'shell.run', 'fs.read', 'file.watch', 'file.bridge', 'web.crawl',
+  'web.agent', 'system.introspect', 'doc.read', 'media.transcribe',
+  'image.analyze', 'screen.capture', 'screen.display', 'terminal.agent',
+  'cli.agent', 'tool.discover', 'provider.discovery', 'skill.review',
+  'skillcreator.skill', 'external.skill',
+]);
+
 /** Pull the artifact's identity out of a done task: quoted title from the
  *  prompt, `ID:`/`When:`/`Title:` lines from result or step outputs. */
 function _describe(t) {
@@ -80,11 +94,21 @@ function resolve(text, recentTasks) {
   const now = Date.now();
   // Newest-first — the referent of "that event I just set" is the most recent
   // matching creation (getRecentTasks already sorts doneAt desc).
+  const _commNoun = _COMM_NOUN_RE.test(msg);
   const candidates = tasks
     .filter(t => t && t.status === 'done' && t.agentId && ARTIFACT_CREATE_RE.test(String(t.prompt || '')));
   for (const t of candidates) {
+    if (_commNoun && _NON_COMM_AGENTS.has(String(t.agentId).toLowerCase())) continue;
     if (nounRe) {
-      if (!nounRe.test(String(t.prompt || ''))) continue;
+      // Data-compound tails ("commit messages", "log entries", "error
+      // messages") are the create task's output vocabulary, not the
+      // artifact's noun — the same tail exclusion resolveExplicitTool
+      // applies to tool pins, applied to the CANDIDATE's prompt here.
+      let _hay = String(t.prompt || '');
+      for (const w of _dataCompoundTails(_hay)) {
+        _hay = _hay.replace(new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi'), ' ');
+      }
+      if (!nounRe.test(_hay)) continue;
     } else if (!(typeof t.doneAt === 'number' && now - t.doneAt <= BARE_DEICTIC_WINDOW_MS)) {
       continue; // bare "it" — only a freshly-created artifact qualifies
     }

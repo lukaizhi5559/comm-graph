@@ -299,8 +299,26 @@ async function _bakeUrlFirstArgs(steps, taskText) {
   return steps;
 }
 
-async function _compileTaskSteps(prompt, agentId, { conversationContext = null, sessionId = null } = {}) {
+async function _compileTaskSteps(prompt, agentId, { conversationContext = null, sessionId = null, routeDecision = null } = {}) {
   try {
+    // Deterministic templates before the LLM stepgen — a force-classified
+    // plan (page_nav_scan, reply_draft, url_open…) is verbatim-validated and
+    // needs no generation. Without this the stepgen re-invents steps for
+    // shapes the catalog already covers (observed: "give me a response to the
+    // message" compiled into "Find and open the conversation" → url.first
+    // browser driving; the RouteDecision envelope carries the same tc fields
+    // the template classifier reads).
+    try {
+      const { forceClassifyLocalPlan } = require('../../stategraph-module/src/utils/localPlanTemplates.js');
+      const { _llmBackend } = require('./route-decision.cjs');
+      const hit = await forceClassifyLocalPlan(prompt, routeDecision || null, _llmBackend || null, logger);
+      if (hit && Array.isArray(hit.skillPlan) && hit.skillPlan.length) {
+        logger.info(`[Handoff] deterministic template ${hit.template} → ${hit.skillPlan.length} compiled step(s)`);
+        return hit.skillPlan;
+      }
+    } catch (_detErr) {
+      logger.info(`[Handoff] deterministic compile skipped — ${_detErr.message}`);
+    }
     const { _generateTaskSteps } = require('./nodes/planning.cjs');
     const { normalizeTaskStepsAsync, agentFamilyMismatch } = require('../../shared/plan-steps.cjs');
     const { validatePlanSteps } = require('../../shared/skill-contracts.cjs');
@@ -488,7 +506,7 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
     const _canCompile = !deterministicPlan && !planId && !planTask && !thoughtContext
       && !(Array.isArray(priorResults) && priorResults.length)
       && !(Array.isArray(refs) && refs.length);
-    const _compiled = _canCompile ? await _compileTaskSteps(englishPrompt, agentId, { conversationContext, sessionId }) : null;
+    const _compiled = _canCompile ? await _compileTaskSteps(englishPrompt, agentId, { conversationContext, sessionId, routeDecision }) : null;
     if (_compiled) {
       logger.info(`[Handoff] Compiled ${_compiled.length} steps at dispatch — task ${_compiled.map(s => s.skill).join(' → ').slice(0, 160)}`);
       updateTask(taskId, 'queued', { compiledSteps: _compiled.length });

@@ -301,11 +301,35 @@ async function classify(englishText, conversationContext, opts = {}) {
 
   // Conversation-recall questions always need the full transcript search —
   // hand off deterministically instead of trusting the LLM classifier.
+  // Exception: the regex can match inside a PASTED payload — a quoted draft
+  // saying "the message we sent" / "as we discussed" is content, not a
+  // transcript question (observed: "I need this message updated — Here's a
+  // sharp, professional response…" pinned handoff and never drafted). When
+  // draft/edit verbs coexist, confirm semantically before pinning — a lane
+  // override from a lexical match gets a verdict (AGENTS.md).
   if (CONVERSATION_RECALL_RE.test(englishText)) {
-    logger.info('[Classify] Conversation-recall guard → handoff', {
+    const _draftish = /\b(draft|polish|rewrite|re-?write|update|improve|fix(?:\s+up)?|edit|write|compose|respond|reply|response|professional|sharper|concise|rephrase|paraphrase|proofread)\b/i.test(englishText);
+    let _pinRecall = true;
+    if (_draftish) {
+      try {
+        const _v = await require('./decision.cjs').confirmJudgment({
+          site: 'recall-vs-draft',
+          question: 'Does the user want you to inspect or recall the CHAT TRANSCRIPT itself (your prior conversation together), or are they asking you to draft/edit/polish message content (a reply, an email, a pasted draft)?',
+          state: _ds.buildDecisionState({ site: 'recall-vs-draft', message: englishText }),
+        });
+        logger.info(`[semantic-gate-evidence] site=recall-vs-draft verdict=${_v || 'null'} input=${englishText.substring(0, 60)}`);
+        if (_v === 'NO') _pinRecall = false;
+      } catch (_) { /* verdict unavailable — pin stays */ }
+    }
+    if (_pinRecall) {
+      logger.info('[Classify] Conversation-recall guard → handoff', {
+        inputPreview: englishText.substring(0, 60),
+      });
+      return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'conversation_recall_guard' };
+    }
+    logger.info('[Classify] Recall guard released — drafting request, not a transcript question', {
       inputPreview: englishText.substring(0, 60),
     });
-    return { intent: 0, intentName: 'handoff', confidence: 0.95, source: 'conversation_recall_guard' };
   }
 
   // Generated deliverables — slideshows, 3D scenes, resumes/docs — are

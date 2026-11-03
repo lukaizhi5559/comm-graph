@@ -139,4 +139,49 @@ assert(!(e && e.agentId === 'mcp.brave-search.agent'), `"web search" must not pi
 e = resolveExplicitTool('search for flights to hong kong');
 assert(!(e && e.agentId === 'mcp.brave-search.agent'), `"search for" must not pin mcp.brave-search.agent, got ${e && e.agentId}`);
 
+// ── Comm-noun gating + candidate compound-tail exclusion ────────────────────
+// Observed: "this message" bound to a git-status shell run whose prompt said
+// "write good commit messages" — the injected referent then poisoned
+// classification into local_file. Two guards fix it:
+//   (a) local/system agents can't own comm artifacts;
+//   (b) data-compound tails in the CANDIDATE's prompt ("commit messages")
+//       are output vocabulary, not the artifact's noun.
+const gitShellTask = {
+  id: 'task_git1',
+  prompt: 'commit all the changes you did and write good commit messages',
+  agentId: 'shell',
+  status: 'done',
+  doneAt: NOW - 2 * 60 * 1000,
+  createdAt: NOW - 2 * 60 * 1000,
+  result: 'nothing to commit, working tree clean',
+  artifacts: { steps: [] },
+};
+
+// (a) A shell task can never own a "message" the user wants edited.
+r = resolve('update this message', [gitShellTask]);
+assert.strictEqual(r, null, 'shell task must not own a "message" referent');
+r = resolve('delete that message', [gitShellTask]);
+assert.strictEqual(r, null, 'shell task must not own a "message" referent (delete)');
+
+// (b) Even a comm-capable agent's "commit messages" is output vocabulary —
+//     the tail exclusion removes it before the noun test.
+r = resolve('update this message', [{ ...gitShellTask, agentId: 'desktop.agent' }]);
+assert.strictEqual(r, null, '"commit messages" in task prompt is output vocabulary, not a message artifact');
+
+// Positive control — a real comm artifact still binds.
+const gmailDraft = {
+  id: 'task_g1',
+  prompt: 'create a draft email titled "Q3 update" in gmail',
+  agentId: 'gmail.agent',
+  status: 'done',
+  doneAt: NOW - 2 * 60 * 1000,
+  createdAt: NOW - 2 * 60 * 1000,
+  result: 'draft created',
+  artifacts: { steps: [] },
+};
+r = resolve('update this draft', [gmailDraft]);
+assert(r && r.agentId === 'gmail.agent', `gmail draft should bind, got ${r && r.agentId}`);
+r = resolve('update this message', [gmailDraft]);
+assert(r && r.agentId === 'gmail.agent', 'comm artifact still binds for a comm-capable agent');
+
 console.log('artifactReferent.test.cjs: all assertions passed');
