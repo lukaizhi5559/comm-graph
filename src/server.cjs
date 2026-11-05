@@ -59,7 +59,7 @@ const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = req
 const taskJournal = require('./taskJournal.cjs');
 const artifactReferent = require('./artifactReferent.cjs');
 const agentLock = require('./agentLock.cjs');
-const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT } = require('./route-decision.cjs');
+const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT, isPublicWebResearch } = require('./route-decision.cjs');
 const { askEarly } = require('./llm-providers.cjs');
 
 // ── Guardian/trigger rules — entry guard + passphrase-gated management ───────
@@ -165,7 +165,7 @@ const _RULE_PHRASE_RES = [
 const _isRulePhrase = (t) => _RULE_PHRASE_RES.some((re) => re.test(t));
 // Weak markers — not enough to enter the lane alone, but worth a semantic
 // verdict (AGENTS.md: lexical candidates → confirmJudgment for lane overrides).
-const _RULE_WEAK_RE = /\brules?\b|\bevery\s+time\b|\bwhenever\b|\beach\s+time\b|\bnext\s+time\b|\b(?:alert|remind|notify|tell|warn|ping)\s+me\s+when\b/i;
+const _RULE_WEAK_RE = /\brules?\b|\bevery\s+time\b|\bwhenever\b|\beach\s+time\b|\bnext\s+time\b|\b(?:alert|remind|notify|tell|warn|ping)\s+me\s+when\b|\b(?:block|filter|restrict|censor)\s+(?:a\s+|an\s+|the\s+|any\s+|all\s+|every\s+|me\s+)?(?:site|sites|website|websites|page|pages|screen|app|apps|content)\b/i;
 
 // ── Paste-scoped judgment state ─────────────────────────────────────────────
 // A paste+question turn ("<quoted block> … what does X mean?") makes whole-text
@@ -222,7 +222,13 @@ const _RULE_PARSE_SYS = [
   '  hostMatch: bare domain ("tiktok.com"), urlMatch: URL substring or "re:<regex>",',
   '  appName: exact app name, fileMatch: file path/name substring or "re:<regex>",',
   '  titleMatch: window-title regex, ocrMatch: regex over on-screen text,',
-  '  promptMatch: regex over future requests (guard-style rules)',
+  '  (regexes match case-insensitively already — never emit inline flags like (?i))',
+  '  promptMatch: regex over future requests (guard-style rules),',
+  '  semanticMatch: free-text content-scene a model judges over the request or visible screen',
+  '    content — use ONLY when the condition is a concept no keyword/regex can enumerate',
+  '    ("sexual or violent content", "gambling", "jump scares", "distracting videos"),',
+  '  semanticExempt: content classes sharing the vocabulary that do NOT count',
+  '    (the user\'s "but not X" — e.g. "news reporting", "educational text")',
   'then.action: "block" (prevent), "ask" (require passphrase), "notify" (screen note),',
   '  "show_card" (screen display — add "kind":"emoji" + "emoji":"😄" + "durationMs":4000 for emoji),',
   '  "enqueue_task" (run a task — "prompt" is the literal task instruction; may use {{host}}/{{url}}/{{appName}} slots)',
@@ -230,10 +236,11 @@ const _RULE_PARSE_SYS = [
   '- "send/email/notify someone" → enqueue_task with a complete prompt ("send an email to X saying \'Y\'")',
   '- "show emoji/icon on screen" → show_card with kind emoji',
   '- "block/don\'t allow/restrict" → block; "next time"/"once" → fireOnce:true',
-  '- site/app/file rules → seam "observation"; prompt/request rules → seam "entry" or omit',
+  '- site/app/file/content rules → seam "observation"; prompt/request rules → seam "entry" or omit',
+  '- concept/topic conditions ("content about X", "sites with Y") → semanticMatch, not ocrMatch',
 ].join('\n');
 
-const _WHEN_KEYS = ['hostMatch', 'urlMatch', 'appName', 'fileMatch', 'titleMatch', 'ocrMatch', 'promptMatch', 'service', 'intent', 'entities', 'varMatch'];
+const _WHEN_KEYS = ['hostMatch', 'urlMatch', 'appName', 'fileMatch', 'titleMatch', 'ocrMatch', 'promptMatch', 'semanticMatch', 'semanticExempt', 'service', 'intent', 'entities', 'varMatch'];
 const _THEN_KEYS = ['action', 'title', 'body', 'msg', 'reason', 'prompt', 'kind', 'emoji', 'durationMs', 'mood', 'severity', 'deterministicPlan', 'agentId'];
 
 // Observation matchers — presence of any of these means the rule watches the
@@ -296,6 +303,7 @@ function _describeRule(rule) {
   if (w.titleMatch) conds.push(`title matches /${w.titleMatch}/`);
   if (w.ocrMatch) conds.push(`screen text matches /${w.ocrMatch}/`);
   if (w.promptMatch) conds.push(`prompts match /${w.promptMatch}/`);
+  if (w.semanticMatch) conds.push(`content matches "${w.semanticMatch}"${w.semanticExempt ? ` (except ${w.semanticExempt})` : ''}`);
   const t = rule.then || {};
   let act;
   switch (t.action) {
@@ -336,6 +344,7 @@ async function _authorRule(text) {
   );
 }
 const _decision = require('./decision.cjs');
+const _serviceAvail = require('../../shared/service-availability.cjs');
 
 // ── Thought engine prompt producer ─────────────────────────────────────────────
 // Fire-and-forget POST of each user prompt to personality-service so the
@@ -1020,6 +1029,9 @@ const MAX_HISTORY = 6;
 function _addTurn(userText, assistantText, intent) {
   _conversationHistory.push({
     user: userText.substring(0, 200),
+    // The ask is canonicalized at write time — downstream judgments about
+    // this turn read requestText, not the full paste (AGENTS.md).
+    requestText: deriveRequestText(userText || '').substring(0, 200),
     assistant: (assistantText || '').substring(0, 200),
     intent, ts: Date.now(),
   });
@@ -1029,7 +1041,7 @@ function _addTurn(userText, assistantText, intent) {
 function _formatContext() {
   return _conversationHistory
     .slice(-3)
-    .map(t => `User: ${t.user}\nAssistant: ${t.assistant || ''}`)
+    .map(t => `User: ${t.requestText || t.user}\nAssistant: ${t.assistant || ''}`)
     .join('\n');
 }
 
@@ -1083,7 +1095,16 @@ function _listSessionMessages(sessionId) {
             .filter(m => m.sender !== 'system')
             .slice(0, 12)
             .reverse()
-            .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}: ${(m.text || m.content || '').substring(0, 200)}`)
+            .map(m => {
+              const full = m.text || m.content || '';
+              // History user turns carry their persisted ask — a turn whose
+              // prompt was paste+question judges as the question, not the
+              // paste (judgments read requestText — AGENTS.md).
+              const scoped = m.sender === 'user'
+                ? (m.metadata?.requestText || deriveRequestText(full) || full)
+                : full;
+              return `${m.sender === 'user' ? 'User' : 'Assistant'}: ${scoped.substring(0, 200)}`;
+            })
             .join('\n');
           resolve({ sessionId, history: formatted || null });
         } catch (_) { resolve({ sessionId, history: null }); }
@@ -1109,6 +1130,15 @@ let _lastSessionId = null;
 // When pinnedSessionId is set (task recall / "Continue Thread"), routing is
 // skipped entirely — the session is authoritative regardless of topic drift.
 function _fetchConversationHistory(userText, pinnedSessionId = null) {
+  // COMMS_NO_HISTORY=1 — tests must be hermetic: no session.route calls and no
+  // live history reads (observed: the user's real session history made
+  // offer-echo fire mid-test → flaky confirmJudgment call counts; the fix
+  // gates reads AND _logConversationTurn writes). In-memory _addTurn history
+  // still flows through _formatContext for tests to seed deterministically.
+  if (process.env.COMMS_NO_HISTORY === '1') return Promise.resolve(null);
+  // Conversation service toggled off in the Services panel — skip the
+  // session.route round-trip entirely; caller falls back to in-memory turns.
+  if (_serviceAvail.isServiceOff('conversation')) return Promise.resolve(null);
   if (pinnedSessionId) {
     return _listSessionMessages(pinnedSessionId);
   }
@@ -1156,8 +1186,13 @@ function _fetchConversationHistory(userText, pinnedSessionId = null) {
 // Mirrors the stategraph's logConversation.js pattern. Only called for quick
 // intents (general_quick, memory_quick, memory_store) — handoff intents are
 // logged by the stategraph's logConversation node.
-function _logConversationTurn(userText, assistantText, intentName, preRoutedSessionId, searchMeta) {
+function _logConversationTurn(userText, assistantText, intentName, preRoutedSessionId, searchMeta, requestText) {
   if (!CONV_API_KEY) return; // no key — skip silently
+  // COMMS_NO_HISTORY=1 — test harnesses call processMessage in-process; without
+  // this gate stub replies write into the USER'S live session history
+  // (observed: raw RULE_JSON stub echoes rendered as real assistant turns in
+  // the ResultsFeed — looked like the app authoring rules it never committed).
+  if (process.env.COMMS_NO_HISTORY === '1') return;
   const ts = new Date().toISOString();
   // Search answers carry display metadata — persist it so the feed can
   // rehydrate cards/pills/engine on reload (same job the stategraph's task
@@ -1197,7 +1232,7 @@ function _logConversationTurn(userText, assistantText, intentName, preRoutedSess
   // userText may be null — a deduped completion logs only the real result.
   if (preRoutedSessionId) {
     if (userText) {
-      _post('message.add', { sessionId: preRoutedSessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+      _post('message.add', { sessionId: preRoutedSessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts, ...(requestText ? { requestText } : {}) } });
     }
     if (assistantText) {
       _post('message.add', { sessionId: preRoutedSessionId, text: assistantText, sender: 'assistant', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts, ..._searchMd } });
@@ -1225,7 +1260,7 @@ function _logConversationTurn(userText, assistantText, intentName, preRoutedSess
         const parsed = JSON.parse(raw);
         const sessionId = (parsed.data || parsed)?.sessionId;
         if (!sessionId) return;
-        _post('message.add', { sessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts } });
+        _post('message.add', { sessionId, text: userText, sender: 'user', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts, ...(requestText ? { requestText } : {}) } });
         if (assistantText) {
           _post('message.add', { sessionId, text: assistantText, sender: 'assistant', metadata: { source: 'comms-graph', intent: intentName, timestamp: ts, ..._searchMd } });
         }
@@ -1355,11 +1390,20 @@ async function processMessage(args) {
   // go to…" vocabulary in pasted material is not intent (observed: pasted
   // audit text + "what does envelope mean" → rule-author YES → dead end).
   const _RULE_EVIDENCE_RE = /\brules?\b|\b(?:if|when|whenever|every\s+time|each\s+time|next\s+time)\b/i;
+  // Interrogative-led requests are information asks, not setup commands — the
+  // 0.8b verdict can't hold the how-to/author distinction reliably (YESes on
+  // "how do I block sites in Safari?"), so leading question-words skip the
+  // weak-marker gate deterministically. "Can you…" stays — polite imperative.
+  const _RULE_QLEAD_RE = /^\s*(?:how\b|what\b|which\b|where\b|why\b|who\b|whom\b|whose\b|is\s+there\b|are\s+there\b|is\s+it\b|does\b|do\s+you\s+know\b)/i;
   const _ruleCheck = async () => {
     const focus = _focusState(preFacts, _RULE_EVIDENCE_RE);
     const verdict = await _decision.confirmJudgment({
       site: 'rule-author',
-      question: 'Is the user\'s request — ignoring any quoted or pasted material they are asking ABOUT — asking to create a persistent conditional rule (when X happens, do Y)?',
+      // Example-anchored: 0.8b models separate cases on concrete contrasts,
+      // not abstract descriptions (measured live: 5/7 correct vs 0/4 on the
+      // abstract form). Covers standing policies, not just if-then grammar —
+      // "bring up block screen for any site with X" verdicted NO → planning.
+      question: 'Is the user\'s request — ignoring any quoted or pasted material they are asking ABOUT — instructing ThinkDrop to create a persistent rule or standing automated policy (watch and react automatically)? YES examples: "block any site with X", "remind me whenever Y", "show Z when I visit W". NO examples: "how do I block sites", "what is the best blocker", "block this page now".',
       state: focus,
     });
     return verdict === 'YES' ? focus : null;
@@ -1367,11 +1411,16 @@ async function processMessage(args) {
   if (_rulesMod && _isRulePhrase(_userText)) {
     // The ASK itself phrased conditionally → author directly (cheap path). A
     // match that only exists in pasted/quoted material → the verdict decides
-    // on the scoped state first.
-    const ok = _isRulePhrase(preFacts.requestText || _userText) ? _userText : await _ruleCheck();
+    // on the scoped state first — unless the ask is interrogative-led: a
+    // question-shaped request is answered, never authored (paste's marker
+    // can't convert "what does X mean" into a rule setup).
+    const _reqText = preFacts.requestText || _userText;
+    const ok = _isRulePhrase(_reqText) ? _userText
+      : _RULE_QLEAD_RE.test(_reqText) ? null
+      : await _ruleCheck();
     if (ok) return _authorRule(ok);
   }
-  if (_rulesMod && _RULE_WEAK_RE.test(_userText)) {
+  if (_rulesMod && _RULE_WEAK_RE.test(_userText) && !_RULE_QLEAD_RE.test(preFacts.requestText || _userText)) {
     const ok = await _ruleCheck();
     if (ok) return _authorRule(ok);
   }
@@ -1552,7 +1601,30 @@ async function processMessage(args) {
     // calendar" still need the graph even with a selection riding along. The
     // guesser is a free synchronous regex pre-check, no LLM cost.
     const { guessedIntent: _selGuess } = intentGuesser.guess(classifyText, { hasSelectionContext });
-    if (GRAPH_ONLY_INTENTS.has(_selGuess)) {
+    // Public-search escape — a highlight + "tell me about X, search online"
+    // is a standalone SERP lookup wearing a selection, not text-QA about the
+    // highlight. The envelope decides on structure: lane=web_search means no
+    // service, no DOM work, no follow-up referent — send it to the express
+    // executor before the drafting default below swallows it into
+    // general_quick (observed: Gmail highlight + smoothstack lookup →
+    // general_quick → routing-promise → page_nav_scan browser takeover).
+    if (_selGuess === 'web_search') {
+      _routeDecision = _routeDecision || await _routeDecisionP;
+      if (_routeDecision?.lane === 'web_search') {
+        logger.info('[Process] Selection + public web research → web_search lane', {
+          taskType: _routeDecision.taskType, webAccessMode: _routeDecision.webAccessMode || null,
+        });
+        intent = 8;
+        intentName = 'web_search';
+        confidence = 0.9;
+        classifySource = 'route_decision';
+      } else {
+        intent = 1;
+        intentName = 'general_quick';
+        confidence = 0.9;
+        classifySource = 'selection_fastlane';
+      }
+    } else if (GRAPH_ONLY_INTENTS.has(_selGuess)) {
       // The guesser is only a PROPOSAL — a lexical match can't tell "do
       // something with a service" from "produce text using the highlight"
       // (observed: a LinkedIn thread highlight + "I need a response to the
@@ -1690,7 +1762,23 @@ async function processMessage(args) {
           { ruleId: rule.id, guardianAction: 'block' }
         );
       };
-      const _hits = _rulesMod.evaluate(_guardCtx, 'entry').filter(r => r.id !== _bypass);
+      const _guardJudge = async (frame, exempt, ctx) => {
+        const r = await _decision.askDecision([
+          {
+            id: 'frame', type: 'choice',
+            question: `Does this request present "${frame}" as what the user is actually asking for — not merely mentioning, quoting, or discussing it?`,
+            options: ['YES', 'NO'],
+          },
+          {
+            id: 'exempt', type: 'choice',
+            question: `Is this request ${exempt || 'an ordinary informational question, news discussion, or educational topic'}?`,
+            options: ['YES', 'NO'],
+          },
+        ], { state: `Request: ${String(ctx.prompt || '').slice(0, 1500)}\nIntent: ${ctx.intent || ''}`, timeoutMs: 8000 }).catch(() => null);
+        const a = r && r.answers || {};
+        return (a.frame?.label === 'YES' && a.exempt?.label !== 'YES') ? 'YES' : 'NO';
+      };
+      const _hits = (await _rulesMod.evaluateAsync(_guardCtx, 'entry', _guardJudge)).filter(r => r.id !== _bypass);
       const _guardHit = _hits.find(r => ['block', 'ask'].includes(r?.then?.action));
       if (_guardHit) return _applyGuard(_guardHit);
       // Category rules — `when.category` never matches deterministically; the
@@ -1771,9 +1859,14 @@ async function processMessage(args) {
   // a standalone public-web lookup / screen display:
   //   intent 8 vetoes on any task/follow-up/service/clarification signal —
   //   "search for it" (a pronoun follow-up) or "search my downloads" are not
-  //   public-web queries.
-  //   intent 7 vetoes on service/action taskTypes — "show me my calendar on
-  //   screen" needs gathered data a capture can't provide.
+  //   public-web queries. 'ambiguous' keeps the pin — a vague standalone
+  //   lookup is exactly what a SERP answers.
+  //   intent 7 vetoes ONLY on signals naming a different surface — service,
+  //   DOM work, file/message/schedule/browser taskTypes ("show my calendar on
+  //   screen" needs gathered data a capture can't provide). local_system /
+  //   app_automation KEEP the pin — a screen deliverable legitimately
+  //   classifies as either (observed: "show a happy emoji on my screen" →
+  //   taskType=local_system → veto stole the screen lane for a task run).
   // Envelope unavailable (model down) → keep the pin (express lanes exist for
   // speed; we can't know better without the verdict).
   if (intent === 8 || intent === 7) {
@@ -1783,10 +1876,15 @@ async function processMessage(args) {
         ? (_routeDecision.isFollowUp === true
             || !!_routeDecision.targetService
             || _routeDecision.needsClarification === true
-            || (_routeDecision.taskType && _routeDecision.taskType !== 'query'))
+            || (_routeDecision.taskType && !['query', 'ambiguous'].includes(_routeDecision.taskType)
+                // A browser-typed envelope that is really context-free public
+                // research (public_read, no service/DOM/follow-up) IS a SERP
+                // lookup — same shape deriveLane promotes, same shape the
+                // graph's routeTable sends to web_search. Don't veto it.
+                && !isPublicWebResearch(_routeDecision)))
         : (!!_routeDecision.targetService
             || _routeDecision.requiresDOM === true
-            || (_routeDecision.taskType && _routeDecision.taskType !== 'query' && _routeDecision.taskType !== 'ambiguous'));
+            || (_routeDecision.taskType && ['local_file', 'messaging', 'scheduling', 'browser'].includes(_routeDecision.taskType)));
       if (_vetoSignals) {
         logger.info(`[Process] RouteDecision vetoes ${intentName} → handoff`, {
           taskType: _routeDecision.taskType, targetService: _routeDecision.targetService || null,
@@ -2067,7 +2165,11 @@ async function processMessage(args) {
       // stategraph's full web_search lane answers instead.
       try { if (typeof onReplyChunk === 'function') onReplyChunk('\x00SEARCHING\x00google-serp'); } catch (_) {}
       const _er = await webSearchExpress.execute({
-        englishText, originalText, detectedLanguage, context, onReplyChunk,
+        // Query from the ASK, not the raw prompt — [Highlighted:…] blobs ride
+        // inside englishText and would pollute the SERP query with quoted
+        // page content (observed: Gmail highlight → the email body became the
+        // search). requestText is the blob-stripped trailing ask.
+        englishText: turnFacts.requestText || classifyText, originalText, detectedLanguage, context, onReplyChunk,
         routeDecision: _routeDecision,
       });
       if (!_er) {
@@ -2358,7 +2460,7 @@ async function processMessage(args) {
   _addTurn(englishText, finalText, intent);
   // Log to conversation-service for quick intents (handoff is logged by stategraph)
   if (intent === 1 || intent === 5 || intent === 6 || intent === 7 || intent === 8) {
-    _logConversationTurn(englishText, finalText, intentName, routedSessionId, result?.metadata);
+    _logConversationTurn(englishText, finalText, intentName, routedSessionId, result?.metadata, turnFacts.requestText);
   }
 
   const latencyMs = Date.now() - startTime;
@@ -2582,7 +2684,7 @@ const server = http.createServer(async (req, res) => {
           _logConversationTurn(null, resultText, t.intent || 'handoff', body.sessionId || t.sessionId || null);
         } else {
           _addTurn(tPrompt, resultText, t.intent || 'handoff');
-          _logConversationTurn(tPrompt, resultText, t.intent || 'handoff', body.sessionId || t.sessionId || null);
+          _logConversationTurn(tPrompt, resultText, t.intent || 'handoff', body.sessionId || t.sessionId || null, null, deriveRequestText(tPrompt));
         }
       }
     }
@@ -2617,6 +2719,22 @@ const server = http.createServer(async (req, res) => {
     if (body.agentId) {
       agentLock.heartbeat(body.agentId, body.taskId);
     }
+    return _send(res, 200, { ok: true });
+  }
+
+  // ── Task user-wait flag (from main.js) ────────────────────────────────────
+  // A gather batch pending for a task flips it to 'waiting-for-input' so the
+  // card renders "Waiting for input" (attention styling) instead of a Running
+  // timer that looks stuck; resolve/timeout flips it back. No lock release —
+  // __run__ stays held for the wait (user decision, plan 4.7).
+  if (req.url === '/comms.task.userwait' && req.method === 'POST') {
+    const body = await _readBody(req);
+    if (!body.taskId) {
+      return _send(res, 400, { error: 'taskId is required' });
+    }
+    // updateTask refuses terminal tasks itself — a late userwait on a
+    // finished task is a no-op, not a resurrection.
+    taskJournal.updateTask(body.taskId, body.waiting === false ? 'running' : 'waiting-for-input');
     return _send(res, 200, { ok: true });
   }
 
@@ -2732,4 +2850,4 @@ process.on('SIGTERM', () => _shutdown('SIGTERM'));
 process.on('SIGINT', () => _shutdown('SIGINT'));
 }
 
-module.exports = { server, processMessage, _isRulePhrase, _RULE_WEAK_RE, _authorRule, _handleLoopBack, _loopBackAttempts, _focusState, _evidenceSentence };
+module.exports = { server, processMessage, _isRulePhrase, _RULE_WEAK_RE, _authorRule, _handleLoopBack, _loopBackAttempts, _focusState, _evidenceSentence, _addTurn, _formatContext, _listSessionMessages, _logConversationTurn };

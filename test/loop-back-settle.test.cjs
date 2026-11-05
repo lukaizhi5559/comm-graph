@@ -24,6 +24,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loopback-'));
 // Isolate the task journal + keep the real :3015 service unbound in tests.
 process.env.TASK_JOURNAL_PATH = path.join(tmpDir, 'tasks.json');
 process.env.COMMS_NO_LISTEN = '1';
+process.env.COMMS_NO_HISTORY = '1'; // never write test turns into live session history
 
 // Capture _postMain calls on a scratch port.
 const posts = [];

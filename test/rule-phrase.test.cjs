@@ -26,6 +26,7 @@ const http = require('http');
 // POST /api/llm/stream → data:{text}… data:{done:true}
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'td-rule-test-'));
 process.env.COMMS_NO_LISTEN = '1'; // don't bind :3015 — the real service owns it
+process.env.COMMS_NO_HISTORY = '1'; // never write test turns into live session history
 process.env.THINKDROP_RULES_PATH = path.join(TMP, 'rules.json');
 process.env.THINKDROP_PLANS_DIR = path.join(TMP, 'plans');
 fs.mkdirSync(process.env.THINKDROP_PLANS_DIR, { recursive: true });
@@ -124,6 +125,35 @@ async function listen(server) {
   const weakNo = await processMessage({ text: 'can you set a rule for me' });
   check('weak marker + NO verdict falls through (not guardian)', called === 1
     && weakNo.intentName !== 'guardian' && weakNo.metadata?.source !== 'guardian');
+  decision.confirmJudgment = realConfirm;
+
+  // ── D2. rule-author verdict question covers standing policies ────────────
+  // Incident (2026-11-03): "bring up block screen for any site with sexual
+  // content, explicit language, or blood over top violence" hit the weak
+  // marker but phi4 answered NO to the if-then-shaped question — the request
+  // fell to planning which offered third-party options instead of the native
+  // screen-block rule. The question must name standing automated policies,
+  // not only "when X happens, do Y" grammar.
+  console.log('rule-author verdict question');
+  let capturedQ = null;
+  decision.confirmJudgment = async ({ site, question }) => { if (site === 'rule-author') capturedQ = question; return 'NO'; };
+  await processMessage({ text: 'bring up block screen for any site with sexual content, explicit language, or blood over top violence' });
+  check('block-policy phrasing reaches the verdict', !!capturedQ);
+  check('question covers standing policies, not just if/then grammar',
+    !!capturedQ && /standing|policy|ongoing|automated/i.test(capturedQ));
+  decision.confirmJudgment = realConfirm;
+
+  // Interrogative-led weak-marker candidates skip the model gate entirely —
+  // "how do I block sites in Safari?" is an information ask (the 0.8b verdict
+  // can't hold how-to/author reliably), so leading question-words short-circuit.
+  called = 0;
+  decision.confirmJudgment = async () => { called++; return 'YES'; };
+  const howto = await processMessage({ text: 'how do I block sites in Safari?' });
+  check('interrogative-led weak marker never reaches the verdict', called === 0
+    && howto.intentName !== 'guardian' && howto.metadata?.source !== 'guardian');
+  const reco = await processMessage({ text: "what's the best parental control app for blocking content?" });
+  check('recommendation question never reaches the verdict', called === 0
+    && reco.intentName !== 'guardian' && reco.metadata?.source !== 'guardian');
   decision.confirmJudgment = realConfirm;
 
   // ── E. userText scoping — blobs must not author rules ────────────────────

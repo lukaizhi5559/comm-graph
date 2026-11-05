@@ -28,6 +28,7 @@ const logger = require('../logger.cjs');
 const { standaloneSearchQuery } = require('../query-context.cjs');
 const { SCRIPTURE_REF_RE } = require('../../../shared/text-patterns.cjs');
 const { toItem: _toItem, hostnameOf: _hostname } = require('../../../shared/serp-item.cjs');
+const { isServiceOff } = require('../../../shared/service-availability.cjs');
 
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
 const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
@@ -271,9 +272,15 @@ async function execute(opts) {
         }
       } catch (_) {}
     };
-    let serp = onReplyChunk
-      ? await _postSse(WEB_SEARCH_PORT, '/web.search', _reqBody, WS_API_KEY, SERP_TIMEOUT_MS, _onSerpEvent)
+    // Service toggled off in the Services panel — route into the existing
+    // unavailable-guidance path with an honest reason rather than paying a
+    // refused-connection/timeout per query.
+    let serp = isServiceOff('web-search')
+      ? { data: { searchUnavailable: true, userMessage: 'Web search is turned off — re-enable it in the Services panel.' } }
       : null;
+    if (!serp && onReplyChunk) {
+      serp = await _postSse(WEB_SEARCH_PORT, '/web.search', _reqBody, WS_API_KEY, SERP_TIMEOUT_MS, _onSerpEvent);
+    }
     if (!serp) {
       serp = await _postJson(WEB_SEARCH_PORT, '/web.search', _reqBody, WS_API_KEY, SERP_TIMEOUT_MS);
     }

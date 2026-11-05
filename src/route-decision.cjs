@@ -103,6 +103,41 @@ const _llmBackend = {
 };
 
 /**
+ * True when the envelope describes a standalone public-web research request:
+ * the LLM typed it 'browser' only because the phrasing says "search online",
+ * but there is no named service, no DOM interaction, no follow-up referent,
+ * and nothing to navigate to — the SERP answers it directly. This mirrors
+ * stategraph's routeTable 'public-research' rule (browser + public_read +
+ * no service → web_search) so the ingress envelope and the graph agree on
+ * what the prompt is instead of handing a lookup to page_nav_scan browser
+ * automation (observed: highlight + "tell me about smoothstack… search
+ * online" → taskType=browser → handoff → google.com nav + scan_page, and the
+ * user got an automation report instead of an answer).
+ */
+function isPublicWebResearch(tc) {
+  if (!tc) return false;
+  const noActions = !Array.isArray(tc.interactiveActions) || tc.interactiveActions.length === 0;
+  // public_read is the primary signal; a model that emits suggestedIntent
+  // 'web_search' over a 'browser' taskType is saying the same thing — its own
+  // rules say browser → command_automate, so the override is deliberate.
+  const researchSignal = tc.webAccessMode === 'public_read' || tc.suggestedIntent === 'web_search';
+  return tc.taskType === 'browser'
+    && researchSignal
+    && !tc.targetService
+    && tc.requiresDOM !== true
+    && noActions
+    && tc.isFollowUp !== true
+    && tc.needsClarification !== true
+    && tc.isRecurring !== true
+    && tc.isBrowseOnly !== true
+    && tc.expectsFileOutput !== true
+    && !tc.isScreenFollowUp && !tc.needsFreshScreen && !tc.isAppUiInspection
+    && !tc.isSpatialAnalysis && !tc.isImageAnalysis && !tc.isConversationRecall
+    && !tc.isActivityQuery
+    && (!tc.resolution || tc.resolution === 'resolved');
+}
+
+/**
  * Map a classifyTask envelope to a comms-graph lane. Conservative by design:
  * a prompt only leaves the handoff lane when the taskType is 'query', no
  * screen/recurring/DOM/service signal is set, and suggestedIntent is one of
@@ -115,6 +150,10 @@ function deriveLane(tc) {
   const hasScreenSignal =
     tc.isScreenFollowUp || tc.needsFreshScreen || tc.isAppUiInspection ||
     tc.isSpatialAnalysis || tc.isImageAnalysis || tc.isConversationRecall;
+  // Context-free public research rides the express SERP executor even when
+  // the envelope typed it 'browser' — same answer the graph's web_search
+  // intent would produce, minus the browser takeover.
+  if (isPublicWebResearch(tc)) return 'web_search';
   const isServiceTask =
     SERVICE_TASK_TYPES.has(tc.taskType) || !!tc.targetService;
   if (tc.taskType !== 'query' || hasScreenSignal || isServiceTask ||
@@ -214,4 +253,4 @@ function serializeDecision(tc) {
   return out;
 }
 
-module.exports = { classifyRoute, deriveLane, derivePlanShape, canSkipCapabilityGate, serializeDecision, SERVICE_TASK_TYPES, LANE_BY_INTENT, fetchExtSessions: _fetchExtSessions, _llmBackend };
+module.exports = { classifyRoute, deriveLane, derivePlanShape, canSkipCapabilityGate, serializeDecision, isPublicWebResearch, SERVICE_TASK_TYPES, LANE_BY_INTENT, fetchExtSessions: _fetchExtSessions, _llmBackend };

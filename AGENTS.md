@@ -1,5 +1,18 @@
 # comms-graph conventions
 
+## Test hygiene — never write into live history
+
+Tests that call `processMessage` MUST set `COMMS_NO_HISTORY=1` (and
+`COMMS_NO_LISTEN=1`) before requiring server.cjs. The flag makes tests
+hermetic on conversation history: it gates BOTH `_logConversationTurn`
+(`message.add` writes — stub replies render as real assistant turns in the
+user's feed; observed: raw RULE_JSON echoes looked like the app authoring
+rules it never committed) AND `_fetchConversationHistory` (`session.route` +
+`message.list` reads — live history bleed makes verdict-call counts
+environment-dependent; observed: offer-echo fired on the user's real history
+mid-test). In-memory `_addTurn`/`_formatContext` stays usable for seeded
+context.
+
 ## RouteDecision envelope — ONE task classification per turn
 
 `src/route-decision.cjs` (`classifyRoute`) runs stategraph's `classifyTask`
@@ -62,6 +75,12 @@ is this turn" — same pattern as stategraph's `taskFacts`
   capability select, spec-completeness, memory attributes).
 - `findPlans` fuzzes on any token overlap — reroute/probe callers require
   `score >= 6`.
+- Guardian rules: `when` is deterministic; `semanticMatch`/`semanticExempt`
+  are the frame/anti-frame exception — `whenMatches` returns false on them
+  and callers run `evaluateAsync(ctx, seam, judge)` where the injected judge
+  (phi4 decision.answer, two-question frame/exempt batch) decides. Det fields
+  AND first as prefilters; monitorService adds the screenshot as `ctx.image`
+  (d3:2b) — same module, four seams, model-free by construction.
 
 ## requestText — judgments read the ask, matchers read the turn
 
@@ -83,3 +102,19 @@ paste+question turn, or the whole text when it's short/single-sentence.
 - Content judgments are exempt — "does required info exist anywhere" sees
   the full turn (spec-completeness: a pasted address legitimately supplies a
   missing recipient).
+
+### History turns
+
+The same boundary applies to PAST turns. History rows persist each user
+turn's ask: `metadata.requestText` on conversation-service messages (written
+by `_logConversationTurn`), `requestText` on in-memory turns (`_addTurn`).
+
+- Any consumer that feeds history to a judgment — classifyTask, clarify
+  question-gen, referent resolution, web-search target derivation — reads
+  `msg.requestText ?? msg.content` for user turns. Assistant turns render
+  verbatim; raw `content` stays available to answer-generation nodes.
+- `_historyEntry` (stategraph resolveReferencesV2) normalizes the field;
+  `deriveRequestText` covers legacy rows logged before the field existed.
+- Observed: a clarify asked "the YouTube notification rule, or just the
+  emoji?" because history carried a pasted rule unscoped — the judgment saw
+  the paste, not the ask.

@@ -29,7 +29,31 @@ check('local_file taskType stays handoff',
 check('messaging taskType stays handoff',
   deriveLane({ taskType: 'messaging', suggestedIntent: 'command_automate' }) === 'handoff');
 check('browser taskType stays handoff',
-  deriveLane({ taskType: 'browser', suggestedIntent: 'web_search' }) === 'handoff');
+  deriveLane({ taskType: 'browser', suggestedIntent: 'command_automate' }) === 'handoff');
+// Public-research shape — browser only in name (routeTable's public-research
+// rule): context-free SERP lookups ride the express executor instead of
+// page_nav_scan browser automation (observed: highlight + "tell me about
+// smoothstack… search online" → handoff → google.com nav takeover).
+check('browser + public_read + no service → web_search',
+  deriveLane({ taskType: 'browser', webAccessMode: 'public_read' }) === 'web_search');
+check('browser + public_read + targetService stays handoff',
+  deriveLane({ taskType: 'browser', webAccessMode: 'public_read', targetService: 'gmail' }) === 'handoff');
+check('browser + public_read + requiresDOM stays handoff',
+  deriveLane({ taskType: 'browser', webAccessMode: 'public_read', requiresDOM: true }) === 'handoff');
+check('browser + public_read + interactiveActions stays handoff',
+  deriveLane({ taskType: 'browser', webAccessMode: 'public_read', interactiveActions: ['click'] }) === 'handoff');
+check('browser + public_read + isFollowUp stays handoff',
+  deriveLane({ taskType: 'browser', webAccessMode: 'public_read', isFollowUp: true, followUpTarget: 'X' }) === 'handoff');
+check('browser + public_read + isBrowseOnly stays handoff (nav task)',
+  deriveLane({ taskType: 'browser', webAccessMode: 'public_read', isBrowseOnly: true }) === 'handoff');
+check('browser + interactive webAccessMode stays handoff',
+  deriveLane({ taskType: 'browser', webAccessMode: 'interactive' }) === 'handoff');
+check('browser + public_read + unresolved resolution stays handoff',
+  deriveLane({ taskType: 'browser', webAccessMode: 'public_read', resolution: 'needs_clarification' }) === 'handoff');
+check('browser + suggestedIntent web_search (no webAccessMode) → web_search',
+  deriveLane({ taskType: 'browser', suggestedIntent: 'web_search', webAccessMode: null }) === 'web_search');
+check('browser + suggestedIntent web_search + targetService stays handoff',
+  deriveLane({ taskType: 'browser', suggestedIntent: 'web_search', targetService: 'youtube' }) === 'handoff');
 check('query + general_knowledge → general_quick',
   deriveLane({ taskType: 'query', suggestedIntent: 'general_knowledge' }) === 'general_quick');
 check('query + greeting → general_quick',

@@ -237,7 +237,7 @@ async function classify(englishText, conversationContext, opts = {}) {
   // Explicit planning request — deterministic, runs before every other guard.
   // ("plan" inside a bigger automation prompt like "follow this plan" is NOT
   // matched — the phrases above require intent-to-draft framing.)
-  if (PLANNING_PHRASE_RE.test(englishText)) {
+  if (PLANNING_PHRASE_RE.test(_askText)) {
     logger.info('[Classify] Planning phrase guard → planning', {
       inputPreview: englishText.substring(0, 60),
     });
@@ -377,7 +377,9 @@ async function classify(englishText, conversationContext, opts = {}) {
   // are the planning lane's bread and butter: draft a .md plan → readiness
   // check → approved run, never a single blind handoff. Mere references to
   // an app/skill stay on their own merits (no build verb → no match).
-  if (/\b(?:slideshow|slide\s*deck|slide\s*show)\b|\b3d\s*(?:model|scene)\b|\b(?:build|create|make|write|draft|generate|put\s+together|do|develop|design|program|code|spin\s+up|set\s+up)\s+(?:me\s+)?(?:a|an|the|some|my|new|up)\s+[\w\s-]{0,40}\b(?:deck|slideshow|scene|report|resume|doc|document|pdf|plans?|skills?|apps?|agents?|workflows?|automations?|extensions?|integrations?|bots?|scripts?|projects?|prototypes?|tools?|websites?)\b|\bput\s+(?:a|an|the|some|my|new)\s+[\w\s-]{0,40}\b(?:plans?|skills?|apps?|agents?|workflows?|automations?|extensions?|integrations?|bots?|scripts?|projects?|prototypes?|tools?|websites?|deck|slideshow|report)\b[\w\s-]{0,20}\btogether\b/i.test(englishText)) {
+  // Scoped to the ASK — a pasted "build me an app" inside quoted material
+  // must not pin planning (requestText scoping, AGENTS.md).
+  if (/\b(?:slideshow|slide\s*deck|slide\s*show)\b|\b3d\s*(?:model|scene)\b|\b(?:build|create|make|write|draft|generate|put\s+together|do|develop|design|program|code|spin\s+up|set\s+up)\s+(?:me\s+)?(?:a|an|the|some|my|new|up)\s+[\w\s-]{0,40}\b(?:deck|slideshow|scene|report|resume|doc|document|pdf|plans?|skills?|apps?|agents?|workflows?|automations?|extensions?|integrations?|bots?|scripts?|projects?|prototypes?|tools?|websites?)\b|\bput\s+(?:a|an|the|some|my|new)\s+[\w\s-]{0,40}\b(?:plans?|skills?|apps?|agents?|workflows?|automations?|extensions?|integrations?|bots?|scripts?|projects?|prototypes?|tools?|websites?|deck|slideshow|report)\b[\w\s-]{0,20}\btogether\b/i.test(_askText)) {
     logger.info('[Classify] Deliverable guard → planning', {
       inputPreview: englishText.substring(0, 60),
     });
@@ -406,7 +408,10 @@ async function classify(englishText, conversationContext, opts = {}) {
   // rule (observed: "set a rule that if I goto youtube … on my screen").
   const _serviceRef = /\b(?:inbox|e-?mails?|gmail|outlook|slack|discord|calendar|notion|drive|spotify|whatsapp|imessage|messages|reminders|contacts|files?|photos?)\b/i.test(englishText);
   const _rulePhrasing = /\b(?:set|create|make|add|save)\s+(?:a\s+|me\s+(?:a\s+)?)?rules?\b|\brule\s+that\b|\bwhenever\b|\bevery\s+time\b/i.test(englishText);
-  if (!_serviceRef && !_rulePhrasing && /\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(englishText)) {
+  // Trigger scoped to the ASK — a quoted "show X on my screen" inside pasted
+  // material is decoration, not a display command (observed: pasted rule
+  // phrasing + "explain this" → screen lane painted the quoted emoji).
+  if (!_serviceRef && !_rulePhrasing && /\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(_askText)) {
     logger.info('[Classify] Screen-output guard → screen lane', {
       inputPreview: englishText.substring(0, 60),
     });
@@ -468,7 +473,7 @@ async function classify(englishText, conversationContext, opts = {}) {
   // (observed: gemini picked memory_store → sentinel → stategraph decomposed a
   // doomed Google-Calendar task against the YouTube tab). An explicit action
   // verb keeps the normal route ("add it to my calendar", "remind me").
-  const _personalEvent = /\bi\s+(?:have|'ve\s+got|got)\s+(?:a\s+|an\s+|the\s+|my\s+)?(?:appointment|appt|meeting|dentist|doctor|checkup|interview|call|date|event|haircut|reservation|flight|class|session|practice|party|dinner|lunch|brunch|exam|test|shift|game|concert|wedding|funeral|recital|inspection|deadline)\b/i.test(englishText);
+  const _personalEvent = /\bi\s+(?:have|'ve\s+got|got)\s+(?:a\s+|an\s+|the\s+|my\s+)?(?:appointment|appt|meeting|dentist|doctor|checkup|interview|call|date|event|haircut|reservation|flight|class|session|practice|party|dinner|lunch|brunch|exam|test|shift|game|concert|wedding|funeral|recital|inspection|deadline)\b/i.test(_askText);
   const _eventAction = /\b(?:add|put|schedule|remind|create|book|set|make|plan|cancel|move|reschedul\w*|delete|remove|check|confirm|note|remember|save|store|what|when|where|who|tell|show)\b/i.test(englishText);
   if (!_isQuestion && _personalEvent && !_eventAction) {
     logger.info('[Classify] Personal-event guard → planning', { inputPreview: englishText.substring(0, 60) });
@@ -487,7 +492,7 @@ async function classify(englishText, conversationContext, opts = {}) {
   const _searchOfferReply = !!conversationContext
     && OFFER_RE.test(_lastAssistantTurn(conversationContext) || '');
   if (!_searchCtxDependent && !_searchOfferReply
-      && /^(?:please\s+)?(?:search|google|look\s+up|find|look\s+for|show\s+me\s+(?:pictures?|images|photos|pics|videos|clips)\s+of)\b/i.test(englishText)) {
+      && /^(?:please\s+)?(?:search|google|look\s+up|find|look\s+for|show\s+me\s+(?:pictures?|images|photos|pics|videos|clips)\s+of)\b/i.test(_askText)) {
     logger.info('[Classify] Explicit-search guard → web_search', { inputPreview: englishText.substring(0, 60) });
     return { intent: 8, intentName: 'web_search', confidence: 0.9, source: 'search_guard' };
   }

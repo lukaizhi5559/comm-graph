@@ -34,6 +34,7 @@ const { canonicalAgent } = require('../../../shared/agent-canonical.cjs');
 const skillIndex = require('../../../shared/skill-index.cjs');
 const skillContracts = require('../../../shared/skill-contracts.cjs');
 const serviceMap = require('../../../shared/service-map.cjs');
+const { isServiceOff } = require('../../../shared/service-availability.cjs');
 const sysMap = require('../../../shared/system-map.cjs');
 const capIndex = require('../../../shared/capability-index.cjs');
 const { PLAN_CONFIRM_RE, PLAN_RUN_RE, PLAN_RUN_NEG_RE } = require('../../../shared/plan-check-phrases.cjs');
@@ -987,6 +988,11 @@ async function _toolAppUsage(arg) {
 }
 
 async function _toolWebSearch(query) {
+  // Service toggled off — return a tool-visible error instead of a timeout so
+  // the planner knows the capability is disabled, not flaky.
+  if (isServiceOff('web-search')) {
+    return 'web.search unavailable — the web-search service is turned off (Services panel).';
+  }
   const res = await _postJson(WEB_SEARCH_PORT, '/web.search', {
     version: 'mcp.v1', service: 'web-search', action: 'web.search',
     payload: { query, maxResults: 5 },

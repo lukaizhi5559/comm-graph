@@ -25,6 +25,7 @@ const http = require('http');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'td-paste-test-'));
 process.env.COMMS_NO_LISTEN = '1';
+process.env.COMMS_NO_HISTORY = '1'; // never write test turns into live session history
 process.env.THINKDROP_RULES_PATH = path.join(TMP, 'rules.json');
 process.env.THINKDROP_PLANS_DIR = path.join(TMP, 'plans');
 fs.mkdirSync(process.env.THINKDROP_PLANS_DIR, { recursive: true });
@@ -120,10 +121,23 @@ const PASTE = 'I have written the full audit plus plan. The answer to your quest
   check('paste+question does NOT enter guardian lane',
     r1.intentName !== 'guardian' && r1.metadata?.source !== 'guardian', `got ${r1.intentName}`);
   const ruleCall = calls.find(c => c.site === 'rule-author');
-  check('rule-author verdict ran', !!ruleCall);
-  check('verdict state is scoped to the ask', ruleCall && /^Ask: What does envelope mean/.test(ruleCall.state),
-    `got: ${ruleCall && JSON.stringify(ruleCall.state).slice(0, 160)}`);
-  check('verdict question names the paste problem', ruleCall && /quoted or pasted material/i.test(ruleCall.question));
+  // Interrogative-led asks short-circuit BEFORE the verdict now — question-
+  // shaped requests are answered, never authored; the paste problem is handled
+  // deterministically upstream of the model (stronger than a NO verdict).
+  check('interrogative ask skips the rule-author verdict', !ruleCall);
+
+  // The scoped-state contract still binds for imperative asks — an imperative
+  // variant reaches the gate with focus narrowed to the real request. (Capital
+  // T: deriveRequestText splits the " - " boundary on [A-Z0-9], same as the
+  // original "What does" case.)
+  calls = [];
+  decision.confirmJudgment = async (o) => { calls.push(o); return 'NO'; };
+  await processMessage({ text: `${PASTE} - Tell me what envelope means in this context` });
+  const ruleCall2 = calls.find(c => c.site === 'rule-author');
+  check('imperative ask reaches verdict with scoped state',
+    ruleCall2 && /^Ask: Tell me what envelope means/.test(ruleCall2.state),
+    `got: ${ruleCall2 && JSON.stringify(ruleCall2.state).slice(0, 160)}`);
+  check('verdict question names the paste problem', ruleCall2 && /quoted or pasted material/i.test(ruleCall2.question));
 
   // A YES on the SCOPED state means the ask really was rule-shaped — the lane
   // still fires (regression guard for over-suppression).
@@ -191,6 +205,22 @@ const PASTE = 'I have written the full audit plus plan. The answer to your quest
   check('missing-detail skipped on question-shaped ask',
     !calls.some(c => c.site === 'missing-detail'), `calls: ${calls.map(c => c.site).join(',')}`);
   check('judgments that did run got scoped message', calls.every(c => !c.state || !String(c.state).includes('quarterly report') || String(c.state).includes('Ask:')));
+
+  // ── G. Executor pins on pasted material (observed live: quoted "show me a
+  // happy emoji on my screen" pinned the screen lane; quoted "build me an app"
+  // could pin planning) ────────────────────────────────────────────────────
+  console.log('executor pins on pasted content');
+  providers.ask = async () => ({ text: '1', provider: 'mock' });
+  const rq = await classify('Here is the rule idea the team wrote down. If I go to youtube and a new video drops on a channel I watch you show me a happy emoji on my screen every single time it happens. Can you explain what this rule would do?', null);
+  check('quoted "on my screen" does NOT pin screen lane', rq.intent !== 7, `got ${rq.intentName}/${rq.source}`);
+  const rd = await classify(`${PASTE} The design doc says to build me an app for tracking meals and groceries. What would that involve?`, null);
+  check('quoted deliverable does NOT pin planning', rd.intent !== 6, `got ${rd.intentName}/${rd.source}`);
+  const rp = await classify(`${PASTE} - What does this plan involve?`, null);
+  check('quoted "plan" mention does NOT pin planning', rp.intent !== 6, `got ${rp.intentName}/${rp.source}`);
+  const rs = await classify('show a happy emoji on my screen', null);
+  check('direct screen request still pins screen lane', rs.intent === 7, `got ${rs.intentName}/${rs.source}`);
+  const rp2 = await classify('make a plan to reorganize my downloads folder', null);
+  check('direct planning request still pins planning', rp2.intent === 6, `got ${rp2.intentName}/${rp2.source}`);
 
   decision.confirmJudgment = realConfirm;
   providers.ask = realAsk;
