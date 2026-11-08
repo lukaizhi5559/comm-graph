@@ -47,10 +47,15 @@ function _rewriteMessages(question, conversationContext) {
   ];
 }
 
-/** Loose sanity check on a rewritten query — single line, sane length, has letters. */
+/** Loose sanity check on a rewritten query — single line, sane length, has
+ * letters, and isn't a context echo. A "User:/Assistant:" prefix means the
+ * rewriter leaked the transcript format into the query (observed: "what was
+ * the recruiter's name" → "Assistant: What was the recruiter's name for the
+ * Kforce…" → SERP answered about the wrong person entirely). */
 function _looksLikeQuery(s) {
   const t = String(s || '').trim();
-  return t.length >= 3 && t.length <= MAX_QUERY_LEN && !/[\n\r]/.test(t) && /[a-z]/i.test(t);
+  return t.length >= 3 && t.length <= MAX_QUERY_LEN && !/[\n\r]/.test(t) && /[a-z]/i.test(t)
+    && !/^\s*(?:user|assistant|system|context|transcript|conversation|history|message)\s*:/i.test(t);
 }
 
 /**
@@ -115,6 +120,21 @@ async function standaloneSearchQuery(question, conversationContext, routeDecisio
         });
       }
       return rewritten;
+    }
+    // Unusable rewrite — distinguish contamination from flakiness. A
+    // transcript-marker leak ("Assistant:"/"User:" prefix or embedded role
+    // lines) means the model echoed the conversation INTO the query: the
+    // question almost certainly needs the transcript and a context-free
+    // literal query can only answer wrong (observed: leaked "Assistant:"
+    // prefix → SERP picked a public stranger for a conversation-recall
+    // question) → skip SERP, the context-aware LLM path takes over, same
+    // contract as the unresolved-follow-up fork. Anything else (empty,
+    // overlong, preamble prose) is ordinary model flakiness → fail-open to
+    // the raw query, the documented contract.
+    const _markerLeak = /(?:^|\n)\s*(?:user|assistant|system|context|transcript|conversation|history|message)\s*:/i.test(rewritten);
+    if (_markerLeak) {
+      logger.warn('[QueryContext] transcript-marker leak — skipping SERP for context path', { raw: rewritten.substring(0, 80) });
+      return null;
     }
     logger.warn('[QueryContext] rewrite unusable — using raw query', { raw: rewritten.substring(0, 80) });
     return q;

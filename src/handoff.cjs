@@ -299,7 +299,21 @@ async function _bakeUrlFirstArgs(steps, taskText) {
   return steps;
 }
 
-async function _compileTaskSteps(prompt, agentId, { conversationContext = null, sessionId = null, routeDecision = null } = {}) {
+// The RouteDecision envelope is authoritative — a verdict naming a non-skill
+// lane (memory_retrieve, web_search, general_knowledge, screen intents,
+// clarify/decline resolutions) belongs to stategraph nodes that the _skillPlan
+// fast-path bypasses entirely. Compiling executable steps here would preempt
+// every guard that reads these fields (observed: envelope said
+// memory_retrieve — hoist still compiled "shell.run browser history" →
+// decompose skipped → "None found" on an answerable recall question).
+// command_automate or null suggestedIntent keeps the compile (unchanged path).
+const { skillEnvelope: _skillEnvelope } = require('../../shared/route-envelope.cjs');
+
+async function _compileTaskSteps(prompt, agentId, { conversationContext = null, sessionId = null, routeDecision = null, contextBodies = null } = {}) {
+  if (!_skillEnvelope(routeDecision)) {
+    logger.info(`[Handoff] compile skipped — no affirmative task signal (taskType=${routeDecision?.taskType || 'null'} suggestedIntent=${routeDecision?.suggestedIntent || 'null'})`);
+    return null;
+  }
   try {
     // Deterministic templates before the LLM stepgen — a force-classified
     // plan (page_nav_scan, reply_draft, url_open…) is verbatim-validated and
@@ -330,6 +344,7 @@ async function _compileTaskSteps(prompt, agentId, { conversationContext = null, 
       agents: agentId ? [agentId] : [],
       doneWhen: '',
       context: _compileContextBlock(conversationContext, sessionId, _liveTabsContext(_sessions)),
+      contextBodies,
     }, null, _sessions);
     if (!Array.isArray(steps) || !steps.length) return null;
     const normalized = await normalizeTaskStepsAsync({ steps, agents: agentId ? [agentId] : [] }, { extSessions: _sessions }).catch(() => null);
@@ -453,7 +468,7 @@ function _releaseTask(taskId, agentIdHint) {
  * @param {object|null} [args.thoughtContext] - Proactive card being replied to { id, text, tag }
  * @returns {Promise<{ taskId: string, agentId: string|null, parked: boolean, waitingBehind: string|null }>}
  */
-async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, refs = null, capabilityReason = null, routeDecision = null, allowPlannerFallback = false, conversationContext = null }) {
+async function execute({ englishPrompt, source, originalPrompt, detectedLanguage = null, guessedIntent, sessionId = null, userApproved = false, thoughtContext = null, planId = null, planTaskNum = null, planTask = false, preflightAuthBypass = null, agentId: pinnedAgentId = null, deterministicPlan = null, priorResults = null, refs = null, capabilityReason = null, routeDecision = null, allowPlannerFallback = false, conversationContext = null, contextBodies = null }) {
   // Plan-dispatched tasks carry the task's canonical agentId so the lock key
   // is the shared session (google_*.agent → google.agent), not prompt text.
   const agentId = pinnedAgentId || detectAgent(englishPrompt);
@@ -503,10 +518,17 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
     updateTask(taskId, 'queued');
     // Compiler hoist — task-lane dispatch only (no plan context already
     // attached). Proactive thoughts and plan tasks keep their existing lanes.
-    const _canCompile = !deterministicPlan && !planId && !planTask && !thoughtContext
+    // The RouteDecision envelope is authoritative: a non-skill verdict must
+    // reach the stategraph pipeline, not a pre-compiled _skillPlan that would
+    // bypass the guards which consume it.
+    const _skillEnv = _skillEnvelope(routeDecision);
+    if (!_skillEnv) {
+      logger.info(`[Handoff] compile skipped — no affirmative task signal (taskType=${routeDecision?.taskType || 'null'} suggestedIntent=${routeDecision?.suggestedIntent || 'null'})`);
+    }
+    const _canCompile = _skillEnv && !deterministicPlan && !planId && !planTask && !thoughtContext
       && !(Array.isArray(priorResults) && priorResults.length)
       && !(Array.isArray(refs) && refs.length);
-    const _compiled = _canCompile ? await _compileTaskSteps(englishPrompt, agentId, { conversationContext, sessionId, routeDecision }) : null;
+    const _compiled = _canCompile ? await _compileTaskSteps(englishPrompt, agentId, { conversationContext, sessionId, routeDecision, contextBodies }) : null;
     if (_compiled) {
       logger.info(`[Handoff] Compiled ${_compiled.length} steps at dispatch — task ${_compiled.map(s => s.skill).join(' → ').slice(0, 160)}`);
       updateTask(taskId, 'queued', { compiledSteps: _compiled.length });
@@ -632,4 +654,15 @@ function startRetrySweep() {
   _sweepTimer.unref?.();
 }
 
-module.exports = { execute, complete, remove, detectAgent, isLocked, getWaitingCount, startRetrySweep, _compileTaskSteps };
+/**
+ * Release every lane a task could hold. Public hook for the journal's
+ * onTerminal callback — terminal transitions that bypass complete()/remove()
+ * (direct updateTask writes, test endpoints, killed drivers) must not strand
+ * an agent lane for the 10-min TTL (observed: a terminal task held
+ * youtube.agent, parking every later task behind a dead holder).
+ */
+function releaseTaskLocks(taskId, agentIdHint) {
+  _releaseTask(taskId, agentIdHint);
+}
+
+module.exports = { execute, complete, remove, detectAgent, isLocked, getWaitingCount, startRetrySweep, releaseTaskLocks, _compileTaskSteps };

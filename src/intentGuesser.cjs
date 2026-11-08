@@ -28,6 +28,7 @@ const logger = require('./logger.cjs');
 const {
   CONVERSATION_RECALL_RE,
   EPISODIC_RE: _EPISODIC_RE,
+  ACTIVITY_RECALL_RE: _ACTIVITY_RECALL_RE,
   NAMED_APP_RE: _NAMED_APP_RE,
   ACTION_VERB_RE: _ACTION_VERB_RE,
   NAV_VERB_START_RE: _NAV_VERB_START_RE,
@@ -74,6 +75,10 @@ const INTENT_PATTERNS = [
       if (/\b(do\s+i\s+have\s+.{0,30}\b(saved|stored|noted|bookmarked)|have\s+i\s+(saved|stored|got|noted|written)|did\s+i\s+(save|store|note|write\s+down|bookmark))\b/i.test(text)) return true;
       // Episodic memory — past activity / screen / media history
       if (/\b(what\s+was\s+i\s+(doing|working\s+on|looking\s+at|watching|listening|reading|playing|browsing|editing|writing)|what\s+was\s+on\s+my\s+screen|what\s+was\s+playing|what\s+(song|music|video|show|movie)\s+was\s+(playing|on)|what\s+was\s+that|show\s+me\s+(my\s+)?(recent|past)\s+(activity|screen|history))\b/i.test(text)) return true;
+      // First-person past-activity recall — canonical pattern covers
+      // ungrammatical/STT forms the arms above miss ("what videos have I
+      // been watch today", "what have i been listening to").
+      if (_ACTIVITY_RECALL_RE.test(text)) return true;
       // "that thing/link/article I saw earlier" style recall
       if (/\bthat\s+(thing|article|link|page|site|website|video|song|music|post|tweet|image|picture|photo|meme|file|email|message|recipe|document|tab|window)\b.{0,50}\b(i\s+)?(saw|had|looked|read|watched|opened|visited|saved|copied|sent|received|found)\b/i.test(text)) return true;
       // Time-qualified recall: a past-time marker + recall-ish verb/noun

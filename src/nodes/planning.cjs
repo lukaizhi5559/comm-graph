@@ -92,7 +92,7 @@ function _planFileName(planId) {
   return `${planId}.md`;
 }
 
-function _getOrCreateSession({ planId, sessionId, originalPrompt, conversationContext, refs }) {
+function _getOrCreateSession({ planId, sessionId, originalPrompt, conversationContext, contextBodies, refs }) {
   if (planId && _planSessions.has(planId)) return _planSessions.get(planId);
 
   // Continue from disk when the UI names a plan we haven't seen this process.
@@ -124,6 +124,10 @@ function _getOrCreateSession({ planId, sessionId, originalPrompt, conversationCo
     // Planning often starts mid-conversation ("…and all 46") — the routed
     // session's recent turns give the LLM the context the fragment lacks.
     contextSeed: conversationContext || null,
+    // Full shared-material bodies ([Highlighted:]/pastes) from the routed
+    // session — referent targets like "the bullets it asks for" resolve
+    // against these, not the judgment-scoped contextSeed lines.
+    contextBodies: contextBodies || null,
     history: [],        // [{role, content}]
     status: 'drafting',
     name: null,
@@ -385,7 +389,17 @@ function _pickStepgenAppendix(task) {
   // CLI-first: deterministic programmatic agents get the cli appendix even
   // when a task also lists a browser agent (cli/api/mcp > browser priority).
   if (hasCli) return 'plan-skills-cli-first.md';
-  if (hasBrowser) return 'plan-skills-browser.md';
+  // Browser-driving skills are kill-switched → the planner must emit the
+  // browser-off canon (shell.run open + app.agent scan_page), not the atomic
+  // browser vocabulary it would otherwise learn from plan-skills-browser.md.
+  if (hasBrowser) {
+    try {
+      if (!require('../../../shared/browser-automation.cjs').isBrowserAutomationEnabled()) {
+        return 'plan-skills-browser-off.md';
+      }
+    } catch (_) {}
+    return 'plan-skills-browser.md';
+  }
   if (/[~\/][\w\-./]+\.(?:md|txt|json|csv|pdf|docx?|xlsx?|py|ts|js)\b/i.test(task.prompt || '')) {
     return 'plan-skills-file.md';
   }
@@ -545,11 +559,18 @@ async function _generateTaskSteps(task, pathFeedback, extSessions) {
   // page work rides ext:default; url.first.agent is for NEW destinations.
   let _liveTabsBlock = '';
   try {
-    const _lt = require('../../../shared/live-tabs.cjs');
-    const _ctx = _lt.liveTabsContext(Array.isArray(extSessions) ? extSessions : []);
-    if (_ctx) {
-      _liveTabsBlock = _ctx + '\n'
-        + 'The extension is CONNECTED — work on a listed page or its service runs on `sessionId:"ext:default"` (the user\'s real tab: dom.act / form.fill.agent / turn.loop.agent; browser.act getPageText for reads). `url.first.agent` is for NEW destinations only — re-navigating abandons the page the user means. Do NOT emit app.agent for work these tabs can serve.\n';
+    // Bound-tab guidance only applies when the browser lane is dispatchable —
+    // under the kill switch, bound sessions can't serve dom.act/turn.loop
+    // steps, so advertising "extension CONNECTED" would emit disabled skills.
+    if (!require('../../../shared/browser-automation.cjs').isBrowserAutomationEnabled()) {
+      _liveTabsBlock = 'NOTE: browser automation is DISABLED — bound tabs cannot be driven (no dom.act/turn.loop/form.fill/browser.act). Read live pages via app.agent {action:"scan_page"} and navigate via shell.run {cmd:"open",argv:[url]}.\n';
+    } else {
+      const _lt = require('../../../shared/live-tabs.cjs');
+      const _ctx = _lt.liveTabsContext(Array.isArray(extSessions) ? extSessions : []);
+      if (_ctx) {
+        _liveTabsBlock = _ctx + '\n'
+          + 'The extension is CONNECTED — work on a listed page or its service runs on `sessionId:"ext:default"` (the user\'s real tab: dom.act / form.fill.agent / turn.loop.agent; browser.act getPageText for reads). `url.first.agent` is for NEW destinations only — re-navigating abandons the page the user means. Do NOT emit app.agent for work these tabs can serve.\n';
+      }
     }
   } catch (_) {}
   const userMsg =
@@ -557,6 +578,11 @@ async function _generateTaskSteps(task, pathFeedback, extSessions) {
     // Session/task context the bare prompt can't carry — a follow-up like
     // "next chapter 7" is meaningless without the turns that named the file.
     (task.context ? `RECENT CONTEXT (earlier turns/tasks this session — resolve deictic references against it):\n${task.context}\n` : '') +
+    // Full shared-material bodies (highlighted/pasted content, prior answers)
+    // a follow-up refers to — RECENT CONTEXT turns render truncated asks only.
+    // The synthesize step consumes these bodies at run time, so they must NOT
+    // be re-fetched with a live-page/browser step.
+    (task.contextBodies ? `SHARED CONTENT (full material the user shared earlier — synthesize consumes it at run time; do NOT emit page-extraction steps solely to re-fetch it):\n${String(task.contextBodies).slice(0, 10000)}\n` : '') +
     _knownBlock +
     _repoBlock +
     _feedbackBlock +
@@ -2706,7 +2732,7 @@ function _isRecommended(h, recommendedId) {
  *   (marker blocks are filtered out before chunks reach this)
  * @returns {Promise<{text, fullText, metadata}>}
  */
-async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, onReplyChunk = null, capabilityHints = null, gateReason = null, needsInfo = null, recommended = null, screenContext: passedScreenContext = null }) {
+async function execute({ englishText, systemPrompt, sessionId, planning = {}, source = 'text', conversationContext = null, contextBodies = null, onReplyChunk = null, capabilityHints = null, gateReason = null, needsInfo = null, recommended = null, screenContext: passedScreenContext = null }) {
   const startedExplicit = planning.startedExplicit === true;
 
   // ── Fresh-draft escape — "none of these — start a new plan" (the dismiss
@@ -2717,7 +2743,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     _sessionToPlan.delete(sessionId);
     const draft = _getOrCreateSession({
       planId: null, sessionId,
-      originalPrompt: '', conversationContext,
+      originalPrompt: '', conversationContext, contextBodies,
     });
     const text = 'Starting a fresh plan — what would you like it to do?';
     return {
@@ -2764,6 +2790,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     sessionId,
     originalPrompt: englishText,
     conversationContext,
+    contextBodies,
     refs: planning.refs,
   });
   if (!sess.originalPrompt) sess.originalPrompt = englishText;
@@ -3015,6 +3042,11 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       // session has its own turns they are the truth, and a frozen stale
       // conversation (routed session may be unrelated) only misleads.
       ? `\n\nPRIOR CONVERSATION (context only — planning started mid-conversation; the user's latest message may refer to this):\n${sess.contextSeed}`
+      : '')
+    + (sess.contextBodies
+      // Referent material stays live for the whole draft — "add the bullets
+      // it asks for" can land on any planning turn, not just the first.
+      ? `\n\nSHARED CONTENT (full material the user shared earlier — the current message may refer to it):\n${String(sess.contextBodies).slice(0, 10000)}`
       : '');
 
   // Seed the conversation: planning turns are their own thread — the caller's

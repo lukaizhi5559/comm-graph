@@ -65,6 +65,69 @@ function check(name, cond) {
     console.log('  SKIP compiledPlan absent (backend unavailable or compile declined — degrade path OK)');
   }
 
+  // Release the first dispatch's __run__ lock — every later execute() would
+  // otherwise park behind it and the resume path would notify WITHOUT going
+  // through the compile gate at all.
+  handoff.complete(r.taskId, null, 'done', 'test');
+
+  // ── Compile eligibility — the RouteDecision envelope is authoritative ─────
+  // task_fb887853 regression: envelope {isActivityQuery, suggestedIntent:
+  // memory_retrieve} still got a compiled shell.run plan → _skillPlan bypassed
+  // decompose → "None found". Non-skill envelopes must NOT carry compiledPlan.
+  // Each case must complete before the next execute() — the __run__ lane is
+  // single-holder and a parked task never reaches the compile gate.
+  const nonSkillCases = [
+    ['suggestedIntent=memory_retrieve', { suggestedIntent: 'memory_retrieve', taskType: 'query' }],
+    ['isActivityQuery flag (flake mode: suggestedIntent null)', { isActivityQuery: true, suggestedIntent: null, taskType: 'query' }],
+    ['isConversationRecall', { isConversationRecall: true, taskType: 'query' }],
+    ['resolution=needs_clarification', { resolution: 'needs_clarification', taskType: 'query' }],
+    ['resolution=declined_ack', { resolution: 'declined_ack', taskType: 'browser' }],
+    ['needsFreshScreen', { needsFreshScreen: true, taskType: 'local_system' }],
+    // Abstaining envelopes — task_534944fc regression: query + null intent on
+    // "list details about the videos" compiled to mdfind shell.run. No
+    // affirmative task signal → pipeline, not a compiled plan.
+    ['abstain: query + null suggestedIntent', { suggestedIntent: null, taskType: 'query' }],
+    ['abstain: query + no suggestedIntent field', { taskType: 'query' }],
+    ['abstain: null routeDecision', null],
+    ['abstain: unknown taskType + null intent', { taskType: 'unknown_future_type', suggestedIntent: null }],
+  ];
+  for (const [label, rd] of nonSkillCases) {
+    _captured = null;
+    const rr = await handoff.execute({
+      englishPrompt: `nonskill ${label} ${Date.now()}`,
+      source: 'text',
+      sessionId: 'test-session',
+      routeDecision: rd,
+    });
+    check(`dispatch acquired lane for ${label}`, rr && rr.parked === false);
+    await new Promise(r => setTimeout(r, 300));
+    check(`no compiledPlan for ${label}`, _captured && !Array.isArray(_captured.compiledPlan));
+    if (rd) check(`routeDecision still carried for ${label}`, _captured && _captured.routeDecision && _captured.routeDecision.taskType === rd.taskType);
+    handoff.complete(rr.taskId, null, 'done', 'test');
+  }
+
+  // Skill-lane envelopes keep the hoist — the gate must not block them.
+  // Compile may still return null (backend down) but the POST must land and
+  // the skip must NOT have happened at the envelope gate.
+  for (const [label, rd] of [
+    ['suggestedIntent=command_automate', { suggestedIntent: 'command_automate', taskType: 'browser' }],
+    ['taskType=local_file + null intent (task-shaped)', { taskType: 'local_file', suggestedIntent: null }],
+    ['taskType=messaging + null intent (task-shaped)', { taskType: 'messaging', suggestedIntent: null }],
+  ]) {
+    _captured = null;
+    const rr = await handoff.execute({
+      englishPrompt: `skilllane ${label} ${Date.now()} — reply ok`,
+      source: 'text',
+      sessionId: 'test-session',
+      routeDecision: rd || undefined,
+    });
+    // Compile runs an LLM stepgen before notify — poll up to 30s for the POST.
+    const deadline = Date.now() + 30000;
+    while (!_captured && Date.now() < deadline) await new Promise(r => setTimeout(r, 250));
+    check(`dispatch reached main for ${label}`, _captured && _captured.taskId === rr.taskId);
+    handoff.complete(rr.taskId, null, 'done', 'test');
+  }
+
   server.close();
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

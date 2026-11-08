@@ -51,7 +51,7 @@ const planningNode = require('./nodes/planning.cjs');
 const { execute: statusCheck, isAmbientStateQuery } = require('./nodes/statusCheck.cjs');
 const { execute: controlSignal } = require('./nodes/controlSignal.cjs');
 const screenNode = require('./nodes/screen.cjs');
-const { execute: handoff, complete: handoffComplete, remove: handoffRemove, startRetrySweep: startHandoffRetrySweep } = require('./handoff.cjs');
+const { execute: handoff, complete: handoffComplete, remove: handoffRemove, startRetrySweep: startHandoffRetrySweep, releaseTaskLocks } = require('./handoff.cjs');
 const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
 const intentGuesser = require('./intentGuesser.cjs');
 const { isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply } = require('./planReply.cjs');
@@ -59,7 +59,7 @@ const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = req
 const taskJournal = require('./taskJournal.cjs');
 const artifactReferent = require('./artifactReferent.cjs');
 const agentLock = require('./agentLock.cjs');
-const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT, isPublicWebResearch } = require('./route-decision.cjs');
+const { classifyRoute, canSkipCapabilityGate, serializeDecision, LANE_BY_INTENT, isPublicWebResearch, SERVICE_TASK_TYPES } = require('./route-decision.cjs');
 const { askEarly } = require('./llm-providers.cjs');
 
 // ── Guardian/trigger rules — entry guard + passphrase-gated management ───────
@@ -1008,6 +1008,11 @@ taskJournal.setBroadcast(_broadcastTasks);
 // Feed task completions into the thought engine as 'queue' inputs — the engine
 // gains awareness of its own dispatched work and can correlate artifacts back.
 taskJournal.setOnTerminal((task) => {
+  // Every terminal transition releases whatever lane the task holds — exit
+  // paths that skip complete()/remove() (direct updateTask writes, killed
+  // drivers, test endpoints) otherwise strand the lane for the full 10-min
+  // lock TTL, parking live tasks behind a dead holder.
+  try { releaseTaskLocks(task.id, task.agentId); } catch (_) {}
   _notifyThoughtEngine('queue', {
     taskId: task.id,
     status: task.status,
@@ -1106,7 +1111,44 @@ function _listSessionMessages(sessionId) {
               return `${m.sender === 'user' ? 'User' : 'Assistant'}: ${scoped.substring(0, 200)}`;
             })
             .join('\n');
-          resolve({ sessionId, history: formatted || null });
+          // Context bodies — the FULL shared material ([Highlighted:]/[Context:]
+          // blobs, long pastes, prior answers) a follow-up refers to. Kept OUT
+          // of `history`: that string feeds judgments which must read the ask
+          // (AGENTS.md, history-scope tests). Content consumers — the handoff
+          // stepgen — pick it up from this field instead.
+          let contextBodies = null;
+          try {
+            const _bodies = [];
+            const _seen = new Set();
+            const _push = (label, text, cap) => {
+              const t = String(text || '').trim();
+              if (!t) return;
+              const k = t.slice(0, 160);
+              if (_seen.has(k)) return;
+              _seen.add(k);
+              _bodies.push(`=== ${label} ===\n${t.slice(0, cap)}`);
+            };
+            for (const m of messages.filter(x => x.sender === 'user').slice(0, 10)) {
+              const full = m.text || m.content || '';
+              if (!full) continue;
+              try {
+                for (const a of computeTurnFacts({ rawText: full }).attachments || []) {
+                  if (a.kind === 'file' || a.kind === 'folder' || String(a.value || '').length < 40) continue;
+                  _push(`Shared content (${a.kind})`, a.value, 6000);
+                }
+              } catch (_) {}
+              if (full.trim().length > 400) _push('Shared content (user)', full, 4000);
+            }
+            for (const m of messages.filter(x => x.sender === 'assistant').slice(0, 4)) {
+              const full = m.text || m.content || '';
+              if (full.trim().length > 200) _push('Prior answer', full, 4000);
+            }
+            if (_bodies.length) {
+              let _total = 0;
+              contextBodies = _bodies.filter(b => (_total += b.length) <= 16000).join('\n\n');
+            }
+          } catch (_) { contextBodies = null; }
+          resolve({ sessionId, history: formatted || null, contextBodies });
         } catch (_) { resolve({ sessionId, history: null }); }
       });
     });
@@ -1444,6 +1486,10 @@ async function processMessage(args) {
   const routedSessionId = args.sessionId || routeResult?.sessionId || null;
   if (routedSessionId) _lastSessionId = routedSessionId;
   const convHistory = routeResult?.history || null;
+  // Full shared-material bodies ([Highlighted:]/pastes/prior answers) the
+  // follow-up refers to — out of the judgment-facing history string; the
+  // handoff compile path injects them into the stepgen context.
+  const convContextBodies = routeResult?.contextBodies || null;
 
   logger.info('[Process] Translated', {
     wasTranslated, detectedLanguage,
@@ -1898,6 +1944,94 @@ async function processMessage(args) {
     }
   }
 
+  // ── Memory-store veto — corroboration arbitrates the write lane ──────────
+  // memoryStore executes unconditionally once picked: it stores the raw text
+  // and acks — it cannot tell "remember this fact" from a revision directive
+  // on the prior answer ("don't add claude or cursor I used Devin…" stored
+  // verbatim → "I'll remember that", the draft never regenerated; "add the
+  // ship date October 12" stored verbatim → ship-date fact, draft untouched).
+  //
+  // A store pick needs CORROBORATION to keep the lane — either the anchored
+  // store directive regex ("remember that…", "note: …" — a real store intent
+  // the remote leg may have merely echoed) or the envelope naming the memory
+  // family (suggestedIntent memory_store|memory_retrieve — the local model
+  // sometimes flips store↔retrieve but still smells memory). Uncorroborated,
+  // ANY positive non-memory signal demotes to the envelope's lane:
+  // isFollowUp (revision), planShape=complex (multi-step structure detected
+  // under the store pick), targetService, needsClarification, or an explicit
+  // non-memory suggestedIntent. taskType stays out — content being stored
+  // legitimately LOOKS like a task ("my standup is at 9:15am" → scheduling).
+  // Bare statements ("my wifi is X") have neither anchor nor a positive
+  // non-memory signal → fail-open, they keep the express store lane.
+  // Imperative fragments are never fact statements. "add the ship date",
+  // "don't add claude or cursor", "take out the hashtags" are directives
+  // to MUTATE an existing artifact — the grammar is the discriminator.
+  // Hoisted: the intent-0 path consults the same verdict below.
+  const _u5 = String(turnFacts?.userText || englishText || '');
+  // Optional leading connectors ("also mention", "and remove", "now change")
+  // don't soften the directive — skip them before testing the verb.
+  const _imperativeFragment = /^\s*(?:(?:also|and|too|now|then|please|just|so|but)\s+)*(?:add|remove|delete|change|update|make|include|mention|take\s+out|drop|put\s+in|replace|fix|edit|modify|rewrite|regenerate|set|keep|don'?t|do\s+not)\b/i.test(_u5);
+  let _revVerdict = undefined; // cached revision-directive verdict
+
+  if (intent === 5) {
+    _routeDecision = _routeDecision || await _routeDecisionP;
+    let _guessedStore = false;
+    try { _guessedStore = require('./intentGuesser.cjs').guess(englishText, { hasSelectionContext }).guessedIntent === 'memory_store'; } catch (_) {}
+    if (_imperativeFragment && !_guessedStore) {
+      // A revision directive mutates an in-conversation artifact — the
+      // lexical match proposes, the semantic verdict decides (AGENTS.md):
+      // YES → general_quick composes the revision inline; NO/null → the
+      // envelope lane stands (a named service is a real imperative —
+      // "add the meeting to my calendar"). A targetService read on an
+      // imperative fragment is often context bleed ("ship date" →
+      // messaging → real Gmail send attempt, observed e2e), so the
+      // verdict outranks it.
+      _revVerdict = await _decision.confirmJudgment({
+        site: 'revision-directive',
+        question: 'Does the user\'s message ask to change, add to, or remove something from an artifact already produced earlier in this conversation (a draft, written text, or a prior answer) — rather than to perform an action on an app or service?',
+        state: `Recent conversation:\n${String(context || '').slice(-1600)}\n\nCurrent request: ${_focusState(turnFacts) || _u5}`,
+        timeoutMs: 6000,
+      });
+      const _revise = _revVerdict === 'YES' || (_revVerdict == null && !_routeDecision?.targetService);
+      const _demoted = _revise ? 1 : ((_routeDecision && LANE_BY_INTENT[_routeDecision.lane]) ?? 0);
+      const _demotedName = _revise ? 'general_quick'
+        : ((_routeDecision && _routeDecision.lane in LANE_BY_INTENT) ? _routeDecision.lane : 'handoff');
+      logger.info(`[Process] Imperative-fragment veto memory_store → ${_demotedName}`, {
+        taskType: _routeDecision?.taskType || null, revVerdict: _revVerdict,
+        inputPreview: _u5.substring(0, 60), was: classifySource,
+      });
+      intent = _demoted;
+      intentName = _demotedName;
+      confidence = Math.min(confidence || 0.9, 0.85);
+      classifySource = 'imperative_veto';
+    } else if (_routeDecision && _routeDecision.lane !== 'memory_store') {
+      // Corroboration is direction-specific: only memory_store confirms a
+      // STORE pick. memory_retrieve says the envelope read a RETRIEVAL —
+      // storing a "when is my standup" question verbatim corrupts memory
+      // forever (observed: "I'll remember that your standup meeting is
+      // when." — a retrieval question became a fact).
+      const _memFamily = _routeDecision.suggestedIntent === 'memory_store';
+      const _nonMemSignal = _routeDecision.isFollowUp === true
+        || _routeDecision.planShape === 'complex'
+        || !!_routeDecision.targetService
+        || _routeDecision.needsClarification === true
+        || (!!_routeDecision.suggestedIntent && !_memFamily);
+      const _memVeto = !_guessedStore && !_memFamily && _nonMemSignal;
+      if (_memVeto) {
+        const _demoted = LANE_BY_INTENT[_routeDecision.lane] ?? 0;
+        logger.info(`[Process] RouteDecision vetoes memory_store → ${_routeDecision.lane}`, {
+          taskType: _routeDecision.taskType, isFollowUp: _routeDecision.isFollowUp,
+          suggestedIntent: _routeDecision.suggestedIntent, followUpTarget: _routeDecision.followUpTarget,
+          was: classifySource,
+        });
+        intent = _demoted;
+        intentName = _routeDecision.lane in LANE_BY_INTENT ? _routeDecision.lane : 'handoff';
+        confidence = Math.min(confidence || 0.9, 0.85);
+        classifySource = 'route_verdict_veto';
+      }
+    }
+  }
+
   // ── RouteDecision — the single classification envelope ─────────────────────
   // The envelope was fired at ingress in parallel with classify() — consumers
   // above (selection veto, executor-lane veto) may have already awaited it;
@@ -1919,6 +2053,86 @@ async function processMessage(args) {
       intent = _demoteTo;
       intentName = _routeDecision.lane;
       classifySource = 'route_decision';
+    }
+    // ── Draft guard — produce-text verbs never reach a service agent ─────
+    // "draft a short linkedin post about X" is a writing task — the
+    // deliverable is TEXT. A service-typed envelope read the service noun
+    // as an action target (taskType=messaging targetService=linkedin), and
+    // linkedin.agent composed AND PUBLISHED the "draft" (observed e2e —
+    // a wrong publish cannot be undone; AGENTS.md: ambiguity favors the
+    // low-blast-radius lane). The discriminator is the verb, not the noun:
+    // an anchored produce verb (draft/compose/write/craft/type) with NO
+    // transmit verb keeps the deliverable as text → demote to the lane
+    // that composes inline; its 0-sentinel still self-corrects to handoff
+    // when the ask turns out to need tools. "post" counts as transmit only
+    // in verb position — in "linkedin post" it is the drafted artifact.
+    if (intent === 0 && _routeDecision
+        && (SERVICE_TASK_TYPES.has(_routeDecision.taskType) || _routeDecision.targetService)) {
+      const _u = String(turnFacts?.userText || englishText || '');
+      const _produce = /^\s*(?:please\s+)?(?:draft|compose|write|craft|type|help\s+me\s+(?:write|draft|compose))\b/i.test(_u);
+      // email-as-verb means email + direct object ("email it", "email him the
+      // file") — "email to Jake" is the NOUN phrase ("a short email to my
+      // coworker"), not transmission. Same for "text to". (Observed: "draft
+      // a short email to my coworker" matched transmit → nylas.agent send.)
+      const _transmit = /\b(?:send|sending|publish|submit|share|dm|deliver|upload|forward|email\s+(?:it|this|that|him|her|them|me)\b|text\s+(?:it|this|that|him|her|them|me)\b|post\s+(?:to|on|it|this|that)|tweet\s+(?:it|this|that|out))\b/i.test(_u);
+      if (_produce && !_transmit) {
+        logger.info('[Process] Draft guard — produce-verb without transmit demotes service task → general_quick', {
+          taskType: _routeDecision.taskType, targetService: _routeDecision.targetService || null,
+          inputPreview: _u.substring(0, 60),
+        });
+        intent = 1;
+        intentName = 'general_quick';
+        classifySource = 'draft_guard';
+      }
+    }
+    // Revision-directive check (handoff leg) — an imperative fragment that
+    // survived to handoff may still target in-conversation material ("add
+    // the ship date October 12" after a draft turn). The envelope's service
+    // read on imperative fragments is unreliable (context bleed latched
+    // mcp.time.agent → real Gmail send attempt, observed e2e), so the same
+    // semantic verdict decides; NO/null keeps the task lane.
+    if (intent === 0 && _imperativeFragment) {
+      _routeDecision = _routeDecision || await _routeDecisionP;
+      if (_revVerdict === undefined) {
+        _revVerdict = await _decision.confirmJudgment({
+          site: 'revision-directive',
+          question: 'Does the user\'s message ask to change, add to, or remove something from an artifact already produced earlier in this conversation (a draft, written text, or a prior answer) — rather than to perform an action on an app or service?',
+          state: `Recent conversation:\n${String(context || '').slice(-1600)}\n\nCurrent request: ${_focusState(turnFacts) || _u5}`,
+          timeoutMs: 6000,
+        });
+      }
+      if (_revVerdict === 'YES' || (_revVerdict == null && _routeDecision && !_routeDecision.targetService)) {
+        logger.info('[Process] Imperative-fragment veto handoff → general_quick (revision directive)', {
+          taskType: _routeDecision?.taskType || null, revVerdict: _revVerdict,
+          inputPreview: _u5.substring(0, 60),
+        });
+        intent = 1;
+        intentName = 'general_quick';
+        classifySource = 'imperative_veto';
+      }
+    }
+  }
+
+  // ── Draft guard (planning leg) — the remote leg sometimes picks 6
+  // directly for a produce-text ask ("draft a short tweet…"), skipping
+  // the intent-0 guard entirely; the planning lane then grills for
+  // "missing details" a one-shot draft never needed (observed e2e:
+  // "what's the product?" instead of drafting). Same verb contract:
+  // produce anchored + no transmit → general_quick composes inline.
+  // Exception: when the drafted artifact IS a plan ("draft a plan for
+  // the launch"), planning is the right lane.
+  if (intent === 6) {
+    const _u6 = String(turnFacts?.userText || englishText || '');
+    const _produce6 = /^\s*(?:please\s+)?(?:draft|compose|write|craft|type|help\s+me\s+(?:write|draft|compose))\b/i.test(_u6);
+    const _transmit6 = /\b(?:send|sending|publish|submit|share|dm|deliver|upload|forward|email\s+(?:it|this|to|him|her|them)|text\s+(?:it|this|to|him|her|them)|post\s+(?:to|on|it|this|that)|tweet\s+(?:it|this|that|out))\b/i.test(_u6);
+    const _planArtifact = /\b(?:plan|roadmap|strategy|blueprint)\b/i.test(_u6);
+    if (_produce6 && !_transmit6 && !_planArtifact) {
+      logger.info('[Process] Draft guard — produce-verb without transmit demotes planning pick → general_quick', {
+        inputPreview: _u6.substring(0, 60),
+      });
+      intent = 1;
+      intentName = 'general_quick';
+      classifySource = 'draft_guard';
     }
   }
 
@@ -2092,6 +2306,7 @@ async function processMessage(args) {
         // Session turns fetched at classify — the dispatch-time compile
         // resolves follow-ups ("next chapter 7") against them.
         conversationContext: convHistory || null,
+        contextBodies: convContextBodies,
       });
 
       // Generate intent-aware handoff phrase (LLM for command_automate, static pool for others)
@@ -2131,6 +2346,7 @@ async function processMessage(args) {
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
           conversationContext: convHistory || null,
+          contextBodies: convContextBodies,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi1);
         // Preserve the lane's task-specific ack (routing sentences stripped) —
@@ -2184,6 +2400,7 @@ async function processMessage(args) {
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
           conversationContext: convHistory || null,
+          contextBodies: convContextBodies,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi8);
         const handoffText = handoffResult.parked
@@ -2253,6 +2470,11 @@ async function processMessage(args) {
         // Planning entered mid-conversation — the routed session's recent
         // turns give the lane the context a fragment prompt is missing.
         conversationContext: convHistory || null,
+        // Shared-content bodies (highlighted/attached material from recent
+        // turns) — the lane must see the actual email/doc, not just that a
+        // turn referenced it (observed: "add the bullets it asks for" →
+        // planning asked WHICH document because the body never arrived).
+        contextBodies: convContextBodies,
         // Stream reply prose (translate-back replaces English output, so
         // streaming is disabled for non-English turns).
         onReplyChunk: wasTranslated ? null : onReplyChunk,
@@ -2313,6 +2535,7 @@ async function processMessage(args) {
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
           conversationContext: convHistory || null,
+          contextBodies: convContextBodies,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi7);
         const handoffText = handoffResult.parked
@@ -2349,6 +2572,7 @@ async function processMessage(args) {
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
           conversationContext: convHistory || null,
+          contextBodies: convContextBodies,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi5);
         const handoffText = handoffResult.parked
@@ -2407,6 +2631,7 @@ async function processMessage(args) {
       thoughtContext,
       routeDecision: serializeDecision(_routeDecision),
       conversationContext: convHistory || null,
+      contextBodies: convContextBodies,
     });
     const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _giQ);
     // Keep the lane's task-specific ack minus the routing sentences when one

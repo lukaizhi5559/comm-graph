@@ -66,6 +66,15 @@ describe('intentGuesser — memory_retrieve hints', () => {
     expect('what apps did I use this morning', 'memory_retrieve');
     expect('what did we talk about last week', 'memory_retrieve');
   });
+  it('covers first-person past-activity recall (incl. ungrammatical/STT forms)', () => {
+    expect('what videos have I been watch today', 'memory_retrieve'); // observed flake
+    expect('what videos have I been watching today', 'memory_retrieve');
+    expect('what did I watch yesterday', 'memory_retrieve');
+    expect('what have i been listening to', 'memory_retrieve');
+    expect('what i been watching', 'memory_retrieve');
+    expect('did i watch the game last night', 'memory_retrieve');
+    expect('how long was i on youtube', 'memory_retrieve');
+  });
 });
 
 describe('intentGuesser — web_search hints', () => {

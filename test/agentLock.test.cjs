@@ -99,5 +99,22 @@ tryAcquire(RUN_LOCK_KEY, t10); // parked
 require('../src/taskJournal.cjs').deleteTask(t10); // deleted while parked
 ok(release(RUN_LOCK_KEY, t9) === null, 'deleted waiter skipped, lane drains');
 
+// ── 7. Terminal transitions release lanes (zombie-lock regression) ──────────
+// A task reaching a terminal status through a path that bypasses
+// complete()/remove() (direct updateTask, killed driver, test endpoint) used
+// to strand its lane until the 10-min lock TTL — live tasks parked behind a
+// dead holder (observed: a terminal task held youtube.agent, parking every
+// later task). The journal's onTerminal hook — wired to releaseTaskLocks in
+// server.cjs — frees the lane on ANY terminal transition.
+const { releaseTaskLocks } = require('../src/handoff.cjs');
+journal.setOnTerminal((t) => releaseTaskLocks(t.id, t.agentId));
+const t11 = journal.createTask({ prompt: 'eleventh', intent: 'handoff', source: 'text', agentId: 'youtube.agent' });
+const t12 = journal.createTask({ prompt: 'twelfth', intent: 'handoff', source: 'text', agentId: 'youtube.agent' });
+tryAcquire('youtube.agent', t11);
+tryAcquire('youtube.agent', t12); // parked behind t11
+journal.updateTask(t11, 'failed', { error: 'died without complete()' });
+ok(journal.getTask(t12).status === 'queued', 'terminal holder releases lane — waiter resumes via journal hook');
+ok(isLocked('youtube.agent') === true, 'lane passes to the waiter, not orphaned');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

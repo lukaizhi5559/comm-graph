@@ -439,7 +439,12 @@ async function classify(englishText, conversationContext, opts = {}) {
   // hallucinating telemetry (observed: "what's my battery percentage" →
   // general_quick → "I can't see your device's battery level"). Same class
   // as the live-data exclusion: freshness requires a tool, not a guess.
-  if (DEVICE_STATE_RE.test(englishText)) {
+  // Exempt anchored store-directive openers — "remember that my wifi network
+  // is HomeNet5" is a memory write whose CONTENT happens to name a device
+  // property; the guard turned it into a live system query (observed:
+  // mem-store e2e → shell network query instead of a store).
+  if (DEVICE_STATE_RE.test(englishText)
+      && !/^\s*(?:remember|note|save|store|keep in mind|fyi|for your (?:records|memory|notes))\b/i.test(_askText || englishText)) {
     logger.info('[Classify] Device-state guard → handoff', {
       inputPreview: englishText.substring(0, 60),
     });
@@ -532,6 +537,27 @@ async function classify(englishText, conversationContext, opts = {}) {
   // shape (query, or ambiguous with no service/follow-up signal); envelope
   // unavailable → keep the veto (a faked action is worse than a slow answer).
   const _vetoQuickGated = async (result) => {
+    // Memory pin (mirror of the action veto below): an anchored store
+    // directive ("remember that…", "note: …") proposes memory_store. When
+    // the RouteDecision envelope's own structural answer is ALSO memory-
+    // family (suggestedIntent memory_store|memory_retrieve), two signals
+    // agree and a non-memory remote pick is a content-shape misread — the
+    // remembered text can look like scheduling or planning ("remember that
+    // our team retro is every other Friday" → force-prompt picked 6 while
+    // the envelope itself said memory_retrieve). Lexical guess + envelope
+    // is the sanctioned override; a stray store is cheap to undo, a stray
+    // plan is not.
+    if (result.intent !== 5 && _guessedIntent === 'memory_store') {
+      let _rds = null;
+      try { _rds = opts.routeDecisionP ? await opts.routeDecisionP : null; } catch (_) { _rds = null; }
+      if (_rds && (_rds.suggestedIntent === 'memory_store' || _rds.suggestedIntent === 'memory_retrieve')) {
+        logger.info('[Classify] Memory pin — store-directive guess + memory-family envelope overrule remote pick', {
+          llmIntent: result.intent, suggestedIntent: _rds.suggestedIntent,
+          inputPreview: englishText.substring(0, 60),
+        });
+        return { intent: 5, intentName: 'memory_store', confidence: 0.85, source: 'memory_pin' };
+      }
+    }
     if ((result.intent === 1 || result.intent === 3 || result.intent === 4 || result.intent === 5 || result.intent === 8) && GRAPH_ONLY_INTENTS.has(_guessedIntent)) {
       let _passive = false, _rd = null;
       try {

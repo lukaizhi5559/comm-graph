@@ -72,6 +72,14 @@ async function check(name, p) { tests++; try { const cond = await p; if (cond) {
   _mockReply = '"Chris Johnson ALS"';
   await check('quoted rewrite unwrapped',
     await standaloneSearchQuery('who has ALS?', CTX, null) === 'Chris Johnson ALS');
+  // Transcript-marker leaks are contamination, not flakiness — the model
+  // echoed "Assistant:" INTO the query, meaning the question needs the
+  // transcript; a literal SERP can only answer wrong (live repro: leaked
+  // "Assistant: What was the recruiter's name for the Kforce…" → SERP
+  // picked a public stranger). Skip SERP → context-aware LLM path.
+  _mockReply = 'Assistant: what was the recruiter\u2019s name';
+  await check('role-prefix leak → null (skip SERP)',
+    await standaloneSearchQuery('what was the recruiter\u2019s name?', CTX, null) === null);
 
   // ── No history → verbatim, zero LLM cost ─────────────────────────────
   {
