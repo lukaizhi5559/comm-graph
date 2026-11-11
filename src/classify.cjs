@@ -22,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('./logger.cjs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { BARE_AFFIRM_RE, BARE_DECLINE_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEVICE_STATE_RE, isContextDependent, CONTROL_SIGNAL_RE } = require('../../shared/text-patterns.cjs');
+const { BARE_AFFIRM_RE, BARE_DECLINE_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, ELLIPTICAL_FOLLOWUP_RE, DEVICE_STATE_RE, MEMORY_STORE_DIRECTIVE_RE, isContextDependent, CONTROL_SIGNAL_RE } = require('../../shared/text-patterns.cjs');
 const { isLocalMultiEntityTask } = require('../../shared/context-refs.cjs');
 const _ds = require('../../shared/decision-state.cjs');
 const { deriveRequestText } = require('../../shared/turn-facts.cjs');
@@ -70,7 +70,14 @@ ${intentList}
 
 Return ONLY a single number (${_intentListStr}). No words, no explanation, no punctuation — just the number.`;
 
-  const openPlanLine = openPlan
+  // Only advertise the paused plan when it belongs to THIS session — a
+  // foreign (other-session) plan is context-free bait: the model reads any
+  // topically-adjacent short prompt as "continues that plan" (observed:
+  // "show me examples side-by-side" → intent 6 because a foreign career
+  // plan's "Compile Agent Framework Roadmap" task sounded comparison-shaped).
+  // Cross-session resumes still work — PLAN_RESUME_RE proposes and the
+  // plan-resume verdict decides; they never needed this hint.
+  const openPlanLine = openPlan && openPlan.boundToSession !== false
     ? `\n\nOpen plan: "${openPlan.title}" is paused — ${openPlan.pendingCount} of ${openPlan.totalTasks} tasks still undone (${openPlan.taskTitles.join('; ')}). If this message continues that plan or asks about it, return 6.`
     : '';
 
@@ -233,6 +240,17 @@ async function classify(englishText, conversationContext, opts = {}) {
   // (observed: "click the first result" with a bound tab → local=general_quick
   // vs remote=handoff). ~5ms localhost; awaited lazily inside _localIntent.
   const _extSessP = require('./route-decision.cjs').fetchExtSessions().catch(() => []);
+
+  // Explicit memory writes are a deterministic lane, not planning or
+  // automation. This runs on the scoped ask so a pasted "remember..." example
+  // cannot store the paste itself. The shared predicate excludes transcript
+  // questions and "remember to ..." task requests.
+  if (MEMORY_STORE_DIRECTIVE_RE.test(_askText)) {
+    logger.info('[Classify] Memory-store directive guard → memory_store', {
+      inputPreview: englishText.substring(0, 60),
+    });
+    return { intent: 5, intentName: 'memory_store', confidence: 0.96, source: 'memory_store_directive_guard' };
+  }
 
   // Explicit planning request — deterministic, runs before every other guard.
   // ("plan" inside a bigger automation prompt like "follow this plan" is NOT
@@ -427,7 +445,7 @@ async function classify(englishText, conversationContext, opts = {}) {
   // hallucinates a referent (observed: "when was that" → invented a date).
   // Exception: a captured text selection rides in the payload and IS the
   // referent — "what does this word mean" + highlight is self-contained.
-  if (!hasSelectionContext && DEICTIC_CONTINUATION_RE.test(englishText)) {
+  if (!hasSelectionContext && (DEICTIC_CONTINUATION_RE.test(englishText) || ELLIPTICAL_FOLLOWUP_RE.test(_askText))) {
     logger.info('[Classify] Deictic-continuation guard → handoff', {
       inputPreview: englishText.substring(0, 60),
     });
@@ -743,7 +761,7 @@ async function classify(englishText, conversationContext, opts = {}) {
       history: String(conversationContext || '').split('\n').filter(Boolean).slice(-3),
       extras: [
         _boundHosts.length ? `Bound pages: ${_boundHosts.join(', ')} — prompts acting on/continuing those pages are intent 0 (handoff), NEVER a quick lane.` : '',
-        openPlan ? `Open plan: "${openPlan.title}" paused — ${openPlan.pendingCount}/${openPlan.totalTasks} undone (${(openPlan.taskTitles || []).join('; ')}) — continues/questions about it → planning.` : '',
+        openPlan && openPlan.boundToSession !== false ? `Open plan: "${openPlan.title}" paused — ${openPlan.pendingCount}/${openPlan.totalTasks} undone (${(openPlan.taskTitles || []).join('; ')}) — continues/questions about it → planning.` : '',
       ],
     });
     const r = await decision.askDecision([{

@@ -37,6 +37,7 @@ const {
   DEICTIC_CONTINUATION_RE,
   DEVICE_STATE_RE: _DEVICE_STATE_RE,
   FILE_PATH_RE: _FILE_PATH_RE,
+  MEMORY_STORE_DIRECTIVE_RE,
 } = require('../../shared/text-patterns.cjs');
 
 // ── Intent patterns (ordered by specificity — first match wins) ──────────────
@@ -108,12 +109,7 @@ const INTENT_PATTERNS = [
   {
     intent: 'memory_store',
     test: (text) => {
-      if (/\b(remember\s+(that|this|it)|note\s+(that|this|down)|take\s+a\s+note|write\s+(this|that|it)\s+down|jot\s+(this|that|it)\s+down|keep\s+(this|that|it)\s+in\s+mind|add\s+(this|that|it)\s+to\s+(your\s+)?(memory|notes|records))\b/i.test(text)) return true;
-      // "note: buy milk tomorrow" — colon form needs its own check: a shared
-      // trailing \b can never match after the non-word ':' (same gotcha as
-      // classifier-fallback's memory_store tier).
-      if (/\bnote\s*:/i.test(text)) return true;
-      return false;
+      return MEMORY_STORE_DIRECTIVE_RE.test(text);
     },
   },
 

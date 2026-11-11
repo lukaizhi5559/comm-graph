@@ -90,7 +90,7 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
     await withVerdict('CHAT', async () => {
       const r = await classify('note: buy milk tomorrow');
       check('LLM "0" + CHAT verdict → memory_store keyword adopted',
-        r.intent === 5 && r.source === 'keyword_fallback');
+        r.intent === 5 && (r.source === 'keyword_fallback' || r.source === 'memory_store_directive_guard'));
     });
   });
 

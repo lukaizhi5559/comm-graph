@@ -217,13 +217,26 @@ async function classifyRoute(userMessage, conversationHistory) {
   if (!classifyTask || !userMessage) return null;
   try {
     // classifyTask wants [{role, content}] turns; callers pass the formatted
-    // "User: …\nAssistant: …" string. Coerce — string history is still useful
-    // context, just in the wrong shape.
+    // "User: …\nAssistant: …" string. Coerce — but continuation lines (the
+    // body of a multi-line Assistant answer) belong to the PREVIOUS turn,
+    // not to a new user turn. Flattening them to role:'user' made answer
+    // fragments the newest "user" text — elliptical-follow-up lane inference
+    // then read a filename/list bullet as the prior turn and fell back to
+    // memory_retrieve (observed: Downloads follow-ups → memory_retrieve).
     const convArr = Array.isArray(conversationHistory)
       ? conversationHistory
-      : String(conversationHistory || '').split('\n').filter(Boolean).map(l =>
-          /^Assistant:/i.test(l) ? { role: 'assistant', content: l.replace(/^Assistant:\s*/i, '') }
-                                 : { role: 'user', content: l.replace(/^User:\s*/i, '') });
+      : String(conversationHistory || '').split('\n').reduce((out, line) => {
+          if (/^Assistant:/i.test(line)) {
+            out.push({ role: 'assistant', content: line.replace(/^Assistant:\s*/i, '') });
+          } else if (/^User:/i.test(line)) {
+            out.push({ role: 'user', content: line.replace(/^User:\s*/i, '') });
+          } else if (out.length) {
+            out[out.length - 1].content += '\n' + line;
+          } else {
+            out.push({ role: 'user', content: line });
+          }
+          return out;
+        }, []);
     const tc = await classifyTask(
       userMessage,
       convArr,

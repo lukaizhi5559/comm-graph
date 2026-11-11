@@ -54,7 +54,7 @@ const screenNode = require('./nodes/screen.cjs');
 const { execute: handoff, complete: handoffComplete, remove: handoffRemove, startRetrySweep: startHandoffRetrySweep, releaseTaskLocks } = require('./handoff.cjs');
 const { getHandoffPhrase, getHandoffPhraseForIntent, getCommandAutomatePhrase } = require('./handoffPhrases.cjs');
 const intentGuesser = require('./intentGuesser.cjs');
-const { isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply } = require('./planReply.cjs');
+const { isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply, canInheritOpenPlan, PLAN_EXPLICIT_RESUME_RE } = require('./planReply.cjs');
 const { needsAmbientCtx: _needsAmbientCtx, screenContext: _screenContext } = require('./screen-context.cjs');
 const taskJournal = require('./taskJournal.cjs');
 const artifactReferent = require('./artifactReferent.cjs');
@@ -1514,6 +1514,12 @@ async function processMessage(args) {
   // (no API key in dev), but they carry the actual answers follow-ups need.
   const _localCtx = _formatContext();
   const context = sanitizeContext([convHistory, _localCtx].filter(Boolean).join('\n'));
+  // The isolated/e2e cell deliberately disables conversation-service reads.
+  // The in-process turn buffer still has the preceding turns, so pass the
+  // merged context to the ingress classifier and handoff compiler. Otherwise
+  // every deictic continuation is classified as a fresh standalone prompt
+  // even though the same process just answered its referent.
+  const routeHistory = [convHistory, _localCtx].filter(Boolean).join('\n') || null;
   // Highlighted-context tags ("[Highlighted: …]") ride inside the prompt. Strip
   // them for intent classification/guessing — a code- or command-looking blob
   // would otherwise bias the intent toward handoff. They stay in englishText
@@ -1542,7 +1548,7 @@ async function processMessage(args) {
   // highlight + "message for this" → browser takeover). classifyRoute never
   // rejects (returns null) — the catch is belt-and-suspenders; null means
   // every consumer keeps its pre-envelope behavior.
-  const _routeDecisionP = classifyRoute(classifyText, convHistory)
+  const _routeDecisionP = classifyRoute(classifyText, routeHistory)
     .catch(err => { logger.warn('[Process] RouteDecision error', { error: err?.message }); return null; });
   // [File:]/[Folder:] chips are path POINTERS, not content — generalQuick can't
   // open them, so a selection made only of file refs isn't self-contained QA
@@ -1737,8 +1743,8 @@ async function processMessage(args) {
   const _t = String(classifyText || '').trim();
   // 'resume' is a verb only with a plan/task object — "build me a new
   // resume" (the document) must not count as continuation-shaped.
-  const _resumeish = /\b(?:the|that|this|same|it|my)\s+[\w .-]{0,30}?\s*plan\b|\bresume\s+(?:the\s+|my\s+|that\s+)?(?:plan|task|draft)\b|\b(?:continue|run|start|go\s+ahead|yes|ok|approve|confirm|cancel|exit)\b/i.test(_t)
-    || _t.split(/\s+/).length <= 6;
+  const _explicitResume = PLAN_EXPLICIT_RESUME_RE.test(_t);
+  const _resumeish = _explicitResume || _t.split(/\s+/).length <= 6;
   if (_resumePlanId && intent === 6 && !_resumeish) {
     logger.info('[Process] Dropping classifier resume — new-topic prompt', {
       planId: _resumePlanId, textPreview: _t.slice(0, 60),
@@ -1751,7 +1757,7 @@ async function processMessage(args) {
     // with no open plan so the prompt routes on its own merits.
     if (classifySource === 'plan_resume_guard') {
       ({ intent, intentName, confidence, source: classifySource } =
-        await classify(classifyText, context, { hasSelectionContext, openPlan: null }));
+        await classify(classifyText, context, { hasSelectionContext, openPlan: null, facts: turnFacts, routeDecisionP: _routeDecisionP }));
       logger.info('[Process] Re-classified after dropped resume', {
         intent, intentName, classifySource, textPreview: _t.slice(0, 60),
       });
@@ -2093,15 +2099,23 @@ async function processMessage(args) {
     // semantic verdict decides; NO/null keeps the task lane.
     if (intent === 0 && _imperativeFragment) {
       _routeDecision = _routeDecision || await _routeDecisionP;
-      if (_revVerdict === undefined) {
+      // A concrete real-world taskType means the referent is a thing in the
+      // world, not the answer text — "delete the oldest" after a Downloads
+      // listing is a file op, not an edit to the prior answer (observed e2e:
+      // the semantic verdict read "the oldest" as the answer's artifact and
+      // demoted a real deletion to general_quick). Only query-shaped
+      // envelopes keep the revision verdict.
+      const _realWorldTask = _routeDecision
+        && !['query', 'ambiguous', null, undefined].includes(_routeDecision.taskType);
+      if (!_realWorldTask && _revVerdict === undefined) {
         _revVerdict = await _decision.confirmJudgment({
           site: 'revision-directive',
-          question: 'Does the user\'s message ask to change, add to, or remove something from an artifact already produced earlier in this conversation (a draft, written text, or a prior answer) — rather than to perform an action on an app or service?',
+          question: 'Does the user\'s message ask to change the WORDING of an artifact already produced earlier in this conversation (the text of a draft, written answer, or prior reply — e.g. "make it shorter", "add the date to the email") — rather than to perform an action on a real-world thing that text merely describes (a file, app, service, or account)?',
           state: `Recent conversation:\n${String(context || '').slice(-1600)}\n\nCurrent request: ${_focusState(turnFacts) || _u5}`,
           timeoutMs: 6000,
         });
       }
-      if (_revVerdict === 'YES' || (_revVerdict == null && _routeDecision && !_routeDecision.targetService)) {
+      if (!_realWorldTask && (_revVerdict === 'YES' || (_revVerdict == null && _routeDecision && !_routeDecision.targetService))) {
         logger.info('[Process] Imperative-fragment veto handoff → general_quick (revision directive)', {
           taskType: _routeDecision?.taskType || null, revVerdict: _revVerdict,
           inputPreview: _u5.substring(0, 60),
@@ -2123,10 +2137,46 @@ async function processMessage(args) {
   // the launch"), planning is the right lane.
   if (intent === 6) {
     const _u6 = String(turnFacts?.userText || englishText || '');
+    // ── RouteDecision vetoes planning on follow-up/non-task evidence ───────
+    // Same arbitration contract as the executor/memory vetoes above:
+    // planning is a stateful mode (drafts a plan file, pins the session),
+    // not a text answer — a force-prompt 6 on a conversational follow-up is
+    // a context-blind flake. The envelope sees the history and types the
+    // turn a continuation (isFollowUp) or a non-task lane, never new
+    // plan-shaped work (observed: "show me examples side-by-side" after a
+    // SQL-joins answer → planning → resumed an unrelated paused career plan
+    // and ran its web.search; "but how do you get started making money…" →
+    // an empty ghost draft that pinned the session). Genuine plan-adjacent
+    // asks keep the lane — plan vocabulary, a definite plan referent,
+    // resume phrasing, a resume-guard/capture hit, or a session-bound plan
+    // awaiting input. Demotes to the envelope's own lane; envelope
+    // unavailable → keep the pick (fail-open, same as the executor veto).
+    if (classifySource !== 'planning_pinned' && !_resumePlanId) {
+      _routeDecision = _routeDecision || await _routeDecisionP;
+      const _planEvidence = /\b(?:plans?|planning|brainstorm)\b/i.test(_u6)
+        || (turnFacts?.planRef && turnFacts.planRef.meaningful)
+        || PLAN_EXPLICIT_RESUME_RE.test(_u6)
+        || (_openPlan && _openPlan.boundToSession === true && _openPlan.awaitingInput === true);
+      const _notPlanShaped = !!_routeDecision
+        && (_routeDecision.isFollowUp === true
+          || (!!_routeDecision.lane && _routeDecision.lane !== 'handoff'));
+      if (_notPlanShaped && !_planEvidence) {
+        const _demoted = LANE_BY_INTENT[_routeDecision.lane] ?? 0;
+        logger.info(`[Process] RouteDecision vetoes planning → ${_routeDecision.lane || 'handoff'}`, {
+          taskType: _routeDecision.taskType, isFollowUp: _routeDecision.isFollowUp,
+          lane: _routeDecision.lane, was: classifySource,
+          inputPreview: _u6.substring(0, 60),
+        });
+        intent = _demoted;
+        intentName = _routeDecision.lane in LANE_BY_INTENT ? _routeDecision.lane : 'handoff';
+        confidence = Math.min(confidence || 0.9, 0.85);
+        classifySource = 'route_verdict_veto';
+      }
+    }
     const _produce6 = /^\s*(?:please\s+)?(?:draft|compose|write|craft|type|help\s+me\s+(?:write|draft|compose))\b/i.test(_u6);
     const _transmit6 = /\b(?:send|sending|publish|submit|share|dm|deliver|upload|forward|email\s+(?:it|this|to|him|her|them)|text\s+(?:it|this|to|him|her|them)|post\s+(?:to|on|it|this|that)|tweet\s+(?:it|this|that|out))\b/i.test(_u6);
     const _planArtifact = /\b(?:plan|roadmap|strategy|blueprint)\b/i.test(_u6);
-    if (_produce6 && !_transmit6 && !_planArtifact) {
+    if (intent === 6 && _produce6 && !_transmit6 && !_planArtifact) {
       logger.info('[Process] Draft guard — produce-verb without transmit demotes planning pick → general_quick', {
         inputPreview: _u6.substring(0, 60),
       });
@@ -2305,7 +2355,7 @@ async function processMessage(args) {
         routeDecision: serializeDecision(_routeDecision),
         // Session turns fetched at classify — the dispatch-time compile
         // resolves follow-ups ("next chapter 7") against them.
-        conversationContext: convHistory || null,
+        conversationContext: routeHistory || null,
         contextBodies: convContextBodies,
       });
 
@@ -2345,7 +2395,7 @@ async function processMessage(args) {
           guessedIntent: _gi1,
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
-          conversationContext: convHistory || null,
+          conversationContext: routeHistory || null,
           contextBodies: convContextBodies,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi1);
@@ -2399,7 +2449,7 @@ async function processMessage(args) {
           guessedIntent: _gi8,
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
-          conversationContext: convHistory || null,
+          conversationContext: routeHistory || null,
           contextBodies: convContextBodies,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi8);
@@ -2444,6 +2494,22 @@ async function processMessage(args) {
     }
 
     case 6: { // planning — conversational plan-drafting lane
+      // Foreign-plan absorption guard — findOpenPlan surfaces the most
+      // relevant open plan, which may belong to ANOTHER conversation
+      // session. canInheritOpenPlan is the single predicate for whether this
+      // prompt may continue it: explicit resume vocabulary only for foreign
+      // plans; short reply shapes also count for this session's own plan
+      // (mirrors shouldCaptureShortReply's boundToSession doctrine). Without
+      // it, a short misrouted prompt inherits _activePlanId and mutates an
+      // unrelated paused plan (observed: "show me examples side-by-side" —
+      // a SQL-joins follow-up — bound the career plan and ran its
+      // web.search).
+      const _openPlanResume = canInheritOpenPlan(_openPlan, _t);
+      // Any plan this turn may legitimately continue — governs preferFresh/
+      // forceNewPlan so a non-resume prompt can't inherit _activePlanId via
+      // execute()'s boundId fallback either.
+      const _mayContinuePlan = !!_resumePlanId || _openPlanResume
+        || (_resumeish && !(_openPlan && _openPlan.boundToSession === false));
       result = await planningNode.execute({
         englishText,
         systemPrompt,
@@ -2454,7 +2520,7 @@ async function processMessage(args) {
           // (skipped for fresh-draft requests so "plan a party" doesn't
           // inherit an unrelated paused plan).
           planId: planning?.planId || _resumePlanId
-            || (_openPlan && _resumeish && classifySource !== 'planning_phrase_guard' ? _openPlan.planId : null),
+            || (_openPlanResume && classifySource !== 'planning_phrase_guard' ? _openPlan.planId : null),
           name: planning?.name || null,
           startedExplicit: planning?.startedExplicit === true || classifySource === 'planning_pinned',
           // Capability-gap turns are NEW capability requests — they must not
@@ -2463,13 +2529,13 @@ async function processMessage(args) {
           // Capability-gap turns are NEW capability requests — same for any
           // non-resume-shaped prompt. Without this the _activePlanId fallback
           // in planning.cjs merges unrelated tasks into the last open plan.
-          preferFresh: classifySource === 'capability_gap' || (!_resumeish && !planning?.planId),
-          forceNewPlan: !_resumeish && !planning?.planId && classifySource !== 'planning_pinned',
+          preferFresh: classifySource === 'capability_gap' || (!_mayContinuePlan && !planning?.planId),
+          forceNewPlan: !_mayContinuePlan && !planning?.planId && classifySource !== 'planning_pinned',
         },
         source,
         // Planning entered mid-conversation — the routed session's recent
         // turns give the lane the context a fragment prompt is missing.
-        conversationContext: convHistory || null,
+        conversationContext: routeHistory || null,
         // Shared-content bodies (highlighted/attached material from recent
         // turns) — the lane must see the actual email/doc, not just that a
         // turn referenced it (observed: "add the bullets it asks for" →
@@ -2518,7 +2584,7 @@ async function processMessage(args) {
     case 7: { // screen — direct GhostLayer display lane (no stategraph run)
       result = await screenNode.execute({
         englishText,
-        conversationContext: convHistory,
+        conversationContext: routeHistory,
         sessionId: routedSessionId,
       });
       // The lane couldn't resolve a payload from context (generative chart/
@@ -2534,7 +2600,7 @@ async function processMessage(args) {
           guessedIntent: _gi7,
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
-          conversationContext: convHistory || null,
+          conversationContext: routeHistory || null,
           contextBodies: convContextBodies,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi7);
@@ -2571,7 +2637,7 @@ async function processMessage(args) {
           guessedIntent: _gi5,
           sessionId: routedSessionId,
           routeDecision: serializeDecision(_routeDecision),
-          conversationContext: convHistory || null,
+          conversationContext: routeHistory || null,
           contextBodies: convContextBodies,
         });
         const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _gi5);
@@ -2630,7 +2696,7 @@ async function processMessage(args) {
       sessionId: routedSessionId,
       thoughtContext,
       routeDecision: serializeDecision(_routeDecision),
-      conversationContext: convHistory || null,
+      conversationContext: routeHistory || null,
       contextBodies: convContextBodies,
     });
     const { phrase: basePhrase, guessedIntent } = await _generateHandoffPhrase(englishText, detectedLanguage, context, _giQ);

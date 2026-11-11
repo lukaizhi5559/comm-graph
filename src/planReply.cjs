@@ -19,7 +19,7 @@
 // not an answer to the plan's pending question. go/goto/navigate/browse were
 // missing once and voice navigation commands ("goto john 1") were eaten by
 // an awaiting-input plan.
-const PLAN_REPLY_VERB_RE = /\b(go|goto|navigate|browse|visit|open|launch|play|show|display|search|look|read|click|watch|listen|send|add|create|check|tell|text|call|find|get|set|make|remind|schedule|summarize|give|what|how|when|where|who|why)\b/i;
+const PLAN_REPLY_VERB_RE = /\b(go|goto|navigate|browse|visit|open|launch|play|show|display|search|look|read|click|watch|listen|send|add|create|check|tell|text|call|find|get|set|make|remind|schedule|summarize|give|what|how|when|where|who|why|remember|memori[sz]e|note|save|store|jot|recall|repeat|forget|list|delete|remove|download|upload|print|book|order|buy|pay|email|draft|write|update|edit|change|move|copy|rename|install|restart|shutdown|lock|mute|volume|ask|asks|inquire|wonder)\b/i;
 
 const _ORDINAL_RE = /\b(?:option|choice|pick)\s+\w+|^(?:the\s+)?(?:first|second|third|fourth|fifth|last|top|bottom)\b/i;
 
@@ -65,4 +65,30 @@ function shouldCaptureShortReply(openPlan, ansText) {
   return isPlanAnswerShape(t, openPlan);
 }
 
-module.exports = { PLAN_REPLY_VERB_RE, isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply };
+// Explicit resume vocabulary — "the X plan", "resume the plan", or a
+// continuation/run verb. This is the only evidence allowed to pull a FOREIGN
+// (other-session) plan into the current turn; a session-bound plan also
+// accepts short reply shapes.
+const PLAN_EXPLICIT_RESUME_RE = /\b(?:the|that|this|same|it|my)\s+[\w .-]{0,30}?\s*plan\b|\bresume\s+(?:the\s+|my\s+|that\s+)?(?:plan|task|draft)\b|\b(?:continue|run|start|go\s+ahead|yes|ok|approve|confirm|cancel|exit)\b/i;
+
+/**
+ * May this prompt legitimately continue the open plan findOpenPlan surfaced?
+ * Session stickiness applies to THIS session's plan — a plan bound to a
+ * different conversation is foreign context and only explicit resume
+ * vocabulary may pull it in. Short length alone is not a referent
+ * (observed: "show me examples side-by-side" — a SQL-joins follow-up —
+ * absorbed an unrelated paused career plan, ran its task-2 web search, and
+ * replied "I updated the plan").
+ * @param {object} openPlan - findOpenPlan result ({boundToSession, …})
+ * @param {string} text - the user's message
+ * @returns {boolean}
+ */
+function canInheritOpenPlan(openPlan, text) {
+  if (!openPlan) return false;
+  const t = String(text || '').trim();
+  if (!t) return false;
+  if (openPlan.boundToSession === false) return PLAN_EXPLICIT_RESUME_RE.test(t);
+  return PLAN_EXPLICIT_RESUME_RE.test(t) || t.split(/\s+/).length <= 6;
+}
+
+module.exports = { PLAN_REPLY_VERB_RE, PLAN_EXPLICIT_RESUME_RE, isPlanAnswerShape, shouldPinGate, shouldCaptureShortReply, canInheritOpenPlan };

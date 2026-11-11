@@ -20,7 +20,7 @@
  */
 const assert = require('assert');
 const { classify, _complexityPlanningScore } = require('../src/classify.cjs');
-const { isPlanAnswerShape, shouldPinGate, PLAN_REPLY_VERB_RE, shouldCaptureShortReply } = require('../src/planReply.cjs');
+const { isPlanAnswerShape, shouldPinGate, PLAN_REPLY_VERB_RE, shouldCaptureShortReply, canInheritOpenPlan, PLAN_EXPLICIT_RESUME_RE } = require('../src/planReply.cjs');
 const providers = require('../src/llm-providers.cjs');
 
 const realAsk = providers.ask;
@@ -168,6 +168,46 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
   check('awaiting plan captures option label', shouldCaptureShortReply(foreignPlan && { ...foreignPlan, boundToSession: true }, 'nylas'));
   check('long reply → not captured even when awaiting', !shouldCaptureShortReply(awaitingPlan, 'can you also look up the weather in denver tomorrow morning'));
   check('no plan → not captured', !shouldCaptureShortReply(null, 'yes'));
+
+  // ── canInheritOpenPlan — foreign plans need explicit resume evidence ──────
+  // Regression (2026-11-11): "show me examples side-by-side" — a SQL-joins
+  // follow-up — classified 6 and bound an unrelated paused career plan from
+  // ANOTHER session on length alone (≤6 words counted as resume-shaped). A
+  // foreign plan binds only on explicit resume vocabulary; this session's
+  // own plan keeps the short-reply leniency.
+
+  const foreignOpen = { planId: 'pf', boundToSession: false, awaitingInput: false, pendingCount: 3 };
+  const boundOpen   = { planId: 'pb', boundToSession: true,  awaitingInput: false, pendingCount: 3 };
+
+  check('foreign plan + short non-resume prompt → no inherit',
+    !canInheritOpenPlan(foreignOpen, 'show me examples side-by-side'));
+  check('foreign plan + unrelated question → no inherit',
+    !canInheritOpenPlan(foreignOpen, 'what is the weather today'));
+  check('foreign plan + "continue the plan" → inherit',
+    canInheritOpenPlan(foreignOpen, 'continue the plan'));
+  check('foreign plan + "the career plan" referent → inherit',
+    canInheritOpenPlan(foreignOpen, 'show me the career plan'));
+  check('foreign plan + "resume the task" → inherit',
+    canInheritOpenPlan(foreignOpen, 'resume the task'));
+  check('foreign plan + bare "yes" → inherit (explicit consent vocab, status quo)',
+    canInheritOpenPlan(foreignOpen, 'yes'));
+  check('bound plan + short reply → inherit',
+    canInheritOpenPlan(boundOpen, 'metallic blue'));
+  check('bound plan + long non-resume command → no inherit',
+    !canInheritOpenPlan(boundOpen, 'send an invoice to the client by email'));
+  check('bound plan + explicit resume → inherit',
+    canInheritOpenPlan(boundOpen, 'run the plan'));
+  check('no open plan → no inherit',
+    !canInheritOpenPlan(null, 'continue the plan'));
+  check('empty text → no inherit',
+    !canInheritOpenPlan(boundOpen, ''));
+
+  // "show me examples side-by-side" must NOT count as explicit resume — the
+  // vocabulary is what makes a foreign bind honest.
+  check('"show me examples side-by-side" has no resume vocabulary',
+    !PLAN_EXPLICIT_RESUME_RE.test('show me examples side-by-side'));
+  check('"but how do you get started making money" has no resume vocabulary',
+    !PLAN_EXPLICIT_RESUME_RE.test('but how do you get started making money'));
 
   // ── Capability gate pin mapping ───────────────────────────────────────────
 

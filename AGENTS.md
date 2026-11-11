@@ -25,7 +25,15 @@ not re-derive intent:
   executors with context-free surfaces — a regex pin alone cannot put a
   task-shaped, follow-up, service-named, or clarification-needed prompt on
   them (observed: "search for it" → public SERP for a local-filesystem
-  question).
+  question). intent 6 (planning) is arbitrated the same way: a pick dies on
+  `isFollowUp` or a non-handoff envelope lane absent plan evidence —
+  plan vocabulary, a definite plan referent, resume phrasing, or a
+  session-bound plan awaiting input (observed: "show me examples
+  side-by-side" → planning → bound an unrelated paused career plan and ran
+  its stale web.search). Session stickiness only applies to THIS session's
+  plan: `planReply.canInheritOpenPlan` is the single inheritance predicate —
+  foreign (other-session) plans bind on explicit resume vocabulary only,
+  never short length.
 - **The handoff carries it** via `routeDecision` → `state._taskClassification`
   — `parseIntentV2`, `gatherPlanContext`, `resolveReferencesV2` consume the
   seeded verdict. `planShape: 'single'` suppresses `no_skill_coverage`
