@@ -1936,7 +1936,14 @@ async function processMessage(args) {
                 && !isPublicWebResearch(_routeDecision)))
         : (!!_routeDecision.targetService
             || _routeDecision.requiresDOM === true
-            || (_routeDecision.taskType && ['local_file', 'messaging', 'scheduling', 'browser'].includes(_routeDecision.taskType)));
+            || (_routeDecision.taskType && ['local_file', 'messaging', 'scheduling', 'browser'].includes(_routeDecision.taskType))
+            // Envelope typed the turn for a non-display lane — a regex-pinned
+            // display lane must not preempt it (observed: "look into this
+            // company on my screen" → bare locative matched the output guard
+            // → screen lane repainted stale results; envelope said
+            // memory_retrieve/live surface). isFollowUp is NOT a signal here:
+            // "show it on my screen" is legitimately follow-up + display.
+            || (_routeDecision.suggestedIntent && _routeDecision.suggestedIntent !== 'screen_display'));
       if (_vetoSignals) {
         logger.info(`[Process] RouteDecision vetoes ${intentName} → handoff`, {
           taskType: _routeDecision.taskType, targetService: _routeDecision.targetService || null,

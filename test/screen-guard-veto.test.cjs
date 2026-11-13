@@ -53,6 +53,43 @@ function check(name, cond) { tests++; if (cond) { passed++; console.log(`  PASS:
       r.intent === 7 && r.source === 'screen_output_guard');
   });
 
+  // ── Bare locative defers to the RouteDecision envelope ─────────────────
+  // "on my screen" is ambiguous evidence: it can locate the referent
+  // (observe) or name the output surface (display). The guard must not
+  // blind-pin — the envelope's suggestedIntent decides.
+  // (Phrasing deliberately avoids SCREEN_OBSERVATION_RE coverage so the
+  // locative-deferral path itself is exercised.)
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify("this company on my screen — tell me what they do", null, {
+      routeDecisionP: Promise.resolve({ taskType: 'query', suggestedIntent: 'memory_retrieve' }),
+    });
+    check('screen-locative + non-display envelope → not display lane',
+      r.intent !== 7 && r.source !== 'screen_output_guard');
+  });
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify('show it on my screen', null, {
+      routeDecisionP: Promise.resolve({ taskType: 'query', suggestedIntent: 'screen_display' }),
+    });
+    check('display ask + screen_display envelope → still screen lane',
+      r.intent === 7 && r.source === 'screen_output_guard');
+  });
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify('put a chart on my screen', null, {
+      routeDecisionP: Promise.resolve({ taskType: 'local_system', suggestedIntent: 'screen_display' }),
+    });
+    check('locative + screen_display envelope → screen lane',
+      r.intent === 7 && r.source === 'screen_output_guard');
+  });
+
+  await withAsk(async () => ({ text: '0', provider: 'mock' }), async () => {
+    const r = await classify('put a chart on my screen');
+    check('locative with no envelope → keeps pin (degraded-mode contract)',
+      r.intent === 7 && r.source === 'screen_output_guard');
+  });
+
   console.log(`\n${passed}/${tests} passed`);
   process.exit(passed === tests ? 0 : 1);
 })().catch(e => { console.error(e); process.exit(1); });

@@ -429,7 +429,33 @@ async function classify(englishText, conversationContext, opts = {}) {
   // Trigger scoped to the ASK — a quoted "show X on my screen" inside pasted
   // material is decoration, not a display command (observed: pasted rule
   // phrasing + "explain this" → screen lane painted the quoted emoji).
-  if (!_serviceRef && !_rulePhrasing && /\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b|\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(_askText)) {
+  // Evidence split: "on (my|the) screen" is a bare locative — it can locate
+  // the referent ("look into this company on my screen" → observe) or name
+  // the output surface ("put it on my screen" → display). Two regex lists
+  // can't settle which; the RouteDecision envelope does (AGENTS.md: no
+  // regex path may blind-pin). Anchored effect commands have no locative
+  // ambiguity and pin instantly.
+  const _anchoredDisplay = /\bmake it (?:rain|snow)\b|\bfireworks?\b|\b(?:clear|hide|dismiss)\s+(?:the\s+|my\s+)?screen\b/i.test(_askText);
+  const _screenLocative = /\bon(?:to)?\s+(?:the|my)\s+screen\b|\bon\s+screen\b/i.test(_askText);
+  let _pinDisplay = false;
+  if ((_anchoredDisplay || _screenLocative) && !_serviceRef && !_rulePhrasing) {
+    if (_anchoredDisplay) {
+      _pinDisplay = true;
+    } else {
+      let _rd = null;
+      try { _rd = opts.routeDecisionP ? await opts.routeDecisionP : null; } catch (_) { _rd = null; }
+      // Envelope unavailable → keep the pin (same degraded-mode contract as
+      // the express veto: fast path exists for speed, we can't know better).
+      _pinDisplay = !_rd || _rd.suggestedIntent === 'screen_display';
+      if (_rd && _rd.suggestedIntent && _rd.suggestedIntent !== 'screen_display') {
+        logger.info('[Classify] Screen-locative deferred — envelope names non-display lane', {
+          suggestedIntent: _rd.suggestedIntent, taskType: _rd.taskType || null,
+          inputPreview: englishText.substring(0, 60),
+        });
+      }
+    }
+  }
+  if (_pinDisplay) {
     logger.info('[Classify] Screen-output guard → screen lane', {
       inputPreview: englishText.substring(0, 60),
     });
