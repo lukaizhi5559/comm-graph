@@ -2817,23 +2817,12 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   // "a plan for X" (indefinite) is a draft request — never a referent.
   if (referentHit) {
     _activity(`searching saved plans for "${refMatch[1].trim()}"…`);
-    const hits = sysMap.findPlans(refMatch[1]);
+    // Name/title/ID only — a definite referent resolves deterministically.
+    // Content-fuzz must never hijack the session onto an unrelated plan
+    // (observed: "forgot that plan" fuzzy-matched a saved plan's prompt).
+    const hits = sysMap.findPlansByName(refMatch[1]);
     const top = hits[0];
-    const clearTop = !!(top && top.planId !== sess.planId && (!hits[1] || hits[1].score < top.score));
-    // findPlans fuzzes on ANY token overlap — a weak top hit must not hijack
-    // the session. score >= 6 auto-binds (the documented reroute floor,
-    // same as the server-level referent path); below it the decision model
-    // confirms rather than silently binding the wrong plan. Model-down → no
-    // bind: a wrong bind is worse than continuing the draft.
-    let canBind = clearTop && (top.score || 0) >= 6;
-    if (clearTop && !canBind) {
-      const verdict = await decision.confirmJudgment({
-        site: 'plan-referent',
-        question: `The user's message is "${String(englishText || '').slice(0, 200)}". A saved plan "${top.name || top.title || top.planId}" fuzzy-matched it only weakly. Is the user referring to that saved plan?`,
-        state: String(conversationContext || '').slice(0, 800),
-      });
-      canBind = verdict === 'YES';
-    }
+    const canBind = !!(top && top.planId !== sess.planId && (!hits[1] || hits[1].score < top.score));
     if (canBind) {
       const { sess: opened, reopened } = _openPlanForSession(top.planId, sessionId);
       if (opened) {
@@ -3077,6 +3066,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
   const sessToolCalls = [];
   let stallChecked = false;
   let stallRecovered = false;
+  let resultsNarratedCorrected = false;
   let repeatCorrected = false;
   let phantomCorrected = false;
 
@@ -3169,6 +3159,26 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       sess.history.push({ role: 'assistant', content: cleanText });
       sess.history.push({ role: 'user', content: `<tool_results>\n${toolResults}${fabricatedResults ? '\n\nNOTE: a <tool_results> block you wrote was removed — results are system-generated. Trust ONLY the entries above.' : ''}\n</tool_results>` });
       toolNotes = (toolNotes ? toolNotes + '\n' : '') + toolResults;
+      continue;
+    }
+
+    // A tool result was already produced in an earlier round, but the model
+    // sometimes repeats its pre-tool narration instead of answering from the
+    // results ("I'll search your messages…"). That is not the same stall as
+    // claiming work with no tools at all: the lookup did happen, so give the
+    // model one bounded reminder to use the real result before falling back
+    // to the normal honesty gate.
+    if (sessToolCalls.length && !resultsNarratedCorrected
+        && round < MAX_TOOL_ROUNDS
+        && (_CLAIM_TOOL_WORK_RE.test(_stripMarkers(cleanText))
+          || _CLAIM_COMPLETION_RE.test(_stripMarkers(cleanText)))) {
+      resultsNarratedCorrected = true;
+      _activity('results returned — composing the answer…', 'plan');
+      sess.history.push({ role: 'assistant', content: cleanText });
+      sess.history.push({ role: 'user', content: '<tool_results>\n'
+        + 'The requested tool work already ran and its real results are above. '
+        + 'Answer using those results now; do not promise to search or check again. '
+        + 'If the results are empty or inconclusive, say that plainly.\n</tool_results>' });
       continue;
     }
 
@@ -3469,6 +3479,17 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
     sess._needsInfo = sess._needsInfo || 'clarify';
   }
 
+  // Do not leave a session pinned to an empty draft that is neither asking a
+  // clarification nor holding tasks. It is only a placeholder created while
+  // the planning lane was evaluating the prompt; keeping it bound makes every
+  // later command enter planning_pinned and appear to do nothing.
+  let releasePin = false;
+  if (!sess.tasks.length && !sess._needsInfo && sessionId && !exitPlanning) {
+    releasePin = true;
+    if (_sessionToPlan.get(sessionId) === sess.planId) _sessionToPlan.delete(sessionId);
+    if (_activePlanId === sess.planId) _activePlanId = null;
+  }
+
   return {
     text: spoken,
     fullText: spoken,
@@ -3496,6 +3517,7 @@ async function execute({ englishText, systemPrompt, sessionId, planning = {}, so
       // detail) — the feed can show "awaiting your reply" instead of looking
       // like work in progress.
       needsInfo: sess._needsInfo || null,
+      releasePin,
     },
   };
 }

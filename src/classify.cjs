@@ -25,7 +25,7 @@ const logger = require('./logger.cjs');
 const { BARE_AFFIRM_RE, BARE_DECLINE_RE, OFFER_RE, BARE_FOLLOWUPS, CONVERSATION_RECALL_RE, SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, ELLIPTICAL_FOLLOWUP_RE, DEVICE_STATE_RE, MEMORY_STORE_DIRECTIVE_RE, isContextDependent, CONTROL_SIGNAL_RE } = require('../../shared/text-patterns.cjs');
 const { isLocalMultiEntityTask } = require('../../shared/context-refs.cjs');
 const _ds = require('../../shared/decision-state.cjs');
-const { deriveRequestText } = require('../../shared/turn-facts.cjs');
+const { deriveRequestText, PLAN_EXISTENCE_RE } = require('../../shared/turn-facts.cjs');
 
 // ── Intent definitions ─────────────────────────────────────────────────────────
 const INTENTS = {
@@ -139,7 +139,7 @@ function _lastAssistantTurn(conversationContext) {
 // ── Planning-detection guards ────────────────────────────────────────────────
 // Explicit "let's plan / brainstorm / come up with a plan" phrasing → planning
 // lane deterministically (the LLM slips these to general_quick or handoff).
-const PLANNING_PHRASE_RE = /\b(?:let'?s|lets|help me|i want to|i need to|we need to|can we|wanna)\s+(?:make|create|build|come up with|work out|draft|do|start)\s+(?:a\s+|an\s+|the\s+|some\s+|up\s+a\s+)?plan\b|\bcome up with a plan\b|\bplan (?:out|for|to)\b|\bmake a plan\b|\bcreate a plan\b|\bdraft a plan\b|\bplanning mode\b|\bbrainstorm\b|\bwork out a plan\b|\bplanning session\b|\b(?:let'?s|lets)\s+plan\b|\bwork\s+out\s+(?:an?\s+|the\s+)?(?:idea|approach|plan|strategy)\b|\bthink\s+(?:it|this|that|things)\s+through\b|\bthink\s+through\s+(?:an?\s+idea|this|the\s+\w+)\b|\bfigure\s+out\s+(?:an?\s+|the\s+)?(?:approach|idea|plan|strategy|way\s+forward)\b|\bhash\s+out\s+(?:the\s+|some\s+)?(?:details|idea|ideas|plan|approach)\b|\bmap\s+out\s+(?:a\s+|an\s+|the\s+)?(?:plan|idea|approach|strategy|roadmap)\b|\bpick\s+your\s+brain\b/i;
+const PLANNING_PHRASE_RE = /\b(?:let'?s|lets|help me|i want to|i need to|we need to|can we|wanna)\s+(?:make|create|build|come up with|work out|draft|do|start)\s+(?:a\s+|an\s+|the\s+|some\s+|up\s+a\s+)?plan\b|\bcome up with a plan\b|\bplan (?:out|for|to)\b|\bmake a plan\b|\bcreate a plan\b|\bdraft a plan\b|\bplanning mode\b|\bplan mode\b|\bbrainstorm\b|\bwork out a plan\b|\bplanning session\b|\b(?:let'?s|lets)\s+plan\b|\bwork\s+out\s+(?:an?\s+|the\s+)?(?:idea|approach|plan|strategy)\b|\bthink\s+(?:it|this|that|things)\s+through\b|\bthink\s+through\s+(?:an?\s+idea|this|the\s+\w+)\b|\bfigure\s+out\s+(?:an?\s+|the\s+)?(?:approach|idea|plan|strategy|way\s+forward)\b|\bhash\s+out\s+(?:the\s+|some\s+)?(?:details|idea|ideas|plan|approach)\b|\bmap\s+out\s+(?:a\s+|an\s+|the\s+)?(?:plan|idea|approach|strategy|roadmap)\b|\bpick\s+your\s+brain\b/i;
 
 // Plan-resume vocabulary — fires only when an open (paused) plan exists, so
 // the false-positive surface is bounded. Approval words are deliberately
@@ -255,7 +255,11 @@ async function classify(englishText, conversationContext, opts = {}) {
   // Explicit planning request — deterministic, runs before every other guard.
   // ("plan" inside a bigger automation prompt like "follow this plan" is NOT
   // matched — the phrases above require intent-to-draft framing.)
-  if (PLANNING_PHRASE_RE.test(_askText)) {
+  // Plan-EXISTENCE asks are excluded: "do we have a plan for X" contains the
+  // bare "plan for" phrase but asks about a saved plan — the probe answers
+  // it (plan-existence questions may be plan-shaped but never enter the lane).
+  const _planExistAsk = opts.facts?.planAsk === true || PLAN_EXISTENCE_RE.test(_askText);
+  if (PLANNING_PHRASE_RE.test(_askText) && !_planExistAsk) {
     logger.info('[Classify] Planning phrase guard → planning', {
       inputPreview: englishText.substring(0, 60),
     });

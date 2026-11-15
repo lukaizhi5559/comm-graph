@@ -41,7 +41,7 @@ const { toEnglish, fromEnglish, normalizeLanguage } = require('./translate.cjs')
 const { buildSystemPrompt, fetchOverlay, fetchMoodContext } = require('./persona.cjs');
 const { classify, INTENTS, GRAPH_ONLY_INTENTS } = require('./classify.cjs');
 const { sanitizeContext, isRoutingPromise, stripRoutingPromises } = require('./refusal.cjs');
-const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE, isLocalFileEdit, NAMED_APP_RE } = require('../../shared/text-patterns.cjs');
+const { FILE_REF_TAG_LINE_RE, ATTACHMENT_TAG_RE, LIVE_PAGE_REF_RE, isLocalFileEdit, NAMED_APP_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE } = require('../../shared/text-patterns.cjs');
 const { computeTurnFacts, deriveRequestText } = require('../../shared/turn-facts.cjs');
 const { replaceVocalizationTags, createVocalizationMapper } = require('../../shared/vocalization-tags.cjs');
 const { execute: generalQuick } = require('./nodes/generalQuick.cjs');
@@ -114,7 +114,13 @@ async function _guardianCommand(text, args) {
       return _guardianReply('Passphrase required — say: guardian add <passphrase> <rule JSON>');
     }
     try {
-      const r = _rulesMod.addRule(JSON.parse(rest.join(' ')));
+      const parsed = JSON.parse(rest.join(' '));
+      // Guard actions require a passcode — a dismissible-by-click block rule
+      // protects no one. Refuse the add until a passphrase exists.
+      if (['block', 'ask'].includes(parsed?.then?.action) && !_rulesMod.hasPassphrase()) {
+        return _guardianReply('This rule blocks content — a guardian passcode is required first. Say "guardian passphrase <code>" to set one, then add the rule again.');
+      }
+      const r = _rulesMod.addRule(parsed);
       return _guardianReply(r.ok ? `Rule "${r.rule.id}" added.` : `Rule not added: ${r.error}`);
     } catch (e) {
       // Not JSON — treat the remainder as natural-language rule phrasing.
@@ -147,6 +153,23 @@ async function _guardianCommand(text, args) {
 // explicit "rule confirm" — passphrase-gated when one is set. Match/fire paths
 // contain no model; the model appears only at authoring.
 let _pendingRule = null; // {rule, authed}
+
+// ── Plan-offer state ────────────────────────────────────────────────────────
+// An implicit planning pick (deliverable/complexity/missing-detail/capability-
+// gap/LLM — anything without explicit plan vocabulary) no longer enters the
+// lane silently: comms asks "want a plan?" first. The pending offer stores the
+// ORIGINAL prompt so a consent reply replays it into planning, not the "yes".
+const _PLAN_OFFER_TTL_MS = 5 * 60 * 1000;
+const _pendingPlanOffers = new Map(); // sessionId → {prompt, ts}
+// Sources that may enter planning without asking — explicit plan vocabulary,
+// resume paths, named referents, and machine escalations.
+const _PLAN_OFFER_EXPLICIT = new Set([
+  'planning_pinned', 'planning_phrase_guard', 'plan_resume_guard',
+  'open_plan_reply', 'plan_offer_consent', 'plan_referent', 'fresh_plan_sentinel',
+]);
+// Ideation openers — "I have an idea" / "working on X and need help" ask for a
+// plan offer even when classify routes them to chat (deterministic, per spec).
+const _IDEATION_OFFER_RE = /\bi have an?\s+idea\b|\bi'?ve got an?\s+idea\b|\bworking on\b[\s\S]{0,80}\b(?:need|could use)\s+(?:some\s+)?help\b|\bi need\s+(?:some\s+)?help\s+(?:with|on|figuring\s+out|planning)\b|\bhelp me\s+(?:think|figure|work|sort)\s+(?:this|it|things?)\s+(?:out|through)\b/i;
 
 // Visit-verb alternation shared by the condition↔action patterns — covers the
 // common phrasings observed missing the lane ("goto" one-word, "look at",
@@ -1413,6 +1436,13 @@ async function processMessage(args) {
   if (_pendingRule && /^(?:rule\s+)?(?:confirm|yes)\b/i.test(_userText)) {
     const stash = _pendingRule;
     const pw = _userText.replace(/^(?:rule\s+)?(?:confirm|yes)\s*/i, '');
+    // Guard actions need a passcode to exist at all — a block curtain that
+    // anyone can click away protects no one. The draft survives: the
+    // `guardian` command lane returns before the pending-draft abandon check,
+    // so "guardian passphrase <code>" doesn't drop it.
+    if (['block', 'ask'].includes(stash.rule?.then?.action) && !_rulesMod.hasPassphrase()) {
+      return _guardianReply('This rule blocks content — a guardian passcode is required first. Say "guardian passphrase <code>" to set one, then "rule confirm <code>".');
+    }
     if (_rulesMod.hasPassphrase() && !stash.authed && !_rulesMod.verifyPassphrase(pw)) {
       return _guardianReply('Passphrase required — say: rule confirm <passphrase>');
     }
@@ -1563,6 +1593,24 @@ async function processMessage(args) {
   let intent, intentName, confidence, classifySource;
   let _routeDecision = null; // awaited once; shared by every consumer below
   let _openPlan = null, _resumePlanId = null;
+  // ── Pending plan-offer — the reply answers the OFFER, not a new prompt ────
+  // Consent replays the stored original prompt into the planning lane;
+  // decline answers it as chat; anything else abandons the offer (single-shot).
+  let _offerPrompt = null, _offerDeclined = null, _offerCap = null;
+  if (routedSessionId && _pendingPlanOffers.has(routedSessionId)) {
+    const _offer = _pendingPlanOffers.get(routedSessionId);
+    _pendingPlanOffers.delete(routedSessionId);
+    const _uTrim = String(turnFacts.userText || '').trim();
+    const _fresh = Date.now() - (_offer.ts || 0) < _PLAN_OFFER_TTL_MS;
+    if (_fresh && (turnFacts.confirmish || BARE_AFFIRM_RE.test(_uTrim))) {
+      _offerPrompt = _offer.prompt + (_uTrim.length > 30 ? ` — plus: ${_uTrim}` : '');
+      _offerCap = _offer.cap || null;
+      logger.info('[Process] Plan offer accepted — planning the original prompt', { prompt: _offer.prompt.slice(0, 60) });
+    } else if (_fresh && (BARE_DECLINE_RE.test(_uTrim) || turnFacts.cancelish)) {
+      _offerDeclined = { prompt: _offer.prompt };
+      logger.info('[Process] Plan offer declined — answering original prompt as chat', { prompt: _offer.prompt.slice(0, 60) });
+    }
+  }
   // Stale-pin escape — a UI pin on a finished plan must not keep trapping
   // new prompts in the lane ("planning mode not being handed off"). The pin
   // releases on run-start/cancel/exit markers, but a plan that reached a
@@ -1640,7 +1688,19 @@ async function processMessage(args) {
       }
     } catch (_) { /* escape check fails open — pin stays */ }
   }
-  if (planning && planning.active === true && !_pinTerminal) {
+  if (_offerPrompt) {
+    // Plan-offer consent — the stored original prompt enters the lane.
+    intent = 6;
+    intentName = 'planning';
+    confidence = 1.0;
+    classifySource = 'plan_offer_consent';
+  } else if (_offerDeclined) {
+    // Plan-offer decline — the original prompt answers as chat.
+    intent = 1;
+    intentName = 'general_quick';
+    confidence = 1.0;
+    classifySource = 'plan_offer_declined';
+  } else if (planning && planning.active === true && !_pinTerminal) {
     // Planning mode pinned by the UI (toggle / continue-plan) — bypass the
     // classifier entirely so "yes", edits, and questions stay in the lane.
     intent = 6;
@@ -2158,7 +2218,7 @@ async function processMessage(args) {
     // resume phrasing, a resume-guard/capture hit, or a session-bound plan
     // awaiting input. Demotes to the envelope's own lane; envelope
     // unavailable → keep the pick (fail-open, same as the executor veto).
-    if (classifySource !== 'planning_pinned' && !_resumePlanId) {
+    if (classifySource !== 'planning_pinned' && !_resumePlanId && !_offerPrompt) {
       _routeDecision = _routeDecision || await _routeDecisionP;
       const _planEvidence = /\b(?:plans?|planning|brainstorm)\b/i.test(_u6)
         || (turnFacts?.planRef && turnFacts.planRef.meaningful)
@@ -2299,18 +2359,16 @@ async function processMessage(args) {
     }
   }
 
-  // Plan-referent re-route — messages ABOUT a saved plan ("the nylas plan",
-  // "no the nylas plan", a choice-card label riding back, "i thought we had a
-  // nylas plan") must never become handoff tasks and must land in the lane
-  // that can act on them:
-  //   - definite selection, not informational → planning (referent-switch
-  //     binds the session; status_check would only describe it and the next
-  //     "continue" would re-ask forever)
-  //   - informational ("thought we had…", "do we have…") → status_check
-  //     (_probePlan answers from disk)
+  // Plan-referent re-route — SCOPED recall only. A prompt mentioning "plan"
+  // is never fuzzy-matched against saved plans; recall fires only on:
+  //   - a definite name referent that resolves by name/title/ID
+  //     ("the nylas plan", "the plan for lunch") — definite → planning
+  //     (referent-switch binds), informational question → status_check
+  //   - a time-scoped question ("what plans did I do last week") →
+  //     status_check answers with a windowed listing
   //   - the dismiss sentinel "none of these — start a new plan" → planning
   //     (fresh-draft escape)
-  if (!result && (intent === 0 || intent === 1 || intent === 3) && /\bplan\b|none of these/i.test(turnFacts.userText)) {
+  if (!result && (intent === 0 || intent === 1 || intent === 3) && /\bplans?\b|none of these/i.test(turnFacts.userText)) {
     try {
       const sysMap = require('../../shared/system-map.cjs');
       const s = turnFacts.userText;
@@ -2318,11 +2376,11 @@ async function processMessage(args) {
         logger.info('[Server] Fresh-plan sentinel → planning lane');
         intent = 6;
         intentName = 'planning';
-      } else if (turnFacts.planRef && turnFacts.planRef.meaningful) {
-        // findPlans fuzzes on ANY token overlap ("my current" bound a "current
-        // price" plan on one word) — require a real score before re-routing.
-        const hits = sysMap.findPlans(turnFacts.planRef.token).filter(h => (h.score || 0) >= 6);
-        if (hits.length) {
+        classifySource = 'fresh_plan_sentinel';
+      } else {
+        const _named = (turnFacts.planRef && turnFacts.planRef.meaningful)
+          ? sysMap.findPlansByName(turnFacts.planRef.token)[0] : null;
+        if (_named) {
           // Question-shaped informational hits can still be "asking about the
           // word" — one semantic verdict before hijacking the lane.
           let _referent = !turnFacts.planRef.informational || !turnFacts.isQuestion;
@@ -2335,13 +2393,82 @@ async function processMessage(args) {
           }
           const to = turnFacts.planRef.informational ? 3 : 6;
           if (_referent && to !== intent) {
-            logger.info('[Server] Plan referent re-route', { ref: turnFacts.planRef.token, from: intent, to, informational: turnFacts.planRef.informational });
+            logger.info('[Server] Plan referent re-route (name match)', { ref: turnFacts.planRef.token, planId: _named.planId, from: intent, to, informational: turnFacts.planRef.informational });
             intent = to;
             intentName = to === 6 ? 'planning' : 'status_check';
+            classifySource = 'plan_referent';
+            if (to === 6) _resumePlanId = _named.planId;
           }
+        } else if (turnFacts.planTimeScope
+                   && (turnFacts.isQuestion || /\b(?:show|list|find|open|bring|get|pull|recall)\b/i.test(s))) {
+          // "what plans did I do last week" / "show me tuesday's plans" —
+          // status_check's _probePlanQuery lists the windowed plans.
+          logger.info('[Server] Time-scoped plan query → status_check', { scope: turnFacts.planTimeScope });
+          intent = 3;
+          intentName = 'status_check';
+          classifySource = 'plan_time_query';
+        } else if (turnFacts.isQuestion
+                   && ((turnFacts.planRef && turnFacts.planRef.meaningful && turnFacts.planRef.informational)
+                       || turnFacts.planAsk)) {
+          // "do we have a plan for X" / "i thought we had a plan" with no
+          // name hit — the probe answers found or "no saved plan named X"
+          // instead of a blind chat reply.
+          logger.info('[Server] Plan-existence question → status_check', { ref: turnFacts.planRef?.token || null });
+          intent = 3;
+          intentName = 'status_check';
+          classifySource = 'plan_referent';
         }
       }
     } catch (_) {}
+  }
+
+  // ── Plan-offer gate ─────────────────────────────────────────────────────
+  // A planning pick without explicit plan evidence asks BEFORE entering the
+  // lane — the prompt may be plan-suitable, but silent plan-mode entry is the
+  // bug (observed: ordinary prompts pinned into ghost drafts). Explicit
+  // sources (phrase guard, resume, named referent, UI pin, consent, machine
+  // escalation) still enter directly. Idea openers ("I have an idea",
+  // "working on X and need help") get the same offer deterministically.
+  const _planExplicitEntry = _PLAN_OFFER_EXPLICIT.has(classifySource)
+    || !!_resumePlanId || _offerPrompt != null
+    // Explicit continuation vocabulary with a real open plan — "continue the
+    // plan" is a resume signal, not a plan-suitable prompt (matches
+    // canInheritOpenPlan's foreign-binding predicate).
+    || (_explicitResume && !!_openPlan)
+    || (planning && (planning.escalated === true || !!planning.planId));
+  const _ideaOpener = !_planExplicitEntry && (intent === 0 || intent === 1)
+    && _IDEATION_OFFER_RE.test(String(turnFacts.requestText || ''));
+  if (!result && ((intent === 6 && !_planExplicitEntry) || _ideaOpener)) {
+    const _offerText = 'This sounds like something a plan could help with — want me to draft one?';
+    if (routedSessionId) _pendingPlanOffers.set(routedSessionId, {
+      prompt: englishText, ts: Date.now(),
+      // Capability-gap offers carry the verified options through the ask —
+      // consent restores them so planning still shows the real choices card.
+      cap: (_capHints || _capGateReason || _capNeedsInfo || _capRecommended || _capScreenCtx)
+        ? { hints: _capHints, gateReason: _capGateReason, needsInfo: _capNeedsInfo, recommended: _capRecommended, screenCtx: _capScreenCtx }
+        : null,
+    });
+    logger.info('[Process] Plan offer — implicit planning pick asks first', {
+      was: classifySource, intent, ideaOpener: _ideaOpener,
+    });
+    intent = 1;
+    intentName = 'general_quick';
+    result = {
+      text: _offerText,
+      fullText: _offerText,
+      metadata: {
+        source: 'plan_offer',
+        intent: 1,
+        speakable: true,
+        choices: {
+          question: _offerText,
+          options: [
+            { label: 'Yes — draft a plan', value: 'yes, draft a plan' },
+            { label: 'No thanks', value: 'no thanks' },
+          ],
+        },
+      },
+    };
   }
 
   if (!result) switch (intent) {
@@ -2390,7 +2517,8 @@ async function processMessage(args) {
     }
 
     case 1: { // general_quick
-      result = await generalQuick(englishText, systemPrompt, context, { hasSelectionContext, originalPrompt: originalText, detectedLanguage, routeDecision: _routeDecision, onReplyChunk });
+      // Plan-offer decline answers the STORED original prompt, not the "no".
+      result = await generalQuick(_offerDeclined?.prompt || englishText, systemPrompt, context, { hasSelectionContext, originalPrompt: _offerDeclined?.prompt || originalText, detectedLanguage, routeDecision: _routeDecision, onReplyChunk });
       // If generalQuick couldn't answer (LLM failed), handoff to main state graph
       if (result.metadata.shouldHandoff) {
         const { guessedIntent: _gi1 } = intentGuesser.guess(classifyText, { hasSelectionContext });
@@ -2515,10 +2643,11 @@ async function processMessage(args) {
       // Any plan this turn may legitimately continue — governs preferFresh/
       // forceNewPlan so a non-resume prompt can't inherit _activePlanId via
       // execute()'s boundId fallback either.
-      const _mayContinuePlan = !!_resumePlanId || _openPlanResume
-        || (_resumeish && !(_openPlan && _openPlan.boundToSession === false));
+      const _mayContinuePlan = _offerPrompt ? false
+        : (!!_resumePlanId || _openPlanResume
+        || (_resumeish && !(_openPlan && _openPlan.boundToSession === false)));
       result = await planningNode.execute({
-        englishText,
+        englishText: _offerPrompt || englishText,
         systemPrompt,
         sessionId: routedSessionId,
         planning: {
@@ -2526,10 +2655,10 @@ async function processMessage(args) {
           // planId precedence: explicit UI pin → resume-guard hit → open plan
           // (skipped for fresh-draft requests so "plan a party" doesn't
           // inherit an unrelated paused plan).
-          planId: planning?.planId || _resumePlanId
-            || (_openPlanResume && classifySource !== 'planning_phrase_guard' ? _openPlan.planId : null),
+          planId: _offerPrompt ? null : (planning?.planId || _resumePlanId
+            || (_openPlanResume && classifySource !== 'planning_phrase_guard' ? _openPlan.planId : null)),
           name: planning?.name || null,
-          startedExplicit: planning?.startedExplicit === true || classifySource === 'planning_pinned',
+          startedExplicit: planning?.startedExplicit === true || classifySource === 'planning_pinned' || _offerPrompt != null,
           // Capability-gap turns are NEW capability requests — they must not
           // inherit (and mutate) the session's bound finalized plan. planning.cjs
           // honors this by only reusing a bound session that's still drafting.
@@ -2553,18 +2682,18 @@ async function processMessage(args) {
         onReplyChunk: wasTranslated ? null : onReplyChunk,
         // Capability-gap re-route carried verified candidates — inject them
         // into the planning prompt so <choices> lists real, vetted options.
-        capabilityHints: _capHints,
+        capabilityHints: _capHints || _offerCap?.hints,
         // 'capability_options' — planning shows the verified options list
         // first; 'needsInfo' means a detail (e.g. recipient) must be asked
         // after the user picks a route.
-        gateReason: _capGateReason,
-        needsInfo: _capNeedsInfo,
+        gateReason: _capGateReason || _offerCap?.gateReason,
+        needsInfo: _capNeedsInfo || _offerCap?.needsInfo,
         // The selector's own pick — planning marks it RECOMMENDED on the
         // options card instead of defaulting to the first ready option.
-        recommended: _capRecommended,
+        recommended: _capRecommended || _offerCap?.recommended,
         // Screen context the gate already fetched for ambient prompts — the
         // planning lane opens with eyes instead of asking "what's on screen".
-        screenContext: _capScreenCtx,
+        screenContext: _capScreenCtx || _offerCap?.screenCtx,
       });
       // Auto-entered planning (phrase guard / complexity / intent-6 LLM) —
       // surface WHY so the UI shows "moved to planning" rather than silently

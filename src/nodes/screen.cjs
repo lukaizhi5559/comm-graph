@@ -91,10 +91,11 @@ function _plansDir() {
     || path.join(os.homedir(), '.thinkdrop', 'plans');
 }
 
-// Resolve "the X plan" → {path, title} by searching plan files on disk.
+// Resolve "the X plan" → {path, title} — name/title/ID only; a display
+// referent names the plan, it doesn't search its contents.
 function _findPlanFile(query) {
   try {
-    const hits = require('../../../shared/system-map.cjs').findPlans(query).slice(0, 3);
+    const hits = require('../../../shared/system-map.cjs').findPlansByName(query).slice(0, 3);
     if (!hits.length) return null;
     const dir = _plansDir();
     for (const h of hits) {

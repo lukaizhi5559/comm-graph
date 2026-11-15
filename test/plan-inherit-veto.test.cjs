@@ -162,19 +162,33 @@ Research and execute a career transition into AI engineering.
     !/Open plan:/.test(lastPrompt) && !/Career Transition Roadmap/.test(lastPrompt),
     lastPrompt.slice(0, 120));
 
-  // ── 3. Envelope down → fail-open keeps planning, but NO foreign binding ──
-  // The dispatch guard is the last line: even when the pick survives, a
-  // foreign plan must not be inherited on short-prompt shape alone.
+  // ── 3. Envelope down → the pick survives, but the OFFER asks first ───────
+  // The offer gate sits between classify and dispatch: an implicit 6 with no
+  // plan evidence no longer enters the lane silently — it asks "want a
+  // plan?" first. The foreign plan stays untouched either way; if the user
+  // consents, the replayed prompt dispatches with planId=null + forceNewPlan
+  // (the same non-inheritance the old direct path enforced).
   envelope = null;
   planCalls = [];
-  const r3 = await processMessage({ text: 'show me examples side-by-side' });
-  check('envelope unavailable → fail-open keeps planning',
-    r3.intent === 6 && r3.intentName === 'planning',
-    `got intent=${r3.intent} ${r3.intentName}`);
-  check('dispatch sent planId=null (no foreign inheritance)',
+  const r3 = await processMessage({ text: 'show me examples side-by-side', sessionId: 'sess-veto-3' });
+  check('envelope unavailable → implicit 6 asks before planning',
+    r3.metadata?.source === 'plan_offer' && r3.intent === 1,
+    `got intent=${r3.intent} ${r3.intentName} src=${r3.metadata?.source}`);
+  check('offer → planning lane never dispatched',
+    planCalls.length === 0,
+    `planCalls=${planCalls.length}`);
+  check('foreign plan file not mutated',
+    fs.readFileSync(FOREIGN_PLAN_FILE, 'utf8') === foreignBytes);
+  // Consent replays the stored prompt — still no foreign binding.
+  const r3b = await processMessage({ text: 'yes', sessionId: 'sess-veto-3' });
+  check('offer consent → planning dispatched on the original prompt',
+    r3b.intent === 6 && planCalls.length === 1
+      && planCalls[0].englishText === 'show me examples side-by-side',
+    `got intent=${r3b.intent} calls=${planCalls.length} text=${planCalls[0] && planCalls[0].englishText}`);
+  check('consent dispatch sent planId=null (no foreign inheritance)',
     planCalls.length === 1 && planCalls[0].planning.planId === null,
     `planId=${planCalls[0] && planCalls[0].planning.planId}`);
-  check('dispatch forced a fresh plan (preferFresh + forceNewPlan)',
+  check('consent dispatch forced a fresh plan (preferFresh + forceNewPlan)',
     planCalls.length === 1
       && planCalls[0].planning.preferFresh === true
       && planCalls[0].planning.forceNewPlan === true);

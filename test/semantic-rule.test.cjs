@@ -125,7 +125,14 @@ async function listen(server) {
   check('echo describes the frame + exempt', /content matches/i.test(auth.text) && /except/i.test(auth.text));
   decision.confirmJudgment = realConfirm;
 
-  const conf = await processMessage({ text: 'rule confirm' });
+  // block/ask rules are passcode-gated at authoring — a dismissible-by-click
+  // block protects no one. Refused confirm keeps the draft (the guardian
+  // lane's early return never reaches the pending-draft abandon check).
+  const early = await processMessage({ text: 'rule confirm' });
+  check('block-rule confirm gated without passcode', /passcode is required/i.test(early.text));
+  const passSet = await processMessage({ text: 'guardian passphrase test123' });
+  check('passcode set while draft pending', /passphrase set/i.test(passSet.text));
+  const conf = await processMessage({ text: 'rule confirm test123' });
   check('rule confirm commits', /Rule set:/.test(conf.text));
   const authored = rulesMod.listRules().find(r => r.when?.semanticMatch && !['sem1'].includes(r.id));
   check('semanticMatch persisted', !!authored && authored.when.semanticMatch === 'sexual material, explicit language, or graphic blood and violence');

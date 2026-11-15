@@ -81,14 +81,35 @@ is this turn" — same pattern as stategraph's `taskFacts`
   `'YES' | 'NO' | null` (model down — the caller picks the fallback).
 - Raw `askDecision` stays for multi-option picks / batches (classify intent,
   capability select, spec-completeness, memory attributes).
-- `findPlans` fuzzes on any token overlap — reroute/probe callers require
-  `score >= 6`.
+- `findPlans` fuzzes on any token overlap — it is ONLY the in-lane
+  `plan.find` search tool's matcher. Reroute/probe/display callers use
+  `findPlansByName` (name/title/planId scoring — never prompt/task content);
+  time-scoped recall ("plans last week") goes through `planWindowFor` +
+  `plansInWindow`.
+- **Plan-offer gate.** An intent-6 without explicit plan evidence
+  (deliverable/complexity/missing-detail/capability-gap/LLM picks, plus
+  ideation openers like "I have an idea") emits a `plan_offer` ask instead
+  of entering the lane — consent replays the stored prompt as
+  `plan_offer_consent`, decline answers it via general_quick. Only
+  `planning_pinned|planning_phrase_guard|plan_resume_guard|open_plan_reply|
+  plan_offer_consent|plan_referent|fresh_plan_sentinel`, a `_resumePlanId`,
+  explicit resume vocabulary with an open plan (`PLAN_EXPLICIT_RESUME_RE`
+  + `_openPlan`), or `planning.escalated`/`planning.planId` bypass the offer.
 - Guardian rules: `when` is deterministic; `semanticMatch`/`semanticExempt`
   are the frame/anti-frame exception — `whenMatches` returns false on them
   and callers run `evaluateAsync(ctx, seam, judge)` where the injected judge
   (phi4 decision.answer, two-question frame/exempt batch) decides. Det fields
-  AND first as prefilters; monitorService adds the screenshot as `ctx.image`
-  (d3:2b) — same module, four seams, model-free by construction.
+  AND first as prefilters; monitorService judges two evidence lanes OR'd —
+  OCR text by the text decision model (vision can't read screen text) and
+  the screenshot `ctx.image` by the vision model — same module, four seams,
+  model-free by construction.
+- Guard actions (`block`/`ask`) are passcode-gated at authoring — `rule
+  confirm` and `guardian add` refuse them while no guardian passphrase
+  exists. Their displays post with `locked:true` (Esc/click/clear all skip
+  them); dismissal goes through `rules:guardian:unlock` in main, which
+  verifies the passphrase and stamps `unlockedUntil` via rules.cjs
+  `suppressRule` — a re-arm grace every evaluator honors (guard actions
+  bypass cooldown but not unlock grace).
 
 ## requestText — judgments read the ask, matchers read the turn
 
