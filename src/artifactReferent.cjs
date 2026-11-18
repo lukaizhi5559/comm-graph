@@ -154,12 +154,17 @@ const _GENERIC_PIN_PHRASES = new Set([
  *  same shape. Collecting their tails lets hits drop them without a wordlist
  *  of services. Heads are modifiers that produce data; verbs like send/write/
  *  read are deliberately absent so "send messages to mom" still resolves. */
-const _DATA_COMPOUND_HEAD_RE = /\b(commit|commits?|error|errors?|log|logs?|status|diff|diffs?|push|pull|merge|build|test|tests?|deploy|release|system|audit|debug|console|warning|alerts?|notification|notifications?|chat|chats?|voice|email|e-?mails?|api|server|request|requests?|response|responses?|report|reports?|summar(?:y|ies)|data)\s+([a-z][\w.+-]{2,30})\b/gi;
+// Head can bridge over hash/hex tokens — "amend commits 2eb157d and 5b4c854
+// messages" inserts commit-hashes between head and tail, which plain
+// adjacency missed (observed: weak pin on "messages" → messages.app.agent).
+// The hash run is optional, which reduces to the original <head> <tail>.
+const _DATA_COMPOUND_HEAD_RE = /\b(commit|commits?|error|errors?|log|logs?|status|diff|diffs?|push|pull|merge|build|test|tests?|deploy|release|system|audit|debug|console|warning|alerts?|notification|notifications?|chat|chats?|voice|email|e-?mails?|api|server|request|requests?|response|responses?|report|reports?|summar(?:y|ies)|data)\s+((?:[0-9a-f]{6,40}\s+(?:and\s+|or\s+|,\s*)?)*)?([a-z][\w.+-]{2,30})\b/gi;
 
 function _dataCompoundTails(msg) {
   const tails = new Set();
   for (const m of String(msg || '').matchAll(_DATA_COMPOUND_HEAD_RE)) {
-    tails.add(m[2].toLowerCase().replace(/[.,;:!?'"]+$/g, ''));
+    const tail = m[3] || m[2];
+    if (tail) tails.add(tail.toLowerCase().replace(/[.,;:!?'"]+$/g, ''));
   }
   return tails;
 }

@@ -122,6 +122,14 @@ e = resolveExplicitTool('Stage and commit all uncommitted work across the reposi
 assert.strictEqual(e, null, `"commit messages" must not pin messages.app.agent, got ${e && e.agentId}`);
 e = resolveExplicitTool('check the error messages in the log');
 assert.strictEqual(e, null, `"error messages" is data vocabulary, got ${e && e.agentId}`);
+// Hash-bridged compounds — "amend commits <hash> and <hash> messages" puts
+// commit-hashes between head and tail; plain adjacency missed them and a
+// weak "messages" pin survived into confirmJudgment (task_b6a28db5 ran under
+// messages.app.agent on a git-amend prompt).
+e = resolveExplicitTool('We need to amend commits 2eb157d and 5b4c854 messages. Does this make sense?');
+assert.strictEqual(e, null, `hash-adjacent "messages" must not pin messages.app.agent, got ${e && e.agentId}`);
+e = resolveExplicitTool('swap the commit messages be68d3b and 5b4c854');
+assert.strictEqual(e, null, `"commit messages" before hashes must not pin, got ${e && e.agentId}`);
 // Bare (non-compound) service-name mentions still resolve weak.
 e = resolveExplicitTool('send messages to mom');
 assert(e && e.agentId === 'messages.app.agent', `bare "send messages" should still hit, got ${e && e.agentId}`);

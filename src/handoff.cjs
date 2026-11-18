@@ -53,7 +53,16 @@ function detectAgent(englishPrompt) {
   const { _stripTags } = require('../../shared/decision-state.cjs');
   const clean = _stripTags(englishPrompt).replace(/\S+@\S+/g, ' ');
   for (const { agentId, pattern } of AGENT_PATTERNS) {
-    if (pattern.test(clean)) return agentId;
+    if (!pattern.test(clean)) continue;
+    // Only pin agents the registry actually serves — retired browser
+    // descriptors (spotify, youtube, …) are service hints for the universal
+    // screen lane, and pinning a phantom id creates a dead lane + blocks
+    // plan readiness on a registration that can never exist.
+    try {
+      const svcMap = require('../../shared/service-map.cjs');
+      if (!svcMap.isServiceAgent(agentId)) return null;
+    } catch (_) { return null; }
+    return agentId;
   }
   return null;
 }
@@ -315,13 +324,53 @@ async function _compileTaskSteps(prompt, agentId, { conversationContext = null, 
     return null;
   }
   try {
+    // ── UI-goal detection (runs BEFORE deterministic templates) ───────────
+    // An interactive-UI task (create/add/click/type against an app or page)
+    // belongs on ONE screen.task.agent step carrying the FULL prompt — the
+    // service_task template routes the same goal to the retired dom.act lane
+    // (observed: spotify playlist task compiled to url.first → dom.act).
+    const _interactiveUi =
+      /command_automate|app_automation|browser/.test(String(routeDecision?.taskType || ''))
+      && (String(routeDecision?.webAccessMode || '') === 'interactive'
+        || (Array.isArray(routeDecision?.interactiveActions) && routeDecision.interactiveActions.length > 0));
+    // Classifier-abstain fallback — an 'ambiguous'/empty taskType with an
+    // affirmative lane still carries structural evidence: a named service
+    // (registered OR retired browser descriptor) plus interactive verbs.
+    // Without this, a classifier miss skips compile → stepgen shreds the
+    // goal → no_skill_coverage → the task detours through the planning lane
+    // (observed: "make a playlist … on spotify" parked on a plan card).
+    const _tt = String(routeDecision?.taskType || '');
+    const _uiFallback = !_interactiveUi && (!_tt || /^(ambiguous|app_automation|command_automate)$/.test(_tt))
+      && (() => {
+        const p = String(prompt || '');
+        const hasVerb = /\b(make|create|add|play|open|click|type|send|post|search|rename|delete|remove|upload|download|schedule|book|order|buy|reply|compose|fill|submit|follow|like|share|save|queue|shuffle|skip|pause|resume|mute|join|leave|accept|decline|sign|enable|disable|rename|edit|insert|select|scroll|drag|drop|hover|expand|collapse|capture|print|export|import|sync|install|launch|quit|organize|sort|filter|merge|split|highlight|format|translate|transcribe|summarize|record|listen|watch)\b/i.test(p);
+        if (!hasVerb) return false;
+        // Named service — registered agent, retired browser descriptor, or a
+        // hostname/service-map hit. Anything else stays on the LLM path.
+        for (const { pattern } of AGENT_PATTERNS) { if (pattern.test(p)) return true; }
+        try {
+          const svcMap = require('../../shared/service-map.cjs');
+          const m = p.match(/\b([a-z0-9-]+\.(?:com|net|org|io|ai|app|dev|co|fm|tv|me))\b/i);
+          if (m && svcMap.serviceForUrl(`https://${m[1]}`)) return true;
+        } catch (_) {}
+        return false;
+      })();
+    if (_interactiveUi || _uiFallback) {
+      const _uiPrompt = String(prompt || '').trim();
+      if (_uiPrompt) {
+        logger.info(`[Handoff] deterministic UI compile → single screen.task step (${_uiPrompt.slice(0, 60)})${_uiFallback && !_interactiveUi ? ' [classifier-abstain fallback]' : ''}`);
+        return [{ skill: 'screen.task.agent', args: { prompt: _uiPrompt }, description: `Drive the UI: ${_uiPrompt.slice(0, 70)}` }];
+      }
+    }
+
     // Deterministic templates before the LLM stepgen — a force-classified
     // plan (page_nav_scan, reply_draft, url_open…) is verbatim-validated and
     // needs no generation. Without this the stepgen re-invents steps for
     // shapes the catalog already covers (observed: "give me a response to the
     // message" compiled into "Find and open the conversation" → url.first
     // browser driving; the RouteDecision envelope carries the same tc fields
-    // the template classifier reads).
+    // the template classifier reads). Runs AFTER the UI-goal return — an
+    // interactive-UI task belongs on screen.task, never dom.act.
     try {
       const { forceClassifyLocalPlan } = require('../../stategraph-module/src/utils/localPlanTemplates.js');
       const { _llmBackend } = require('./route-decision.cjs');
@@ -333,6 +382,7 @@ async function _compileTaskSteps(prompt, agentId, { conversationContext = null, 
     } catch (_detErr) {
       logger.info(`[Handoff] deterministic compile skipped — ${_detErr.message}`);
     }
+
     const { _generateTaskSteps } = require('./nodes/planning.cjs');
     const { normalizeTaskStepsAsync, agentFamilyMismatch } = require('../../shared/plan-steps.cjs');
     const { validatePlanSteps } = require('../../shared/skill-contracts.cjs');
@@ -531,7 +581,11 @@ async function execute({ englishPrompt, source, originalPrompt, detectedLanguage
     const _compiled = _canCompile ? await _compileTaskSteps(englishPrompt, agentId, { conversationContext, sessionId, routeDecision, contextBodies }) : null;
     if (_compiled) {
       logger.info(`[Handoff] Compiled ${_compiled.length} steps at dispatch — task ${_compiled.map(s => s.skill).join(' → ').slice(0, 160)}`);
-      updateTask(taskId, 'queued', { compiledSteps: _compiled.length });
+      // Persist the plan itself, not just the count — the re-notify sweep
+      // re-sends the handoff after a missed notify, and without compiledPlan
+      // the stategraph pays the full pipeline (observed: Quiet Hour task
+      // re-notified → no compiled plan → no_skill_coverage → planning lane).
+      updateTask(taskId, 'queued', { compiledSteps: _compiled.length, compiledPlan: _compiled });
     }
     const notified = await _notifyMain(taskId, englishPrompt, agentId, source, originalPrompt, guessedIntent, sessionId, userApproved, thoughtContext, planMeta, detectedLanguage, capabilityReason, routeDecision, _compiled);
     if (!notified) {
@@ -646,7 +700,7 @@ function startRetrySweep() {
       try {
         const guessedIntent = require('./intentGuesser.cjs').guess(task.prompt).guessedIntent;
         const ok = await _notifyMain(task.id, task.prompt, task.agentId, task.source, task.originalPrompt || null,
-          guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null, task.detectedLanguage || null, null, task.routeDecision || null);
+          guessedIntent, task.sessionId, task.userApproved === true, task.thoughtContext || null, task.planMeta || null, task.detectedLanguage || null, null, task.routeDecision || null, task.compiledPlan || null);
         if (ok) _notifyAttempts.delete(task.id);
       } catch (_) { /* next sweep */ }
     }

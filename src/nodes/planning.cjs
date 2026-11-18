@@ -147,6 +147,25 @@ function _getOrCreateSession({ planId, sessionId, originalPrompt, conversationCo
   return sess;
 }
 
+// Dormant-driver sanitize for file-parsed steps — a plan file's `- **Steps**:`
+// JSON block carries whatever the LLM drafted (or the user typed) verbatim;
+// dormant UI vocab (url.first/dom.act/turn.loop) must collapse to
+// screen.task before those steps can render on the card or reach the
+// runner (observed: spotify plan card showing guide.step→url.first→dom.act
+// →turn.loop→synthesize from a mid-generation draft).
+function _sanitizeFileSteps(tasks, userMessage) {
+  let rw = null;
+  try { rw = require('../../../stategraph-module/src/nodes/planSkillsV2.js')._rewriteBrowserStepsToAtomicAgents; } catch (_) {}
+  if (!rw) return;
+  for (const t of tasks || []) {
+    if (!Array.isArray(t.steps) || !t.steps.length) continue;
+    try {
+      const re = rw(t.steps, logger, userMessage || t.prompt || '');
+      if (Array.isArray(re) && re.length) t.steps = re;
+    } catch (_) {}
+  }
+}
+
 function _loadPlanFromDisk(planId) {
   try {
     const filePath = path.join(_plansDir(), _planFileName(planId));
@@ -155,6 +174,7 @@ function _loadPlanFromDisk(planId) {
     const fm = planFormat.parseFrontmatter(content) || {};
     const titleMatch = content.match(/^# Plan:\s*(.+)$/m);
     const tasks = planFormat.parseTasks(content);
+    _sanitizeFileSteps(tasks, fm.original_prompt || '');
     const risks = _parseRisks(content);
     const sess = {
       planId,
@@ -196,6 +216,7 @@ function _refreshSessionFromDisk(sess) {
     const content = fs.readFileSync(sess.filePath, 'utf8');
     const fm = planFormat.parseFrontmatter(content) || {};
     const fresh = planFormat.parseTasks(content);
+    _sanitizeFileSteps(fresh, sess.originalPrompt);
     // Preserve in-memory-only bookkeeping (stepgen dedup state) across the
     // refresh — steps/stepsStatus themselves parse back from the file.
     const prev = new Map((sess.tasks || []).map(t => [t.num, t]));
@@ -307,7 +328,18 @@ const _STEPGEN_FALLBACK = `You are ThinkDrop's execution planner. Convert ONE ta
 into a concrete step list for the skill runtime. Reply with ONLY a fenced json
 block — an array of steps, each {"skill": "...", "args": {...}, "description": "..."}.
 
+DORMANT DRIVERS — NOT EMITTABLE: url.first.agent, dom.act, turn.loop.agent,
+form.fill.agent, browser.act, browser.agent (driving), app.agent, playwright.agent.
+They are internal executor vocabulary only. ANY UI driving (navigate, click,
+type, scroll, operate a page or app) → ONE screen.task.agent step carrying the
+task's VERBATIM UI goal — never split into per-clause steps, never emit
+launch/open steps around it.
+
 Available skills:
+- screen.task.agent: {prompt} — THE UI-driving skill. Observes the screen,
+  resolves visible elements, performs physical input, verifies, recovers.
+  args.prompt carries the verbatim UI goal verbatim (entities feed learned
+  recipes). ONE step per UI goal/destination.
 - url.first.agent: {url, agentId, service?} — open a specific service/app URL.
   ONLY use when the task's deliverable lives on a named service AND the URL
   belongs to the TASK AGENTS' service (e.g. task agent google.agent →
@@ -693,6 +725,17 @@ async function _generateTaskSteps(task, pathFeedback, extSessions) {
     // (redirect-follow → web.search), then persist to learned_domains.
     const norm = await require('../../../shared/plan-steps.cjs')
       .normalizeTaskStepsAsync({ ...task, steps }, { extSessions });
+    // Dormant-driver lockdown — same canonical rewrite planSkillsV2 applies:
+    // a stray dom.act/url.first/turn.loop from stepgen (cached plan, stale
+    // appendix vocabulary) collapses to screen.task.agent before it can
+    // reach execution. Without this the LLM stepgen lane bypassed the
+    // Electron-side sanitizer entirely (observed: spotify plan of
+    // url.first + 3× dom.act reached the plan card).
+    try {
+      const rw = require('../../../stategraph-module/src/nodes/planSkillsV2.js')._rewriteBrowserStepsToAtomicAgents;
+      const re = rw?.(norm.steps, logger, task.prompt || '');
+      if (Array.isArray(re) && re.length) norm.steps = re;
+    } catch (_) {}
     task._normalized = norm; // {steps, agents, services} — consumed by _scheduleStepGen
     task._missingPaths = null;
     return norm.steps;
@@ -2570,7 +2613,11 @@ async function _applyPlanMarkers(text, sess, unknownAgents) {
         for (const t of newTasks) {
           const bad = (t.agents || []).filter(a => {
             const n = String(a).toLowerCase();
-            return n && !LOCAL.has(n) && !skillIndex.skillExists(n) && !svcMap.isServiceAgent(a);
+            // Retired browser descriptors (type:browser files kept on disk)
+            // are not phantoms — the screen lane owns those services, so the
+            // pin is a service hint and must not trigger the corrective loop.
+            const retired = svcMap.retiredBrowserAgent && svcMap.retiredBrowserAgent(a);
+            return n && !LOCAL.has(n) && !skillIndex.skillExists(n) && !svcMap.isServiceAgent(a) && !retired;
           });
           for (const a of bad) {
             const entry = { taskNum: t.num, agent: a, suggested: svcMap.suggestAgent(a) || null };
